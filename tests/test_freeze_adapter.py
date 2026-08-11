@@ -1,8 +1,10 @@
 import io
+from dataclasses import replace
 from datetime import date
 import pytest
 from engine.config import Config
 from engine import book_store, loaders
+from engine.loaders import normalize_process_name
 from engine.new_engine import _orders_from_batches, _ppc_frozen, _new_masters, _plan_config
 from engine.rules import rule1_consolidate
 from ppc_engine.loaders import load_all as new_load
@@ -13,16 +15,26 @@ _CONF = Config(scheduler="new", plan_start_date=date(2025, 3, 3), apply_operator
 
 
 def test_ppc_frozen_maps_so_and_process_to_frozenop():
+    """A row pins WHERE (machine + operator) and WHEN (prev_start). HOW MUCH comes
+    from the BATCH — ``Order.process_remaining`` — because the pinned op belongs to a
+    batch that may club several SO lines, and the row only knows its own line.
+
+    Rebased 2026-08-11 (was: ``fo.remaining_qty == 7``, the row's own number). That
+    was the live bug: a part-finished SO clubbed with an untouched one scheduled only
+    the part-finished line's remainder and silently dropped the rest of the batch.
+    Deliberate behaviour change — see tests/test_frozen_batch_qty.py."""
     wb = build_new_sample_bytes()
     book_store.save_masters_bytes(wb)
     nm = new_load(io.BytesIO(wb)).masters
     so_lines, masters = loaders.load_all(io.BytesIO(wb))
     batches = rule1_consolidate.run(so_lines, _CONF)
+    routing0 = nm.routings[batches[0].item_code]
+    mop = next(op for op in routing0.operations if op.machine_options and op.cycle_min > 0)
+    # The batch still owes 30 pieces on that step (its own line owes only 7).
+    batches[0] = replace(batches[0], process_qty={normalize_process_name(mop.name): 30})
     orders, batch_by_key = _orders_from_batches(batches, nm)
     o0 = orders[0]
     batch = batch_by_key[o0.key]
-    routing = nm.routings[o0.item_code]
-    mop = next(op for op in routing.operations if op.machine_options and op.cycle_min > 0)
     row = {"so_no": batch.source_so_refs[0], "item_code": o0.item_code,
            "process": mop.name, "op_seq": mop.seq, "machine": mop.machine_options[0],
            "operator": "Alpha", "remaining_qty": 7, "prev_start": "2025-03-03T08:00:00"}
@@ -32,7 +44,7 @@ def test_ppc_frozen_maps_so_and_process_to_frozenop():
     assert isinstance(fo, FrozenOp)
     assert fo.order_key == o0.key and fo.op_seq == mop.seq
     assert fo.machine_id == mop.machine_options[0] and fo.operator == "Alpha"
-    assert fo.remaining_qty == 7
+    assert fo.remaining_qty == 30
 
 
 def test_ppc_frozen_drops_unmappable_rows():

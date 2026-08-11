@@ -470,7 +470,8 @@ def _absence_orphans(masters, absences=None) -> list:
                   if a["operator"] not in names})
 
 
-def _report_for_book(masters, so_lines, absences=None, config=None, schedule=None):
+def _report_for_book(masters, so_lines, absences=None, config=None, schedule=None,
+                     batches=None):
     """The validation report scoped to the CURRENT order book. Loader-level rows
     about the masters (pending machines, time coercions, …) pass through, but
     NO_ROUTING is re-derived from the live book: the stored workbook's own SO
@@ -526,6 +527,17 @@ def _report_for_book(masters, so_lines, absences=None, config=None, schedule=Non
             rows.extend(_ne2.routing_order_violations(schedule, masters))
         except Exception:  # noqa: BLE001 — a self-check must never break the report
             pass
+        # And that the plan actually MAKES what the book still owes. A step given
+        # fewer pieces than its batch owes is invisible everywhere else — every other
+        # step of the same order still shows the full quantity (live 2026-08-11: a
+        # frozen op ran only the punched SO line's 88 pieces and dropped the 281 of the
+        # untouched SO clubbed with it). See new_engine.batch_quantity_violations.
+        if batches:
+            try:
+                from engine import new_engine as _ne3
+                rows.extend(_ne3.batch_quantity_violations(schedule, batches))
+            except Exception:  # noqa: BLE001 — a self-check must never break the report
+                pass
     return to_table([
         {"Kind": r["kind"], "Reference": r["ref"], "Message": r["message"]}
         for r in rows
@@ -985,7 +997,8 @@ def _plan(config: Config):
 
     result = {"run_id": run_id, "trace": trace,
               "report": _report_for_book(masters, so_lines, absences=absences_raw,
-                                         config=config, schedule=plan_run.schedule),
+                                         config=config, schedule=plan_run.schedule,
+                                         batches=plan_run.batches_prioritized),
               "gantt": gantt, "orders": orders,
               # SAVED (unresolved) config — null plan_start_date = auto survives
               # the round-trip; the resolved start is a separate display key.

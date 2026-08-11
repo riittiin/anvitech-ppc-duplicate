@@ -282,9 +282,21 @@ def _ppc_frozen(rows, orders, batch_by_key, masters):
     A row maps to the scheduled batch whose source SOs include ``so_no`` (batch_id ==
     ppc order_key[0]); its op_seq is taken from the row (or resolved via the routing by
     normalised process name). Rows that don't map to a scheduled order, have an unknown/
-    OS machine, have remaining_qty<=0, or have a malformed remaining_qty/prev_start
+    OS machine, have a remaining_qty<=0, or have a malformed remaining_qty/prev_start
     (non-numeric, None, missing) are dropped -- never raised, so one bad row can't
-    take down the whole call (and, once wired into a Plan action, the whole plan)."""
+    take down the whole call (and, once wired into a Plan action, the whole plan).
+
+    **A frozen row pins WHERE and WHEN, never HOW MUCH** (2026-08-11 live bug,
+    director escalation). A row's ``remaining_qty`` is that ONE SO line's remaining;
+    the op it pins is a BATCH operation that Rule 1 may have clubbed several SO lines
+    into. ``_preplace_frozen`` lays exactly ``FrozenOp.remaining_qty`` pieces and then
+    advances the order past that op, so anything the row under-counted is never
+    scheduled at all: a part-finished SO (88 left) clubbed with an untouched one (281)
+    ran 88 pieces of CNC FIRST SIDE while every downstream step ran the full 535.
+    So the qty comes from the BATCH -- ``Order.process_remaining``, the exact
+    expression the main decode loop uses (``flow_scheduler._place_operation``) -- and
+    the rows are collapsed to ONE FrozenOp per (batch, op): an operation runs once, on
+    one machine. Machine/operator/prev_start come from the row that started earliest."""
     from datetime import datetime
     from ppc_engine.scheduler import FrozenOp
     # Reverse index: (so_no, item_code) -> order_key of the batch that covers it.
@@ -293,7 +305,7 @@ def _ppc_frozen(rows, orders, batch_by_key, masters):
         for so in (getattr(batch, "source_so_refs", None) or []):
             so_to_key[(so, batch.item_code)] = key
     order_by_key = {o.key: o for o in orders}
-    out = []
+    pinned = {}                      # (order_key, op_seq) -> (prev_start, so_no, mid, operator)
     for r in rows or []:
         key = so_to_key.get((r.get("so_no"), r.get("item_code")))
         if key is None or key not in order_by_key:
@@ -302,10 +314,9 @@ def _ppc_frozen(rows, orders, batch_by_key, masters):
         if not mid or mid not in masters.machines:   # unknown / OS / off-lane
             continue
         try:
-            qty = int(round(float(r.get("remaining_qty", 0))))
+            if int(round(float(r.get("remaining_qty", 0)))) <= 0:
+                continue             # this line is finished at this step -> nothing to pin
         except (TypeError, ValueError):
-            continue
-        if qty <= 0:
             continue
         # Resolve op_seq: trust the row, else match the routing by normalised name.
         op_seq = r.get("op_seq")
@@ -319,9 +330,25 @@ def _ppc_frozen(rows, orders, batch_by_key, masters):
             prev_start = datetime.fromisoformat(r["prev_start"])
         except (KeyError, ValueError, TypeError):
             continue
-        out.append(FrozenOp(order_key=key, op_seq=int(op_seq), machine_id=mid,
-                            operator=r.get("operator", "") or "",
-                            remaining_qty=qty, prev_start=prev_start))
+        # Several clubbed SO lines of one batch can be in progress on the same step.
+        # That is still ONE operation: keep the earliest-started row's pin (so_no
+        # breaks a tie, so the choice can't depend on dict order).
+        stamp = (prev_start, str(r.get("so_no") or ""))
+        cur = pinned.get((key, int(op_seq)))
+        if cur is None or stamp < cur[0]:
+            pinned[(key, int(op_seq))] = (stamp, mid, r.get("operator", "") or "")
+
+    out = []
+    for (key, op_seq), (stamp, mid, operator) in pinned.items():
+        order = order_by_key[key]
+        # How much work is left on this step is the BATCH's business, not the row's.
+        pr = getattr(order, "process_remaining", None)
+        qty = int(round(pr.get(op_seq, order.qty))) if pr is not None else int(round(order.qty))
+        if qty <= 0:
+            continue                 # step already finished for the whole batch
+        out.append(FrozenOp(order_key=key, op_seq=op_seq, machine_id=mid,
+                            operator=operator, remaining_qty=qty, prev_start=stamp[0]))
+    out.sort(key=lambda f: (f.prev_start, f.order_key, f.op_seq))
     return out
 
 
@@ -360,6 +387,52 @@ def qualification_violations(entries, new_masters):
                     "message": (f"the plan plans operator '{op}' on machine "
                                 f"'{e.machine}', which is not in their machine list "
                                 f"under Settings > Operators & shifts")})
+    return out
+
+
+def batch_quantity_violations(entries, batches):
+    """Every step the plan schedules FEWER pieces on than the order book says it owes.
+
+    Pure; returns ``[{"kind", "ref", "message"}]``, empty when clean. Sibling of
+    ``routing_order_violations`` / ``qualification_violations`` and surfaced the same
+    way (``api._report_for_book``, non-blocking — a live plan must never break).
+
+    A batch owes ``batch.process_qty[step]`` on each step (Rule 1's per-step remaining
+    across every SO line it clubbed), or ``batch.qty`` where the book records no
+    progress. Scheduling less than that means pieces the customer ordered are in no
+    plan at all — silently, since every OTHER step still shows the full quantity. That
+    is the 2026-08-11 live bug (a frozen op ran only the punched SO line's remainder);
+    checked here so the next code path that does it is caught instead of shipped.
+
+    An operation's pieces can be published either as ONE entry carrying the whole qty
+    (the new engine, whose blocks each repeat the operation's qty) or as several
+    entries that SUM to it (the classic engine's parallel split), so a step is short
+    only when BOTH readings fall below what is owed."""
+    owed, refs = {}, {}
+    for b in batches or []:
+        owed[b.batch_id] = (getattr(b, "process_qty", None) or {}, float(b.qty))
+        refs[b.batch_id] = ", ".join(getattr(b, "source_so_refs", None) or []) or b.batch_id
+    biggest, total, name_of = {}, {}, {}
+    for e in entries or []:
+        k = (e.batch_id, e.process_seq)
+        biggest[k] = max(biggest.get(k, 0.0), float(e.qty))
+        total[k] = total.get(k, 0.0) + float(e.qty)
+        name_of[k] = e.process_name
+    out = []
+    for k in sorted(biggest, key=lambda k: (k[0], k[1])):
+        bid, seq = k
+        if bid not in owed:
+            continue                       # entry from a batch we weren't given
+        pq, bqty = owed[bid]
+        want = float(pq.get(_norm(name_of[k]), bqty))
+        if biggest[k] + 0.5 >= want or total[k] + 0.5 >= want:
+            continue
+        out.append({
+            "kind": "BATCH_QTY_SHORT",
+            "ref": f"{refs[bid]} / {name_of[k]}",
+            "message": (f"the plan runs {biggest[k]:.0f} pieces of '{name_of[k]}' but "
+                        f"{want:.0f} are still to be made ({refs[bid]}); "
+                        f"{want - biggest[k]:.0f} pieces are in no plan")})
     return out
 
 
@@ -533,7 +606,10 @@ def _entries_from_schedule(sched, batch_by_key):
 # v3 (2026-08-09) = two placement changes in one day: the routing gate + piece-flow
 # guard in `_preplace_frozen` (in-progress ops no longer run before the step feeding
 # them) and first-fit gap backfill (`_first_fit_on_machine`).
-SCHEDULER_FINGERPRINT = "new-engine-v4-routing-gate-no-backfill"
+# v5 (2026-08-11) = a frozen op runs the WHOLE clubbed batch's remaining pieces, not
+# just the punched SO line's (`_ppc_frozen`) — real work moved, so ranks scored under
+# the old semantics are stale.
+SCHEDULER_FINGERPRINT = "new-engine-v5-frozen-batch-qty"
 
 
 def run(batches, config=None, notes=None, masters=None, machine_lost_min=None,

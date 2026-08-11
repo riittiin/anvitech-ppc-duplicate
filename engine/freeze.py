@@ -37,7 +37,16 @@ def schedule_projection(schedule) -> list[dict]:
 def compute_frozen_set(applied_rows, so_lines, good_by_step, masters) -> list[dict]:
     """Frozen (in-progress) ops: partially-punched steps (good>0 and remaining>0),
     with machine + operator looked up from the applied plan. Steps not present in the
-    applied plan, or whose applied machine is OS/off-lane, are not frozen."""
+    applied plan, or whose applied machine is OS/off-lane, are not frozen.
+
+    ``remaining_qty`` here is ONE SO line's remaining at that step — it decides
+    WHETHER the step is in progress, and nothing else. It is NOT how much the
+    scheduler runs: Rule 1 may club several SO lines into the batch that owns the
+    operation, so the quantity comes from the batch at plan time
+    (``new_engine._ppc_frozen`` reads ``Order.process_remaining``). Using this number
+    as the op's qty is the 2026-08-11 live bug — a part-finished SO clubbed with an
+    untouched one scheduled 88 pieces where the batch owed 369, and the missing 281
+    appeared in no plan at all."""
     # Index applied rows: (item_code, process_seq) -> list of rows (with so_refs).
     by_item_seq: dict[tuple[str, int], list[dict]] = {}
     for r in applied_rows or []:

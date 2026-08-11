@@ -1,6 +1,60 @@
 # CLAUDE.md — Anvitech PPC Engine
 
-> ## ⚠️ CURRENT STATE — READ THIS FIRST (updated 2026-08-09)
+> ## ⚠️ CURRENT STATE — READ THIS FIRST (updated 2026-08-11)
+>
+> - **🔴 PIECES OF A CLUBBED ORDER WERE IN NO PLAN AT ALL (2026-08-11, live, director
+>   escalation).** A director opened the Gantt for `26-27SO120` + `26-27SO122` — same
+>   item, clubbed into one batch by Rule 1 — and found **CNC FIRST SIDE running 88
+>   pieces**. 88 is `254 − 166`: SO120's own remainder. **SO122's whole 281 were
+>   missing**, though every step after it still showed the full 535 and the Orders tab
+>   showed both SOs. **Root cause: `engine/freeze.py::compute_frozen_set` derives
+>   `remaining_qty` per SO LINE, but the op it pins is a BATCH operation.**
+>   `flow_scheduler._preplace_frozen` lays exactly `FrozenOp.remaining_qty` pieces and
+>   then advances `idx_of[key]` past that op, so whatever the row under-counted **the
+>   main loop never schedules**. Only reproducible with work IN PROGRESS *and* a
+>   clubbed batch, which is why every earlier check missed it.
+>   **Fix, in `new_engine._ppc_frozen` — a frozen row pins WHERE and WHEN, never HOW
+>   MUCH.** The qty now comes from the batch: `Order.process_remaining.get(op_seq,
+>   order.qty)`, the **exact expression the main decode loop uses**
+>   (`_place_operation`), so there is one definition of "how much is left on this
+>   step". Rows are also collapsed to **ONE FrozenOp per (batch, op)** — several
+>   clubbed lines can each be in progress on the same step, and an operation runs once,
+>   on one machine (before: it was laid twice, double-booking the machine while the
+>   Gantt still showed one bar). Machine/operator/prev_start come from the
+>   earliest-started row (so_no breaks the tie, so it can't depend on dict order).
+>   **Measured on the owner's real books with WIP** (re-runnable harness, 3 books ×
+>   3 WIP levels): starved steps **31 → 0**, routing violations 0 throughout. On Test9
+>   at full WIP the bug hit **4 of 58 batches** — the director found one of four
+>   (SO120/122, SO139/140, SO149/150, SO69/95). Honest cost: the fix ADDS ~300-400
+>   previously-unscheduled pieces per book, and the plan gets **better** on two of
+>   three — Test9 makespan 60.63 → **54.62** d and late-days 1116 → **1062**, Test8
+>   50.68 → **48.44** d and 2577 → **2518**, Test5 45.68 → 45.60 d and 2052 → 2077
+>   (+25, +1.2%). `SCHEDULER_FINGERPRINT` bumped to **v5** (real work moved).
+>   **Defense in depth — `new_engine.batch_quantity_violations(entries, batches)`:**
+>   pure, sibling of `routing_order_violations`/`qualification_violations`, appended by
+>   `_report_for_book` on every plan (non-blocking). Flags any step given fewer pieces
+>   than its batch owes — *"the plan runs 115 pieces of 'CNC FIRST SIDE' but 242 are
+>   still to be made (26-27SO120, 26-27SO122); 127 pieces are in no plan"*. A step is
+>   short only when BOTH `max` and `sum` over its entries fall below what is owed, so
+>   the new engine's repeated-qty blocks AND the classic engine's parallel split are
+>   both read correctly: **0 false positives over 18 runs** (3 books × clean/WIP ×
+>   new/classic/flow), and 4 true rows on Test9 with the fix reverted.
+>   **Mutation-tested, both parts load-bearing:** put the qty back on the row ⇒ 5 tests
+>   fail; emit one FrozenOp per row instead of per (batch, op) ⇒ 1 fails (the op is
+>   laid twice, 1614 min of machine time for 807 min of work). Regression:
+>   `tests/test_frozen_batch_qty.py` (6 tests, RED first).
+>   `test_freeze_adapter.py::test_ppc_frozen_maps_so_and_process_to_frozenop` was
+>   rebased off `remaining_qty == 7` — a deliberate behaviour change, not a fudge.
+>   **Known latent, deliberately left:** `ppc_engine/consolidation.py::consolidate`
+>   merges orders by summing `qty` and **drops `process_remaining` and `promise_date`
+>   entirely**, and its batch keys don't match any `FrozenOp.order_key` — the same
+>   class, worse. It is unreachable live (`new_engine._plan_config` hardcodes
+>   `consolidation_window=0.0`; the app consolidates in Rule 1 instead, and only ppc's
+>   own unused `optimize/contest.py`/`offload.py` sweep that knob). **Never turn ppc
+>   consolidation on without fixing it first.**
+>   **Rule: a quantity that reaches the scheduler must be derived at BATCH level.
+>   Rule 1 clubs SO lines, so any per-SO-line number — a punch, a freeze row, an
+>   actual — is an input to that derivation, never the answer.**
 >
 > - **🔴 THE ADMIN PORTAL AND THE USER PORTAL SHOWED DIFFERENT THINGS (2026-08-09,
 >   director escalation).** A director compared the two logins and reported that they
