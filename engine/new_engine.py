@@ -205,6 +205,9 @@ def _plan_config(config) -> PlanConfig:
         ceiling_days=getattr(config, "worst_ceiling_days", None),
         committed_promise_slack_days=float(getattr(config, "committed_promise_slack_days", 3)),
         committed_promise_weight=COMMITTED_PROMISE_WEIGHT,
+        # `Config.split_parallel` is deliberately NOT forwarded: parallel splitting
+        # measured WORSE on the live book (see PlanConfig.split_enabled). Forwarding
+        # it would silently degrade every plan, since the live config has it on.
     )
 
 

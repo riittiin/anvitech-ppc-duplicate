@@ -69,6 +69,32 @@ class PlanConfig:
     #   "flexible" : the MOST-flexible free operator (for contrast / A-B testing).
     operator_pick: str = "scarce"
 
+    # Parallel batch splitting: run ONE operation on several of the machines its
+    # routing allows, at the same time, each with its own operator for the whole
+    # shift. Every extra machine costs another setup (setup_min), so a part is only
+    # worth making if it carries real work — a 90-minute setup for ten minutes of
+    # cutting is a loss. `split_setup_ratio` is that test: each part must carry at
+    # least ratio x setup_min minutes of CUTTING. At the default 2.0 with a 90-min
+    # setup, a 2-way split needs >= 6 hours of work in the operation.
+    #
+    # This is what `Config.split_parallel` / `split_min_qty` meant in the classic
+    # engine; the new engine had no equivalent.
+    #
+    # DEFAULT OFF, and deliberately NOT wired to `Config.split_parallel`. Measured on
+    # the live book (2026-08-12): splitting made the plan WORSE — 397 -> 401 late-days
+    # even with the operator-slack guard (397 -> 421 without it). The reason is that
+    # machine idleness there is not a machine problem: CNC3/CNC6/CNC7 are three
+    # machines run by two day operators and one night operator, so their machine
+    # utilisation is capped at 51% and already runs at 86% of the operator-hours that
+    # exist. Splitting cannot create operator-hours; it only spends them faster and
+    # starves the third machine.
+    #
+    # Kept, tested and off, because the calculus flips the moment a cell has more
+    # hands than machines. Turn it on per-plan to re-measure.
+    split_enabled: bool = False
+    split_setup_ratio: float = 2.0
+    split_max_ways: int = 3
+
     # Operation overlap (pipelining) — the floor-practical alternative to chunking.
     # An in-house op may START when its predecessor is this fraction through CUTTING
     # (setup excluded), instead of waiting for full completion. Each op still runs as

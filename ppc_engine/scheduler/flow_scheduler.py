@@ -167,7 +167,11 @@ def decode(
         # actual cutting (placement["end"]) — pacing affects only the ORDER's downstream.
         for machine_id, day, shift, name, seg_start, seg_end in placement["assignments"]:
             staffing.commit(machine_id, day, shift, name, seg_start, seg_end)
-        if placement["machine_id"] is not None:
+        # A split operation occupies SEVERAL machines; each becomes free at its own
+        # part's end, not at the operation's end.
+        for mid, mend in (placement.get("machine_ends") or {}).items():
+            machine_free[mid] = mend
+        if not placement.get("machine_ends") and placement["machine_id"] is not None:
             machine_free[placement["machine_id"]] = placement["end"]
         for seg in placement["segments"]:
             if seg.operator is not None:  # track load for the "balanced" operator pick
@@ -271,6 +275,15 @@ def _place_operation(
         seg = Segment(order.key, op.seq, op.name, op.kind, None, None, ready, ready, 0)
         return {"start": ready, "end": ready, "segments": [seg], "assignments": [], "machine_id": None}
 
+    # Parallel split: run this operation on SEVERAL allowed machines at once, each
+    # with its own operator. Tried before the single-machine path so the cheaper of
+    # the two wins on merit (see _try_split — it returns None unless it is faster).
+    if getattr(config, "split_enabled", False) and op.kind == OperationKind.MACHINING:
+        split = _try_split(op, order, ready, machine_free, staffing, masters,
+                           config, dur, int(op_qty))
+        if split is not None:
+            return split
+
     # In-house operation: try each allowed machine, keep the one that finishes soonest
     # (ties → the machine's preference order). "Soonest finish" naturally prefers a
     # free machine over a busy one.
@@ -299,6 +312,146 @@ def _place_operation(
         "segments": best["segments"],
         "assignments": best["assignments"],
         "machine_id": best["machine_id"],
+        "machine_ends": {best["machine_id"]: best["end"]},
+    }
+
+
+def split_ways(work_min, setup_min, machines, ratio=2.0, max_ways=3) -> int:
+    """How many machines this operation is worth spreading across. 1 = don't.
+
+    Every extra machine costs another setup, so a part is only worth creating if it
+    carries enough CUTTING to justify one: at least ``ratio x setup_min`` minutes.
+    That is what stops a 90-minute setup being paid for ten minutes of work.
+
+    ``work_min`` is cutting time only — the setup is added back per part by the
+    caller.
+    """
+    machines = int(machines or 0)
+    if machines < 2 or work_min <= 0:
+        return 1
+    floor_per_part = max(0.0, float(ratio) * float(setup_min or 0.0))
+    if floor_per_part <= 0:
+        affordable = machines                      # no setup cost -> only the cap binds
+    else:
+        affordable = int(work_min // floor_per_part)
+    return max(1, min(machines, int(max_ways), affordable))
+
+
+def _free_operator_count(options, when, staffing, masters, config) -> int:
+    """How many distinct qualified operators could man ANY of ``options`` right now.
+
+    The pool for a group of machines is usually shared (CNC3/CNC6/CNC7 are run by the
+    same two people), so this is the real supply of hands, not a per-machine figure.
+    """
+    from ppc_engine.worktime import effective_shift
+    day = when.date()
+    names = set()
+    for mid in options:
+        machine = masters.machines.get(mid)
+        if machine is None:
+            continue
+        for o in staffing._pools.get(mid, ()):
+            if o.name in names:
+                continue
+            if (effective_shift(o, day, config) == _shift_of(when, config)
+                    and masters.calendar.is_operator_available(o.name, day)):
+                names.add(o.name)
+    return len(names)
+
+
+def _shift_of(when, config):
+    """Which shift a datetime falls in (first unless it is inside the night window)."""
+    from ppc_engine.domain.resources import Shift
+    t = when.time()
+    if config.first_start <= t < config.first_end:
+        return Shift.FIRST
+    return Shift.SECOND
+
+
+def _try_split(op, order, ready, machine_free, staffing, masters, config, dur, op_qty):
+    """Place ``op`` across several allowed machines in parallel, or None.
+
+    Returns None whenever splitting is not worth it, is not physically possible
+    (not enough free operators), or would not actually finish sooner than the best
+    single-machine placement — so this can never make a plan worse.
+
+    Each part is laid on a SCRATCH copy of the staffing board, with the previous
+    part's assignments committed to it first. That is what keeps one person off two
+    machines at once (RULES.md Rule 1): part B genuinely sees part A's operator as
+    busy.
+    """
+    setup = float(getattr(config, "setup_min", 0.0) or 0.0)
+    work = max(0.0, float(dur) - setup)            # cutting only; setup is per part
+    options = [mid for mid in op.machine_options if mid in masters.machines]
+    ways = split_ways(work, setup, len(options),
+                      ratio=getattr(config, "split_setup_ratio", 2.0),
+                      max_ways=getattr(config, "split_max_ways", 3))
+    if ways < 2:
+        return None
+
+    # Cheapest single-machine placement, as the bar the split has to beat.
+    solo_end = None
+    for mid in options:
+        laid = _lay_on_machine(masters.machines[mid],
+                               max(ready, machine_free.get(mid, config.plan_start)),
+                               dur, order, op, op_qty, staffing, masters, config)
+        if laid and (solo_end is None or laid["end"] < solo_end):
+            solo_end = laid["end"]
+
+    # Splitting must not eat the LAST free operators in this group of machines.
+    # Measured on the live book (2026-08-12): CNC3/CNC6/CNC7 share 2 day operators,
+    # so a 2-way split took both and left CNC7 unmanned — total late-days rose from
+    # 397 to 421. Requiring strictly more free operators than parts confines
+    # splitting to genuinely slack cells (the VMCs), where it is free capacity.
+    free_ops = _free_operator_count(options, ready, staffing, masters, config)
+    if free_ops <= ways:
+        return None
+
+    part_work = work / ways
+    part_dur = part_work + setup
+    # Split the pieces as evenly as whole units allow; the first part carries the
+    # remainder so the total is exactly op_qty.
+    base_qty, extra = divmod(int(op_qty), ways)
+    if base_qty <= 0:
+        return None                                 # fewer pieces than parts
+
+    scratch = staffing.clone()
+    segments, assignments, machine_ends = [], [], {}
+    used = set()
+    for i in range(ways):
+        placed = None
+        for mid in options:
+            if mid in used:
+                continue
+            laid = _lay_on_machine(masters.machines[mid],
+                                   max(ready, machine_free.get(mid, config.plan_start)),
+                                   part_dur, order, op, base_qty + (1 if i < extra else 0),
+                                   scratch, masters, config)
+            if laid is None:
+                continue
+            if placed is None or laid["end"] < placed[1]["end"]:
+                placed = (mid, laid)
+        if placed is None:
+            return None                             # no machine+operator free for this part
+        mid, laid = placed
+        used.add(mid)
+        # Commit to the scratch board so the NEXT part cannot reuse this operator.
+        for a in laid["assignments"]:
+            scratch.commit(*a)
+        segments.extend(laid["segments"])
+        assignments.extend(laid["assignments"])
+        machine_ends[mid] = laid["end"]
+
+    end = max(machine_ends.values())
+    if solo_end is not None and end >= solo_end:
+        return None                                 # splitting bought nothing
+    return {
+        "start": min(s.start for s in segments),
+        "end": end,
+        "segments": segments,
+        "assignments": assignments,
+        "machine_id": min(machine_ends, key=lambda k: machine_ends[k]),
+        "machine_ends": machine_ends,
     }
 
 

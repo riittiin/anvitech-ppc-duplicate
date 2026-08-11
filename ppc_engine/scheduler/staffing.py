@@ -71,6 +71,21 @@ class StaffingBoard:
         # operator name -> cumulative committed busy minutes (for the "balanced" pick).
         self._load: dict[str, float] = {}
 
+    def clone(self) -> "StaffingBoard":
+        """A scratch copy that can be written to without touching this board.
+
+        Needed by parallel splitting: the parts of one split operation run on
+        different machines in the SAME shift, so part B must see part A's
+        operator as already taken. Without that, ``candidate_operator`` would
+        hand the same person to both machines and the plan would double-book
+        them. ``_pools`` is static for a shop, so it is shared, not copied.
+        """
+        other = StaffingBoard(self._pools)
+        other._assign = dict(self._assign)
+        other._intervals = {k: list(v) for k, v in self._intervals.items()}
+        other._load = dict(self._load)
+        return other
+
     def add_load(self, name: str, minutes: float) -> None:
         """Record committed work for an operator (drives the 'balanced' pick policy)."""
         self._load[name] = self._load.get(name, 0.0) + minutes
