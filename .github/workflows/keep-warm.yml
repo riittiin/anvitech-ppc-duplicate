@@ -1,0 +1,25 @@
+name: Keep the live site warm
+
+# Render's free tier sleeps the service after ~15 min idle, so the first hit
+# after a break takes 30–60s to wake. This pings the live URL every 12 minutes
+# during working hours so it stays awake and responds instantly.
+#
+# Window: every 12 min from 03:00–14:59 UTC = ~08:30–20:29 IST (the working day).
+# ~60 pings/day ≈ 1800 GitHub Actions minutes/month — under the 2000-min free
+# tier for a private repo. Adjust the hours below if your hours differ.
+# (A login gate means the ping gets HTTP 401 — that still wakes the server.)
+
+on:
+  schedule:
+    - cron: "*/12 3-14 * * *"
+  workflow_dispatch: {}        # lets you trigger a ping manually from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the live site
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 90 \
+            https://anvitech-ppc.onrender.com/ || true)
+          echo "Pinged anvitech-ppc — HTTP $code (401 = up & login-gated, server is awake)"

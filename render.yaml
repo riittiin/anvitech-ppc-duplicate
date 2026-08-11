@@ -1,0 +1,33 @@
+# Render Blueprint — free public deployment.
+# Create the service from this file (Render dashboard → New → Blueprint), then set
+# the secret env vars (marked sync:false) in the dashboard.
+services:
+  - type: web
+    name: anvitech-ppc
+    runtime: python
+    plan: free
+    autoDeploy: true          # deploy automatically on every push to the tracked branch (main)
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    # Login credentials are baked into api/auth.py and work with no env vars set.
+    # Set any of these to OVERRIDE a baked-in value without a code change.
+    envVars:
+      - key: ADMIN_USERNAME         # overrides the baked admin username (optional)
+        sync: false
+      - key: ADMIN_PASSWORD         # overrides the baked admin password (optional)
+        sync: false
+      - key: USER_USERNAME          # overrides the baked user username (optional)
+        sync: false
+      - key: USER_PASSWORD          # overrides the baked user password (optional)
+        sync: false
+      - key: SESSION_SECRET         # optional; else a random secret is generated + stored
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL # from the Upstash console (durable storage)
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      # Run the new operator-stable engine in production. The code default is 'classic'
+      # (kept for the test suite that validates that engine); this makes the deployed app
+      # use the new engine unless an admin explicitly picks another in Settings.
+      - key: DEFAULT_SCHEDULER
+        value: new

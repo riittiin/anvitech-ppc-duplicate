@@ -1,0 +1,177 @@
+{
+  "rule1": {
+    "columns": [
+      "Batch ID",
+      "Item Code",
+      "Item Name",
+      "Qty",
+      "SO Delivery Date",
+      "Source SOs",
+      "Cycle time per piece (min)"
+    ],
+    "rows": [
+      [
+        "B001",
+        "SAMP-A-01",
+        "SAMPLE RING A",
+        15.0,
+        "10-03-2025",
+        "SO-001, SO-002",
+        null
+      ],
+      [
+        "B002",
+        "SAMP-B-01",
+        "SAMPLE PIN B",
+        4.0,
+        "20-03-2025",
+        "SO-003",
+        null
+      ]
+    ]
+  },
+  "rule2": {
+    "columns": [
+      "Batch ID",
+      "Item Code",
+      "Item Name",
+      "Qty",
+      "SO Delivery Date",
+      "Source SOs",
+      "Cycle time per piece (min)"
+    ],
+    "rows": [
+      [
+        "B001",
+        "SAMP-A-01",
+        "SAMPLE RING A",
+        15.0,
+        "10-03-2025",
+        "SO-001, SO-002",
+        null
+      ],
+      [
+        "B002",
+        "SAMP-B-01",
+        "SAMPLE PIN B",
+        4.0,
+        "20-03-2025",
+        "SO-003",
+        null
+      ]
+    ]
+  },
+  "rule3": {
+    "columns": [
+      "Batch ID",
+      "Item Code",
+      "Item Name",
+      "Qty",
+      "SO Delivery Date",
+      "Source SOs",
+      "Cycle time per piece (min)"
+    ],
+    "rows": [
+      [
+        "B001",
+        "SAMP-A-01",
+        "SAMPLE RING A",
+        15.0,
+        "10-03-2025",
+        "SO-001, SO-002",
+        10.0
+      ],
+      [
+        "B002",
+        "SAMP-B-01",
+        "SAMPLE PIN B",
+        4.0,
+        "20-03-2025",
+        "SO-003",
+        6.0
+      ]
+    ]
+  },
+  "rule6": {
+    "columns": [
+      "SO No",
+      "Batch ID",
+      "Item Code",
+      "Seq",
+      "Process",
+      "Machine",
+      "Qty",
+      "Occupancy (min)",
+      "Start",
+      "End",
+      "Notes"
+    ],
+    "rows": [
+      [
+        "SO-001, SO-002",
+        "B001",
+        "SAMP-A-01",
+        1,
+        "BANDSAW",
+        "BS1",
+        15,
+        45.0,
+        "01-03-2025 08:00",
+        "01-03-2025 08:45",
+        ""
+      ],
+      [
+        "SO-003",
+        "B002",
+        "SAMP-B-01",
+        1,
+        "CNC",
+        "CNC9",
+        4,
+        106.0,
+        "01-03-2025 08:00",
+        "01-03-2025 09:46",
+        ""
+      ],
+      [
+        "SO-001, SO-002",
+        "B001",
+        "SAMP-A-01",
+        2,
+        "CNC OS",
+        "CNC1",
+        15,
+        165.0,
+        "01-03-2025 08:45",
+        "01-03-2025 11:30",
+        "chose CNC1 of CNC1/CNC2"
+      ],
+      [
+        "SO-003",
+        "B002",
+        "SAMP-B-01",
+        2,
+        "WASHING",
+        "MW1",
+        4,
+        8.0,
+        "01-03-2025 09:46",
+        "01-03-2025 09:54",
+        ""
+      ],
+      [
+        "SO-001, SO-002",
+        "B001",
+        "SAMP-A-01",
+        3,
+        "INSP",
+        "MI1",
+        15,
+        30.0,
+        "01-03-2025 11:30",
+        "01-03-2025 12:00",
+        ""
+      ]
+    ]
+  }
+}

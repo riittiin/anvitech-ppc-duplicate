@@ -1,0 +1,43 @@
+# Cloud Optimize — the app (Render) dispatches this workflow when the admin
+# presses Start; the runner computes the full fair contest (~2,400 plans) and
+# posts the result back. See scripts/cloud_optimize_worker.py and the spec
+# docs/superpowers/specs/2026-07-15-optimize-settings-sweep-design.md.
+#
+# Repo secrets required: APP_URL, OPTIMIZE_WORKER_SECRET (must equal the
+# Render env var of the same name).
+name: optimize
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "The app's job id for this optimization run"
+        required: true
+        type: string
+
+concurrency: optimize   # one contest at a time — matches the app's own lock
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false   # one shard dying must not cancel the others
+      max-parallel: 20
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run the contest shard and post the result back
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          OPTIMIZE_WORKER_SECRET: ${{ secrets.OPTIMIZE_WORKER_SECRET }}
+          JOB_ID: ${{ inputs.job_id }}
+          SHARD_INDEX: ${{ strategy.job-index }}
+          SHARD_TOTAL: ${{ strategy.job-total }}
+        run: python scripts/cloud_optimize_worker.py

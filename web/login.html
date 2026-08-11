@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in: Anvitech PPC Engine</title>
+  <!-- Self-contained: inline CSS, no JavaScript (keeps CSP script-src strict). -->
+  <style>
+    :root {
+      --paper: #0e1116; --card: #171b21; --line: #262c33; --ink: #e6e8eb;
+      --muted: #9aa3ad; --accent: #3b82f6; --danger: #f85149;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center;
+      justify-content: center; background: var(--paper); color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 15px;
+    }
+    .card {
+      width: 100%; max-width: 360px; background: var(--card);
+      border: 1px solid var(--line); border-radius: 10px; padding: 28px 26px;
+      box-shadow: 0 4px 20px rgba(0,0,0,.35);
+    }
+    .brand-logo { background: #fff; border-radius: 10px; padding: 9px 13px; display: inline-flex;
+      margin: 0 0 16px; box-shadow: 0 2px 8px rgba(0,0,0,.4); }
+    .brand-logo img { height: 38px; width: auto; display: block; }
+    h1 { margin: 0 0 4px; font-size: 20px; }
+    .sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+    label { display: block; margin: 14px 0 6px; color: var(--muted); font-size: 13px; }
+    input {
+      width: 100%; padding: 10px 12px; background: var(--paper); color: var(--ink);
+      border: 1px solid var(--line); border-radius: 6px; font-size: 14px;
+    }
+    input:focus { outline: none; border-color: var(--accent); }
+    button {
+      width: 100%; margin-top: 20px; padding: 11px; border: 0; border-radius: 6px;
+      background: var(--accent); color: #fff; font-weight: 600; font-size: 14px;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(1.05); }
+    .err {
+      margin-top: 16px; padding: 10px 12px; border-radius: 6px; font-size: 13px;
+      background: rgba(248,81,73,.12); border: 1px solid var(--danger); color: #ffb4ab;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <span class="brand-logo"><img src="/logo.png" alt="Anvitech logo" /></span>
+    <h1>Anvitech PPC Engine</h1>
+    <p class="sub">Please sign in to continue.</p>
+    <form method="post" action="/login" autocomplete="off">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" required autofocus />
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" required />
+      <button type="submit">Sign in</button>
+    </form>
+    <!--ERROR-->
+  </main>
+</body>
+</html>

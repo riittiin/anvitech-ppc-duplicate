@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Anvitech PPC Engine</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="role-pending">
+  <div id="boot-loading" class="boot-loading" role="status" aria-live="polite">Loading your plan…</div>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark"><img src="/logo.png" alt="Anvitech logo" /></span>
+      <span class="brand-text">
+        <span class="brand-name">Anvitech <span class="brand-accent">PPC</span></span>
+        <span class="brand-sub">Production Planning &amp; Control</span>
+      </span>
+    </div>
+    <nav id="nav" class="nav" aria-label="Main">
+      <a class="nav-item" data-view="orders" href="#orders">Orders</a>
+      <a class="nav-item" data-view="schedule" href="#schedule">Schedule</a>
+      <a class="nav-item" data-view="gantt" href="#gantt">Gantt</a>
+      <a class="nav-item" data-view="entry" href="#entry">Daily Entry</a>
+      <a class="nav-item" data-view="analytics" href="#analytics">Analytics</a>
+      <a class="nav-item" data-view="settings" href="#settings">Settings</a>
+    </nav>
+    <div class="session-bar">
+      <span id="status" class="status"></span>
+      <span id="session-info"></span>
+    </div>
+  </header>
+
+  <!-- One calm line: what the system is doing right now (both roles). -->
+  <div id="status-strip" class="status-strip" aria-live="polite"></div>
+
+  <!-- ===================== ORDERS ===================== -->
+  <section class="view" id="view-orders">
+    <div class="card admin-only" id="upload-card">
+      <div class="card-head">
+        <h2>Add orders</h2>
+        <p class="explainer">Upload your sales order Excel file. New orders are added to the list below.</p>
+      </div>
+      <div class="cfg-row">
+        <label class="file-field">
+          <input id="xlsx-file" type="file" accept=".xlsx" />
+        </label>
+        <button id="upload-btn" class="primary">Upload orders</button>
+        <span id="dataset-status" class="status">No orders yet. Upload your Excel file to add orders.</span>
+      </div>
+    </div>
+
+    <!-- Data gaps. Deliberately OUTSIDE the admin-only "Add orders" card above:
+         renderReport() runs for BOTH roles on every plan, but while these two
+         panels lived inside that card the user role could never see a warning
+         about its own data (2026-08-09 role-parity fix). The card itself stays
+         hidden until one of them has something to say — see syncDataGapsCard(). -->
+    <div class="card hidden" id="data-gaps-card">
+      <div id="report-noroute" class="report-noroute hidden"></div>
+      <section id="report-panel" class="report hidden">
+        <button id="report-toggle" class="report-summary"></button>
+        <div id="report-detail" class="hidden"></div>
+      </section>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Orders</h2>
+        <p class="explainer">Every order and where it stands. Remaining is what is still left to
+          make. Current expected is the date the plan expects the order to finish.</p>
+      </div>
+      <div id="orders-mount"></div>
+    </div>
+  </section>
+
+  <!-- ===================== SCHEDULE ===================== -->
+  <section class="view" id="view-schedule">
+    <!-- Both roles SEE this panel; only an admin can drive it (2026-08-09
+         role-parity fix). Everyone needs to know a search is running and what it
+         found; Start / Stop / Apply / Discard stay admin-only. Apply and Discard
+         are built in JS, so renderOptimizeResult() gates those on the role. -->
+    <section id="optimize-panel" class="card">
+      <div class="card-head">
+        <h2>Find a better job order</h2>
+        <p class="explainer">Tries many different orders for the jobs and keeps the best one. Fewer late deliveries comes first, shortest total time second.</p>
+      </div>
+      <div class="optimize-intro admin-only">
+        Same machines, same people. Only the order the jobs run in changes. This does
+        not change your plan by itself. After it finishes you must press Apply.
+      </div>
+      <div class="optimize-intro user-only">
+        Same machines, same people. Only the order the jobs run in changes. Your admin
+        starts this search and decides whether to use the result. You can watch it here.
+      </div>
+      <div class="optimize-controls">
+        <button id="optimize-start" class="primary admin-only">Start deep search</button>
+        <button id="optimize-stop" class="ghost-btn hidden admin-only">Stop &amp; keep best</button>
+        <span id="optimize-progress" class="status"></span>
+      </div>
+      <div class="optimize-note muted admin-only">
+        This takes about 15 to 30 minutes. You can leave this screen open and watch it,
+        or come back later. Press <strong>Stop &amp; keep best</strong> any time to use the
+        best one found so far.
+      </div>
+      <div class="optimize-note muted user-only">
+        A search takes about 15 to 30 minutes. If nothing is shown here, no search is
+        running right now.
+      </div>
+      <div id="optimize-result" class="optimize-result hidden"></div>
+    </section>
+
+    <section id="optimize-banner" class="optimize-banner hidden"></section>
+    <div id="auto-note" class="auto-note muted hidden"></div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Machine schedule</h2>
+        <p class="explainer">The finished plan: which machine does which job, and when. Download it to print for the floor.</p>
+      </div>
+      <div id="schedule-mount"></div>
+    </div>
+  </section>
+
+  <!-- ===================== GANTT ===================== -->
+  <section class="view" id="view-gantt">
+    <div class="card">
+      <div class="card-head">
+        <h2>Gantt</h2>
+        <p class="explainer">Shows each order's jobs on the days they run. Each colour is a different machine.</p>
+      </div>
+      <div id="gantt-mount"></div>
+    </div>
+  </section>
+
+  <!-- ===================== DAILY ENTRY ===================== -->
+  <section class="view" id="view-entry">
+    <div class="card">
+      <div class="card-head">
+        <h2>Daily entry</h2>
+        <p class="explainer">Fill in the date, shift and your name. Then pick the order, the item and the process. Enter what you made and click Save.</p>
+      </div>
+      <div id="entry-mount"></div>
+    </div>
+  </section>
+
+  <!-- ===================== ANALYTICS ===================== -->
+  <section class="view" id="view-analytics">
+    <div class="card">
+      <div class="card-head">
+        <h2>Analytics</h2>
+        <p class="explainer">How busy your machines and operators are in the current plan, and where the work is going.</p>
+      </div>
+      <div id="analytics-mount"></div>
+    </div>
+  </section>
+
+  <!-- ===================== SETTINGS (admin) ===================== -->
+  <section class="view" id="view-settings">
+    <div class="card admin-only">
+      <div class="card-head">
+        <h2>Plan settings</h2>
+        <p class="explainer">Controls how the schedule is built. Change a value, then Save &amp; re-plan.</p>
+      </div>
+      <div class="settings-grid">
+        <fieldset class="settings-group">
+          <legend>Scheduling</legend>
+          <label class="cfg-check">
+            <input id="cfg-start-auto" type="checkbox" checked />
+            Start from today (recommended)
+          </label>
+          <label>Plan start date
+            <input id="cfg-plan-start" type="date" value="2025-03-01" />
+            <span id="cfg-plan-start-echo" class="date-echo"></span>
+          </label>
+          <p class="cfg-readonly">How far apart two orders for the same item can be to run
+            together is chosen automatically. You don't set this.</p>
+          <label>Setup time (min)
+            <input id="cfg-setup" type="number" value="90" min="0" />
+          </label>
+          <p class="cfg-help">Minutes added before each CNC/VMC job starts, to account for machine
+            changeover.</p>
+          <p class="cfg-readonly">How much two steps can run at the same time (currently
+            <span id="cfg-overlap-info">50</span>%, set automatically by Optimize, you don't
+            change it): how much of the next step can start before the step before it is fully
+            done. More of this finishes orders sooner, but runs two steps of the same order
+            together.</p>
+          <p class="cfg-readonly">Which machines can be used (set automatically by Optimize, you
+            don't change it): currently <span id="cfg-machineset-info">Allotted only</span>.
+            Optimize decides on its own whether to also use a step's Suggested machine, to take
+            work off a busy one.</p>
+        </fieldset>
+        <fieldset class="settings-group">
+          <legend>Order priority</legend>
+          <p class="cfg-readonly">The order jobs run in (most urgent first) is decided
+            automatically and fine tuned by Optimize. You don't set this.</p>
+        </fieldset>
+        <fieldset class="settings-group">
+          <legend>Options</legend>
+          <label class="cfg-check">
+            <input id="cfg-operator-logic" type="checkbox" checked />
+            Show operator reports
+          </label>
+          <p class="cfg-help">Adds the per operator section to Analytics, and switches on the
+            shift wise schedule download and the machine coverage report. It does not change the
+            plan. The planner always puts a real operator on every shift.</p>
+        </fieldset>
+      </div>
+      <div class="card-actions">
+        <button id="run-btn" class="primary">Save &amp; re-plan</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Operators &amp; shifts</h2>
+        <p class="explainer">Who runs which machine, and on which shift. The shift you set here
+          is used every week until you change it. This list is filled in once from your uploaded
+          Excel. After that, add or edit operators here.</p>
+      </div>
+      <p id="operators-header" class="muted"></p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Machines</th>
+              <th>Shift</th>
+              <th class="admin-only"></th>
+            </tr>
+          </thead>
+          <tbody id="operators-tbody"></tbody>
+        </table>
+      </div>
+      <div class="cfg-row admin-only">
+        <input type="text" id="op-add-name" placeholder="Name" />
+        <span id="op-add-machines" class="mach-cell"></span>
+        <select id="op-add-shift">
+          <option value="">Day (9-18)</option>
+          <option value="First shift">First shift</option>
+          <option value="Second shift">Second shift</option>
+        </select>
+        <button id="op-add-btn" class="ghost-btn" type="button">Add operator</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Operator absences</h2>
+        <p class="explainer">Mark an operator away for a date range. The plan skips them on those
+          days and gives their work to someone else. Work already started stays on its machine.</p>
+      </div>
+      <div class="cfg-row admin-only">
+        <select id="absence-operator"></select>
+        <input type="date" id="absence-from" />
+        <input type="date" id="absence-to" />
+        <button id="absence-add" class="ghost-btn" type="button">Mark absent</button>
+      </div>
+      <ul id="absence-list" class="absence-list"></ul>
+    </div>
+
+    <div class="card admin-only">
+      <div class="card-head">
+        <h2>Efficiency report</h2>
+        <p class="explainer">How much each operator produced in a month, compared with the
+          standard time for those jobs. This is a report only. It never changes the plan.</p>
+      </div>
+      <div class="cfg-row">
+        <label class="inline-field">Month
+          <input type="month" id="eff-month" />
+        </label>
+        <button id="eff-preview-btn" class="ghost-btn" type="button">Preview</button>
+        <button id="eff-download-btn" class="ghost-btn" type="button">⬇ Download CSV</button>
+      </div>
+      <p class="explainer">
+        <strong>Attended (min)</strong> = time on shift minus recorded downtime and setup.
+        <strong>Earned (min)</strong> = standard time credited for GOOD pieces only. Rejects earn
+        nothing. <strong>Efficiency %</strong> = Earned ÷ Attended × 100.
+        <strong>Pace vs standard (x)</strong> = how many times faster/slower than standard cycle
+        time (1.0 = exactly standard, 1.2 = 20% faster). <strong>Reject %</strong> = rejected ÷
+        (good + rejected) qty. <strong>No-standard punches</strong> = entries for an item/process
+        with no time standard on file. These are left out of both earned and attended time, so they never
+        count against the operator.
+      </p>
+      <div id="eff-table" class="eff-table"></div>
+    </div>
+  </section>
+
+  <!-- Legacy single mount kept as a harmless fallback target for any render call
+       whose view isn't found (router always supplies a real mount). -->
+  <main id="tab-content" hidden></main>
+
+  <script src="app.js"></script>
+</body>
+</html>
