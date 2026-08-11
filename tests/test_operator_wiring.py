@@ -302,7 +302,8 @@ def test_scheduled_skips_when_book_and_inputs_both_match(monkeypatch):
     cfg = m._load_plan_config()
     book_store.save_plan_priority({}, {"saved_at": "t",
                                        "book_sig": m._current_book_sig(),
-                                       "inputs_sig": m._inputs_signature(cfg)})
+                                       "inputs_sig": m._inputs_signature(cfg),
+                                       "plan_start": m._current_plan_start_sig()})
     starts = []
     monkeypatch.setattr(m, "_start_optimize", lambda *a, **k: starts.append(1))
     assert m._try_start_auto() is False

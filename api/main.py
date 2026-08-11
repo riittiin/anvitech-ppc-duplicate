@@ -1088,6 +1088,7 @@ _OPT_SEED = 42
 _CANCEL_GRACE_S = 90.0
 
 _OPTIMIZE = {"state": "idle", "label": None, "budget_evals": 0, "evals": 0,
+             "searched_plan_start": None,
              "baseline": None, "best": None, "error": None, "elapsed_s": 0.0,
              "started_mono": None, "result": None, "cancel": False,
              "mode": "local", "job_id": None, "cloud_payload": None,
@@ -1282,6 +1283,49 @@ def _current_book_sig() -> str:
     return optimize_service.book_signature(lines, absences=absences)
 
 
+def _current_plan_start_sig() -> str:
+    """The date the plan clock actually starts from, as an ISO string.
+
+    The THIRD fingerprint of "has anything changed since the last search", next to
+    the book (quantities) and the inputs (settings). Neither of those moves when
+    the calendar does: `_current_book_sig` is quantity-derived, and
+    `_inputs_signature` reads the SAVED config, where an auto start is None on
+    purpose so a moving 'today' never looks like a settings change.
+
+    Without this, any day the start advances with no new quantities — a Monday
+    after the weekend, a holiday, pressing "Done entering" before punching — was
+    answered "nothing new to re-plan", and a sequence optimized for an older start
+    date kept being replayed. Measured on the live book: ranks computed 2026-08-11
+    gave 397 late-days against the 08-12 book, where re-running the same optimizer
+    on 08-12 gave 365.
+    """
+    config = _load_plan_config()
+    start = config.plan_start_date or _ist_now().date()
+    eff = orderbook.effective_plan_start_date(
+        book_store.load_actuals(), start, _current_masters().calendar)
+    return eff.isoformat()
+
+
+def _matches_last_search(record, book_sig, inputs_sig, plan_start) -> bool:
+    """Does ``record`` (applied meta, or the last completed search) describe a
+    contest run against exactly today's book, settings AND plan start?
+
+    A missing ``inputs_sig`` is tolerated — records written before that field
+    existed matched on the book alone, and this must not change that path. A
+    missing ``plan_start`` is NOT tolerated: it means the record predates this
+    fingerprint, so we cannot know which date it was built for. Re-planning once
+    is the safe answer, and the next search writes the field.
+    """
+    if not record:
+        return False
+    if record.get("book_sig") != book_sig:
+        return False
+    rec_inputs = record.get("inputs_sig")
+    if rec_inputs is not None and rec_inputs != inputs_sig:
+        return False
+    return record.get("plan_start") == plan_start
+
+
 def _delivery_dates() -> dict:
     """Every active order's delivery date, keyed like the optimizer's ranks.
 
@@ -1451,14 +1495,13 @@ def _try_start_auto(by: str = "") -> bool:
     try:
         cur_book = _current_book_sig()
         cur_inputs = _inputs_signature(_load_plan_config())
-        meta = _applied_plan_meta() or {}
-        applied_inputs = meta.get("inputs_sig")
-        applied_match = (meta.get("book_sig") == cur_book
-                         and (applied_inputs is None
-                              or applied_inputs == cur_inputs))
-        last = book_store.load_last_searched() or {}
-        searched_match = (last.get("book_sig") == cur_book
-                         and last.get("inputs_sig") == cur_inputs)
+        # The plan START is the third thing a contest is run against. Leaving it out
+        # meant a new day looked like "nothing changed" (see _current_plan_start_sig).
+        cur_start = _current_plan_start_sig()
+        applied_match = _matches_last_search(_applied_plan_meta(), cur_book,
+                                             cur_inputs, cur_start)
+        searched_match = _matches_last_search(book_store.load_last_searched(),
+                                              cur_book, cur_inputs, cur_start)
         if applied_match or searched_match:
             _auto_note_write(f"{_who(by)}pressed \"Done entering\" at {_hhmm()}: nothing "
                              "new to re-plan since the last update, so the plan is "
@@ -1580,6 +1623,7 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
         # this contest is already in flight against the pre-punch book.
         searched_book_sig = _current_book_sig()
         searched_inputs_sig = _inputs_signature(base_config)
+        searched_plan_start = _current_plan_start_sig()
         _OPTIMIZE.update(state="running", label=label, budget_evals=denom,
                          evals=0, baseline=None, best=None, error=None, result=None,
                          elapsed_s=0.0, started_mono=time.monotonic(), cancel=False,
@@ -1588,6 +1632,7 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
                          base_config=base_config, auto=bool(auto),
                          searched_book_sig=searched_book_sig,
                          searched_inputs_sig=searched_inputs_sig,
+                         searched_plan_start=searched_plan_start,
                          shards={}, shard_total=None, shards_finalizing=False,
                          shard_evals={})
 
@@ -1904,7 +1949,8 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
         # found, or nothing was ever applied) can still be skipped without
         # re-running the search.
         book_store.save_last_searched({"book_sig": _OPTIMIZE.get("searched_book_sig"),
-                                       "inputs_sig": _OPTIMIZE.get("searched_inputs_sig")})
+                                       "inputs_sig": _OPTIMIZE.get("searched_inputs_sig"),
+                                       "plan_start": _OPTIMIZE.get("searched_plan_start")})
     if _OPTIMIZE.get("auto"):
         try:
             _auto_apply_result()
@@ -2230,6 +2276,9 @@ def _optimize_apply():
                 "inputs_sig": res.get("inputs_sig"),
                 "best_overlap": res.get("best_overlap"),
                 "book_sig": _current_book_sig(),
+                # The date this optimization's clock started from. A later day must
+                # re-search rather than replay a sequence built for another start.
+                "plan_start": _current_plan_start_sig(),
                 # The delivery dates this optimization was computed against, so a
                 # later plan can flag "the dates moved, re-run the deep search".
                 "dates": _delivery_dates()}

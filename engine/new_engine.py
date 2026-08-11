@@ -208,6 +208,16 @@ def _plan_config(config) -> PlanConfig:
         # `Config.split_parallel` is deliberately NOT forwarded: parallel splitting
         # measured WORSE on the live book (see PlanConfig.split_enabled). Forwarding
         # it would silently degrade every plan, since the live config has it on.
+        #
+        # Settings' "balance operator load" — read only by the CLASSIC engine's
+        # rule6_allocate, so it did nothing under scheduler='new'. Without it the
+        # board uses "scarce", whose tie-break between equally-qualified people is
+        # their NAME: on the live book Rohan Chakane ran at 90.4% and Sidhu Singe at
+        # 81.6% purely because "Rohan" sorts first. "balanced" picks the least-loaded
+        # instead (measured: Swapnil 10.6% -> 43.0%, Narayan 2.4% -> 16.5%, spread
+        # 88 -> 74 points, late-days unchanged at 397 -> 398).
+        operator_pick=("balanced" if getattr(config, "balance_operator_load", False)
+                       else "scarce"),
     )
 
 
