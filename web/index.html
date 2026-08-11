@@ -15,6 +15,10 @@
         <span class="brand-name">Anvitech <span class="brand-accent">PPC</span></span>
         <span class="brand-sub">Production Planning &amp; Control</span>
       </span>
+      <!-- Shown only when this deployment mirrors a live site (see /mirror/status).
+           Two identical-looking tabs, one of them production, is a foot-gun. -->
+      <span id="mirror-badge" class="mirror-badge" hidden
+            title="This is a duplicate. It reads the live site's data but never writes to it.">DUPLICATE</span>
     </div>
     <nav id="nav" class="nav" aria-label="Main">
       <a class="nav-item" data-view="orders" href="#orders">Orders</a>
@@ -281,6 +285,18 @@
         count against the operator.
       </p>
       <div id="eff-table" class="eff-table"></div>
+    </div>
+
+    <!-- Mirror panel — revealed by app.js only when /mirror/status says this
+         deployment mirrors a live site. -->
+    <div class="card admin-only" id="mirror-card" hidden>
+      <div class="card-head">
+        <h2>Live site mirror</h2>
+        <p class="explainer">This deployment reads its data from the live Anvitech site and
+          can never write back to it. Daily entries and orders recorded there appear here
+          automatically. Anything you change here stays here.</p>
+      </div>
+      <div id="mirror-detached"></div>
     </div>
   </section>
 

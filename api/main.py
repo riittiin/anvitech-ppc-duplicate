@@ -2382,6 +2382,73 @@ def clear_orders(req: ClearRequest, request: Request):
     return {"cleared": True}
 
 
+# --------------------------------------------------------------------------- #
+# Mirror (duplicate deployment only)
+# --------------------------------------------------------------------------- #
+# Friendly names for the store keys a user can detach from / re-attach to the
+# live site. Keys absent from this map are internal and never offered.
+MIRROR_KEY_LABELS = {
+    book_store.ORDERS_KEY: "Order book",
+    book_store.COMPLETED_KEY: "Completed orders",
+    book_store.ACTUALS_KEY: "Daily entries",
+    book_store.MASTERS_KEY: "Master workbook",
+    book_store.OPERATORS_KEY: "Operators",
+    book_store.ABSENCES_KEY: "Absences",
+    book_store.PLAN_CONFIG_KEY: "Plan settings",
+}
+
+
+def _mirror_store():
+    """The OverlayStore, or None when this deployment is not a mirror."""
+    store = storage.get_store()
+    # get_store() may hand back a per-request cache wrapper; the overlay is
+    # underneath it.
+    store = getattr(store, "_b", store)
+    return store if hasattr(store, "reattach") else None
+
+
+@app.get("/mirror/status")
+def mirror_status(request: Request):
+    """Whether this deployment mirrors a live site, and which data has been
+    detached from it. Drives the header badge and the Settings panel.
+
+    Readable by both roles (the middleware already requires a valid session) —
+    the badge must show for the user role too, so nobody mistakes this
+    deployment for the real site."""
+    store = _mirror_store()
+    if store is None:
+        return {"enabled": False, "detached": []}
+    detached = store.detached_keys()
+    return {
+        "enabled": True,
+        "detached": [
+            {"key": k, "label": MIRROR_KEY_LABELS.get(k, k)}
+            for k in sorted(detached) if k in MIRROR_KEY_LABELS
+        ],
+    }
+
+
+class ReattachRequest(BaseModel):
+    key: str
+    password: str = ""
+
+
+@app.post("/mirror/reattach")
+def mirror_reattach(req: ReattachRequest, request: Request):
+    """Discard everything this deployment did to one key and mirror the live
+    site again. Admin only, guarded by re-entering the admin password — it
+    throws away local data."""
+    require_admin(request)
+    require_password(request, req.password)
+    store = _mirror_store()
+    if store is None:
+        raise HTTPException(status_code=404, detail="This deployment is not a mirror")
+    if req.key not in MIRROR_KEY_LABELS:
+        raise HTTPException(status_code=400, detail="Unknown key")
+    store.reattach(req.key)
+    return {"reattached": req.key}
+
+
 @app.post("/orders/commit")
 def commit_orders_ep(req: CommitRequest, request: Request):
     """Lock the given orders into the committed lane: each order's current

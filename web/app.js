@@ -2118,6 +2118,70 @@ if (_effPreviewBtn) _effPreviewBtn.onclick = previewEfficiency;
 const _effDownloadBtn = $("eff-download-btn");
 if (_effDownloadBtn) _effDownloadBtn.onclick = downloadEfficiencyCsv;
 
+// ---- Live site mirror ----
+// This deployment can be configured to read its data from the live Anvitech site
+// (UPSTREAM_MONGODB_URI). When it is, say so loudly — an operator must never
+// mistake this tab for production — and let an admin re-attach data they have
+// detached by wiping it here.
+async function loadMirrorStatus() {
+  let status;
+  try {
+    const res = await fetch("/mirror/status");
+    if (!res.ok) return;
+    status = await res.json();
+  } catch (e) { return; }        // cosmetic: never block boot on it
+  if (!status.enabled) return;
+
+  const badge = $("mirror-badge");
+  if (badge) badge.hidden = false;
+  const card = $("mirror-card");
+  if (card) card.hidden = false;
+  renderMirrorDetached(status.detached || []);
+}
+
+function renderMirrorDetached(detached) {
+  const el = $("mirror-detached");
+  if (!el) return;
+  if (!detached.length) {
+    el.innerHTML = `<p class="explainer">Everything is currently mirroring the live site.</p>`;
+    return;
+  }
+  el.innerHTML = `<p class="explainer">These are no longer mirroring the live site, because they
+      were deleted here. Re-attaching discards the local copy and shows the live data again.</p>`
+    + `<ul class="absence-list">`
+    + detached.map((d) => `<li><span>${escapeHtml(d.label)}</span>`
+        + `<button class="ghost-btn" type="button" data-mirror-key="${escapeHtml(d.key)}">`
+        + `Re-attach to live</button></li>`).join("")
+    + `</ul>`;
+  el.querySelectorAll("[data-mirror-key]").forEach((b) => {
+    b.onclick = () => reattachMirror(b.dataset.mirrorKey, b.previousElementSibling.textContent);
+  });
+}
+
+async function reattachMirror(key, label) {
+  if (!confirm(`Re-attach ${label} to the live site?\n\n`
+    + `Everything this duplicate holds for it is deleted and replaced by the live data. `
+    + `This cannot be undone.`)) return;
+  const password = prompt("Confirm your admin password to re-attach:");
+  if (!password) return;
+  try {
+    const res = await fetch("/mirror/reattach", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key, password }),
+    });
+    if (!res.ok) {
+      alert(res.status === 403 ? "Password confirmation failed." : "Could not re-attach.");
+      return;
+    }
+  } catch (e) {
+    alert("Could not re-attach.");
+    return;
+  }
+  await loadMirrorStatus();
+  await runPlan(false);          // the data underneath the plan just changed
+}
+
 // Boot: learn the role, restore the last view, then auto-load the current plan (no
 // persist) so the schedule/Gantt/views populate without a Plan click.
 (async function boot() {
@@ -2130,6 +2194,7 @@ if (_effDownloadBtn) _effDownloadBtn.onclick = downloadEfficiencyCsv;
       + "of inactivity, this can take up to a minute…";
   }, 5000);
   await initSession();
+  loadMirrorStatus();
   window.addEventListener("hashchange", onHashChange);
   document.querySelectorAll(".nav-item").forEach((n) => {
     n.addEventListener("click", (e) => { e.preventDefault(); showView(n.dataset.view, true); });

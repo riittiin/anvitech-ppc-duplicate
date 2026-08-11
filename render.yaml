@@ -3,7 +3,7 @@
 # the secret env vars (marked sync:false) in the dashboard.
 services:
   - type: web
-    name: anvitech-ppc
+    name: anvitech-ppc-duplicate
     runtime: python
     plan: free
     autoDeploy: true          # deploy automatically on every push to the tracked branch (main)
@@ -26,6 +26,21 @@ services:
         sync: false
       - key: UPSTASH_REDIS_REST_TOKEN
         sync: false
+      # --- This deployment's OWN database (read/write). A separate cluster from
+      # the live site's — nothing here is shared with it.
+      - key: MONGODB_URI
+        sync: false
+      # --- The LIVE site's database, read-only. Setting this turns this
+      # deployment into a mirror: daily entries and orders recorded on the real
+      # site show up here automatically, and nothing done here can reach it.
+      # MUST be the connection string of a read-only Atlas user. Leave unset to
+      # run as a plain standalone copy. See engine/overlay_store.py.
+      - key: UPSTREAM_MONGODB_URI
+        sync: false
+      # Seconds to cache live-site reads. Lower = fresher, more cross-cluster
+      # round trips. Default 30.
+      - key: UPSTREAM_CACHE_TTL
+        value: "30"
       # Run the new operator-stable engine in production. The code default is 'classic'
       # (kept for the test suite that validates that engine); this makes the deployed app
       # use the new engine unless an admin explicitly picks another in Settings.

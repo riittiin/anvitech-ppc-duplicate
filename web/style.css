@@ -79,6 +79,17 @@ body:not(.role-user) .user-only { display: none !important; }
 .brand-accent { color: var(--accent); }
 .brand-sub { font-size: 11px; color: var(--muted); }
 
+/* Shown only on a mirror deployment. Deliberately loud: this tab and the real
+   site are otherwise identical, and confusing the two is expensive. */
+.mirror-badge {
+  flex: none; align-self: center;
+  padding: 4px 9px; border-radius: 6px;
+  background: #b45309; color: #fff;
+  font-size: 11px; font-weight: 800; letter-spacing: .8px;
+  border: 1px solid #f59e0b; white-space: nowrap;
+}
+.mirror-badge[hidden] { display: none; }
+
 .nav { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; }
 .nav-item {
   padding: 8px 14px; border-radius: 7px; cursor: pointer;
