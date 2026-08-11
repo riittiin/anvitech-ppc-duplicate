@@ -41,6 +41,27 @@ services:
       # round trips. Default 30.
       - key: UPSTREAM_CACHE_TTL
         value: "30"
+      # --- Cloud Optimize (GitHub Actions) -------------------------------- #
+      # The full contest runs on a GitHub runner instead of Render's 0.1 CPU.
+      # Needs BOTH of the next two set, or Optimize just computes locally.
+      # A fine-grained PAT with Actions: read+write on THIS repo only.
+      - key: GITHUB_DISPATCH_TOKEN
+        sync: false
+      # Shared secret the workers authenticate back with. Must equal the
+      # GitHub repo secret OPTIMIZE_WORKER_SECRET. Use a NEW value — not the
+      # live site's, or its workers could post results here and vice versa.
+      - key: OPTIMIZE_WORKER_SECRET
+        sync: false
+      # Which repo to dispatch into. Defaults to this duplicate's own repo;
+      # api/main.py REFUSES the mirrored repo outright, so a mistake here
+      # cannot fire a contest in the live site's repo.
+      - key: GITHUB_REPO
+        value: riittiin/anvitech-ppc-duplicate
+      # 0 = go straight to GitHub Actions. The live site waits ~3 min for its
+      # always-on Oracle box to claim the job first; this duplicate has no such
+      # box, so waiting would just add 3 idle minutes to every run.
+      - key: ORACLE_CLAIM_TIMEOUT_MIN
+        value: "0"
       # Run the new operator-stable engine in production. The code default is 'classic'
       # (kept for the test suite that validates that engine); this makes the deployed app
       # use the new engine unless an admin explicitly picks another in Settings.

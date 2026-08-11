@@ -73,6 +73,61 @@ The repo is public, like the original. No password or connection string is baked
 into the source; `.gitignore` already excludes every real-data workbook and
 export. Keep it that way.
 
+## Cloud Optimize (GitHub Actions)
+
+"Start deep search" runs the full ~2,400-plan contest on a GitHub runner rather
+than Render's 0.1 CPU. It needs config on **both** sides.
+
+### On Render
+
+| Variable | Value |
+|---|---|
+| `GITHUB_DISPATCH_TOKEN` | a GitHub PAT with **Actions: read and write** on this repo |
+| `OPTIMIZE_WORKER_SECRET` | any long random string — **a new one**, not the live site's |
+| `GITHUB_REPO` | `riittiin/anvitech-ppc-duplicate` |
+| `ORACLE_CLAIM_TIMEOUT_MIN` | `0` |
+
+### On GitHub (this repo → Settings → Secrets and variables → Actions)
+
+| Secret | Value |
+|---|---|
+| `APP_URL` | `https://anvitech-ppc-duplicate.onrender.com` |
+| `OPTIMIZE_WORKER_SECRET` | **the same string** as the Render variable above |
+
+With either Render variable missing, Optimize still works — it just computes
+locally and slowly. Nothing breaks.
+
+### Why the secret must be new
+
+`OPTIMIZE_WORKER_SECRET` is what a worker presents to prove it may post contest
+results. If the duplicate reused the live site's secret, a worker from either
+deployment could post results into the other. Use a fresh value.
+
+### The dispatch guard
+
+`api/main.py` refuses to dispatch a contest into
+`riittiin/anvitech-ppc-engine`, the repo this deployment mirrors — even if
+`GITHUB_REPO` is explicitly set to it. That road leads to production just as
+surely as a database write: it would consume the live site's Actions minutes,
+and that repo's `APP_URL` secret points at the live app, so its workers would
+post results into production. Covered by `tests/test_mirror_dispatch_guard.py`.
+
+### The Oracle box
+
+The live site has an always-on VM polling `/optimize/pending`
+(`scripts/oracle_optimize_worker.py`) that claims contests before GitHub gets
+them. This duplicate has no such box, so `ORACLE_CLAIM_TIMEOUT_MIN=0` skips the
+claim window. Leave it at `0` unless you point a worker at this deployment —
+and if you do, give it this deployment's `APP_URL` and secret, never the live
+site's.
+
+## Keep-warm
+
+`.github/workflows/keep-warm.yml` pings this deployment every 12 minutes during
+working hours so Render's free tier doesn't sleep it. It targets
+`anvitech-ppc-duplicate.onrender.com`; the inherited version pointed at the live
+site. Actions minutes are free on public repos.
+
 ## Running locally
 
 ```bash

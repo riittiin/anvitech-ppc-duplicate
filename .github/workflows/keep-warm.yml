@@ -1,4 +1,4 @@
-name: Keep the live site warm
+name: Keep the duplicate warm
 
 # Render's free tier sleeps the service after ~15 min idle, so the first hit
 # after a break takes 30–60s to wake. This pings the live URL every 12 minutes
@@ -21,5 +21,5 @@ jobs:
       - name: Ping the live site
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 90 \
-            https://anvitech-ppc.onrender.com/ || true)
-          echo "Pinged anvitech-ppc — HTTP $code (401 = up & login-gated, server is awake)"
+            https://anvitech-ppc-duplicate.onrender.com/ || true)
+          echo "Pinged anvitech-ppc-duplicate — HTTP $code (401 = up & login-gated, server is awake)"

@@ -1111,13 +1111,27 @@ _PROCESS_TOKEN = uuid.uuid4().hex
 # never answers, a watchdog falls back to local compute so the button always
 # works. Spec: docs/superpowers/specs/2026-07-15-optimize-settings-sweep-design.md.
 # --------------------------------------------------------------------------- #
+# The repo this deployment mirrors. Dispatching a contest into it would burn the
+# live site's Actions minutes and — because that repo's secrets point APP_URL at
+# the live app — post results back to production. That is the same clause-2
+# violation as a database write, reached by a different road, so it is refused
+# outright rather than merely defaulted away from.
+UPSTREAM_GITHUB_REPO = "riittiin/anvitech-ppc-engine"
+OWN_GITHUB_REPO = "riittiin/anvitech-ppc-duplicate"
+
+
 def _cloud_config():
     token = os.environ.get("GITHUB_DISPATCH_TOKEN", "").strip()
     secret = os.environ.get("OPTIMIZE_WORKER_SECRET", "").strip()
     if not token or not secret:
         return None
+    repo = os.environ.get("GITHUB_REPO", OWN_GITHUB_REPO).strip() or OWN_GITHUB_REPO
+    if repo == UPSTREAM_GITHUB_REPO:
+        # Misconfiguration, not a request to honour. Returning None disables the
+        # cloud tier, so Optimize still works — it just computes locally.
+        return None
     return {"token": token, "secret": secret,
-            "repo": os.environ.get("GITHUB_REPO", "riittiin/anvitech-ppc-engine"),
+            "repo": repo,
             "workflow": os.environ.get("OPTIMIZE_WORKFLOW", "optimize.yml"),
             # 40, not 20: flow-scheduler evals are ~5x slower than classic, so the
             # GitHub Actions runner needs ~25 min for a full flow contest. At 20 the
