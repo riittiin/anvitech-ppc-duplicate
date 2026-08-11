@@ -282,8 +282,28 @@ class _RequestCachedStore:
         self._b.delete_key(key)
 
 
+def _wrap_upstream_overlay(local_store, upstream_uri: str):
+    """Layer ``local_store`` over a read-only view of the production cluster.
+
+    Only used by the duplicate deployment (``UPSTREAM_MONGODB_URI`` set). The
+    upstream connection is read-only twice over: the Atlas user has no write
+    permission, and ``ReadOnlyStore`` refuses writes before the driver is even
+    reached. See ``engine/overlay_store.py``.
+    """
+    from engine.overlay_store import OverlayStore, ReadOnlyStore, TTLCachedReads
+
+    ttl = float(os.environ.get("UPSTREAM_CACHE_TTL") or 30)
+    upstream = TTLCachedReads(ReadOnlyStore(MongoStore(upstream_uri)), ttl=ttl)
+    return OverlayStore(upstream, local_store)
+
+
 def get_store():
     """Pick the backend: MongoDB Atlas > Upstash Redis > local file.
+
+    When ``UPSTREAM_MONGODB_URI`` is set, the chosen backend is wrapped in an
+    OverlayStore that mirrors a second (production) cluster read-only. Unset —
+    the normal case for the original deployment and for local dev — nothing is
+    wrapped and behaviour is unchanged.
 
     The chosen backend is **cached per configuration** and reused across every
     call. This matters most for Mongo: a ``MongoClient`` owns a connection pool
@@ -300,9 +320,10 @@ def get_store():
     mongo_uri = os.environ.get("MONGODB_URI")
     url = os.environ.get("UPSTASH_REDIS_REST_URL")
     token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+    upstream_uri = os.environ.get("UPSTREAM_MONGODB_URI")
     base = str(os.environ.get("STORE_DIR") or (
         Path(__file__).resolve().parent.parent / "data" / "store"))
-    key = (mongo_uri, url, token, base)
+    key = (mongo_uri, url, token, upstream_uri, base)
 
     store = _STORE_CACHE.get(key)
     if store is None:
@@ -312,6 +333,8 @@ def get_store():
             store = UpstashStore(url, token)
         else:
             store = LocalStore(base)
+        if upstream_uri:
+            store = _wrap_upstream_overlay(store, upstream_uri)
         _STORE_CACHE[key] = store
 
     req_cache = _REQUEST_CACHE.get()

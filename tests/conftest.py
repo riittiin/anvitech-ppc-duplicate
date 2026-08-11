@@ -26,6 +26,9 @@ def _isolate_store(tmp_path, monkeypatch):
     monkeypatch.delenv("UPSTASH_REDIS_REST_URL", raising=False)
     monkeypatch.delenv("UPSTASH_REDIS_REST_TOKEN", raising=False)
     monkeypatch.delenv("MONGODB_URI", raising=False)
+    # This deployment mirrors production when UPSTREAM_MONGODB_URI is set. Tests
+    # must never reach a real cluster, so clear it the same way.
+    monkeypatch.delenv("UPSTREAM_MONGODB_URI", raising=False)
     # Login credentials for the test client. Production ships NO baked default
     # password (the repo is public — see api/auth._accounts), so the API-level
     # suites supply the fixture creds they log in with via env vars here.
