@@ -209,15 +209,20 @@ def _plan_config(config) -> PlanConfig:
         # measured WORSE on the live book (see PlanConfig.split_enabled). Forwarding
         # it would silently degrade every plan, since the live config has it on.
         #
-        # Settings' "balance operator load" — read only by the CLASSIC engine's
-        # rule6_allocate, so it did nothing under scheduler='new'. Without it the
-        # board uses "scarce", whose tie-break between equally-qualified people is
-        # their NAME: on the live book Rohan Chakane ran at 90.4% and Sidhu Singe at
-        # 81.6% purely because "Rohan" sorts first. "balanced" picks the least-loaded
-        # instead (measured: Swapnil 10.6% -> 43.0%, Narayan 2.4% -> 16.5%, spread
-        # 88 -> 74 points, late-days unchanged at 397 -> 398).
-        operator_pick=("balanced" if getattr(config, "balance_operator_load", False)
-                       else "scarce"),
+        # Settings' "balance operator load" is deliberately NOT forwarded.
+        #
+        # It is read only by the classic engine's rule6_allocate, so under
+        # scheduler='new' it does nothing, and the board uses "scarce" — whose
+        # tie-break between equally-qualified people is their NAME (on the live book
+        # that is Rohan Chakane 90.4% vs Sidhu Singe 81.6%, same machines, same shift).
+        #
+        # Wiring it to "balanced" was tried and MEASURED on the live book. It evens
+        # the load out (spread 88 -> 74 points, Swapnil 10.6% -> 43.0%) but the plan
+        # gets WORSE on both delivery metrics: 397 -> 398 late-days and 3,399 -> 3,500
+        # on the app's own objective. Both policies are deterministic (verified by
+        # repeat runs). Evening out who is busy is not worth a worse plan, so the
+        # engine keeps "scarce" until something changes that trade-off.
+
     )
 
 
