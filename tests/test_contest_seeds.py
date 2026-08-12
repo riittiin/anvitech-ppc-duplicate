@@ -205,3 +205,38 @@ class TestSharding:
         for i in range(total):
             seen.extend(jobs[i::total])
         assert sorted(seen) == sorted(jobs)
+
+
+# --------------------------------------------------------------------------- #
+# The activation knob
+# --------------------------------------------------------------------------- #
+
+class TestCloudSeedsKnob:
+
+    def test_off_by_default(self, monkeypatch):
+        monkeypatch.delenv("OPTIMIZE_CLOUD_SEEDS", raising=False)
+        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", ())
+        assert osvc.cloud_seeds() == []
+
+    def test_the_constant_is_used_when_no_env_is_set(self, monkeypatch):
+        monkeypatch.delenv("OPTIMIZE_CLOUD_SEEDS", raising=False)
+        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (7, 99))
+        assert osvc.cloud_seeds() == [7, 99]
+
+    def test_env_overrides_the_constant(self, monkeypatch):
+        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (7,))
+        monkeypatch.setenv("OPTIMIZE_CLOUD_SEEDS", "11,22,33")
+        assert osvc.cloud_seeds() == [11, 22, 33]
+
+    def test_whitespace_and_blanks_are_tolerated(self, monkeypatch):
+        monkeypatch.setenv("OPTIMIZE_CLOUD_SEEDS", " 5 , ,6 ")
+        assert osvc.cloud_seeds() == [5, 6]
+
+    def test_junk_never_breaks_a_contest(self, monkeypatch):
+        monkeypatch.setenv("OPTIMIZE_CLOUD_SEEDS", "5,abc,6")
+        assert osvc.cloud_seeds() == [5, 6]
+
+    def test_entirely_unparseable_falls_back_to_the_constant(self, monkeypatch):
+        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (7,))
+        monkeypatch.setenv("OPTIMIZE_CLOUD_SEEDS", "abc")
+        assert osvc.cloud_seeds() == [7]

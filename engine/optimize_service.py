@@ -59,6 +59,38 @@ CLOUD_BUDGET_PER_CANDIDATE = 400
 CLOUD_NEW_BUDGET_PER_CANDIDATE = 150
 
 
+# Extra RNG seeds the cloud contest multi-starts from, on top of the base seed.
+# EMPTY = off (one seed, exactly today's contest). Every seed added multiplies the
+# job count and therefore the wall-clock, so this trades breadth in the overlap
+# grid for breadth in the random stream — see cloud_seeds().
+CLOUD_EXTRA_SEEDS: tuple = ()
+
+
+def cloud_seeds() -> list:
+    """Extra seeds for the cloud contest.
+
+    OPTIMIZE_CLOUD_SEEDS (env, comma-separated ints) overrides the constant, so the
+    allocation can be tuned from the Render dashboard without a deploy — the same
+    pattern as OPTIMIZE_CLOUD_BUDGET_PER_CANDIDATE. Unset/blank/unparseable => the
+    constant. Junk entries are skipped rather than failing a contest.
+    """
+    import os
+    raw = os.environ.get("OPTIMIZE_CLOUD_SEEDS", "").strip()
+    if raw:
+        out = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                out.append(int(part))
+            except ValueError:
+                continue                      # ignore junk; never break a contest
+        if out:
+            return out
+    return list(CLOUD_EXTRA_SEEDS)
+
+
 def cloud_budget(config) -> int:
     """Plans per candidate for the cloud contest, per scheduler mode.
 
