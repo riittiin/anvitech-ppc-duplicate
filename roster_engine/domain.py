@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-from engine.loaders import parse_resource_candidates
+from engine.loaders import normalize_process_name, parse_resource_candidates
 from engine.orderbook import is_dispatch
 
 MACHINING = "machining"
@@ -157,6 +157,31 @@ def build_shop(masters, absent_by_operator=None) -> Shop:
                 absent=dict(absent_by_operator or {}))
 
 
+def _remaining_by_seq(batch, routing) -> dict | None:
+    """Translate a real ``engine.models.Batch``'s ``process_qty`` (keyed by
+    NORMALIZED PROCESS NAME, per RULES.md's per-process remaining) into
+    ``Job.remaining`` (keyed by routing op_seq, what ``Job.qty_for`` reads).
+
+    Mirrors ``engine.new_engine._orders_from_batches`` exactly — that is the
+    reference implementation for this translation, right down to the
+    normalizer (``engine.loaders.normalize_process_name``, the SAME one the
+    order book used to key ``process_qty`` in the first place; any other rule
+    — e.g. stripping spaces instead of collapsing them — silently drops every
+    multi-word step like "CNC FIRST SIDE").
+
+    Real ``process_qty`` wins when present. Falls back to a ``process_remaining``
+    attribute (already seq-keyed) for lightweight test doubles that skip the
+    name-keyed dict entirely."""
+    process_qty = getattr(batch, "process_qty", None)
+    if process_qty:
+        return {
+            proc.seq: int(round(process_qty[normalize_process_name(proc.name)]))
+            for proc in routing.processes
+            if normalize_process_name(proc.name) in process_qty
+        }
+    return getattr(batch, "process_remaining", None)
+
+
 def build_jobs(batches, masters):
     """Batches (Rule 1's output, already clubbed) -> jobs. Never re-consolidates.
 
@@ -193,6 +218,6 @@ def build_jobs(batches, masters):
             due=due,
             so_refs=tuple(so_refs or ()),
             ops=ops,
-            remaining=getattr(batch, "process_remaining", None)))
+            remaining=_remaining_by_seq(batch, routing)))
         by_key[str(batch.batch_id)] = batch
     return jobs, by_key, skipped

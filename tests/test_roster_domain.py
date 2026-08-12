@@ -2,7 +2,7 @@ import pathlib
 from datetime import date, datetime
 
 from engine.config import Config
-from engine.models import Machine, Masters, Operator, Process, Routing, WorkCalendar
+from engine.models import Batch, Machine, Masters, Operator, Process, Routing, WorkCalendar
 from roster_engine import domain, worktime
 
 
@@ -82,6 +82,78 @@ def test_roster_engine_never_imports_ppc_engine():
     offenders = [p.name for p in root.rglob("*.py")
                  if "ppc_engine" in p.read_text()]
     assert offenders == []
+
+
+def _job(**overrides):
+    base = dict(key="B1", item_code="GOOD", qty=254, due=date(2026, 9, 1),
+                so_refs=("SO1",), ops=(), remaining=None)
+    base.update(overrides)
+    return domain.Job(**base)
+
+
+def test_qty_for_with_no_remaining_returns_the_full_batch_qty_for_any_step():
+    job = _job(remaining=None)
+    assert job.qty_for(1) == 254
+    assert job.qty_for(99) == 254
+
+
+def test_qty_for_with_populated_remaining_returns_the_per_step_value():
+    job = _job(remaining={1: 88, 2: 254})
+    assert job.qty_for(1) == 88
+    assert job.qty_for(2) == 254
+
+
+def test_qty_for_falls_back_to_full_batch_qty_when_a_step_is_absent_from_remaining():
+    """A clubbed order's step with no entry in `remaining` (nothing punched on it
+    yet) owes the full batch qty, not zero — this is the exact class of bug that
+    dropped 281 pieces of a clubbed order into no plan at all (2026-08-11)."""
+    job = _job(qty=254, remaining={1: 88})
+    assert job.qty_for(2) == 254
+
+
+def test_qty_for_returns_zero_when_a_step_is_fully_complete():
+    job = _job(remaining={1: 0})
+    assert job.qty_for(1) == 0
+
+
+def test_build_jobs_translates_name_keyed_process_qty_to_seq_keyed_remaining():
+    """Real engine.models.Batch keys process_qty by NORMALIZED PROCESS NAME, not
+    op_seq — build_jobs must translate it via the routing using the exact same
+    normalizer the order book used to key it (engine.loaders.normalize_process_name),
+    exactly as engine.new_engine._orders_from_batches does. A multi-word process
+    name ('CNC FIRST SIDE') is the case a wrong normalizer (e.g. one that strips
+    spaces instead of collapsing them) silently drops."""
+    routing = Routing("ITEM1", "desc", "cust", "steel", None, [
+        # Irregular casing/spacing straight off the sheet -- must normalize to the
+        # SAME key process_qty is stored under, or the lookup below silently misses.
+        Process(1, "Cnc  First Side", 5.0, None, None, "CNC1"),
+        Process(2, "cnc second side", 5.0, None, None, "CNC1"),
+        Process(3, "DEBURING", 1.5, None, None, "MD1"),
+    ])
+    masters = Masters(
+        machines={"CNC1": Machine("CNC1", "CNC 1", "CNC lathe"),
+                  "MD1": Machine("MD1", "MD 1", "manual")},
+        routings={"ITEM1": routing})
+    batch = Batch(
+        batch_id="26-27SO120+26-27SO122", item_code="ITEM1", item_name="widget",
+        qty=535, so_delivery_date=date(2026, 9, 1),
+        source_so_refs=["26-27SO120", "26-27SO122"],
+        # process_qty is keyed by NORMALIZED process name (engine.models.Batch's own
+        # documented contract) -- exercising the multi-word key is the point: a
+        # normalizer that strips spaces instead of collapsing them would produce
+        # "CNCFIRSTSIDE"/"CNCSECONDSIDE" and never match these routing steps.
+        process_qty={
+            "CNC FIRST SIDE": 88,    # 254 (SO120's own remainder) already made elsewhere
+            "CNC SECOND SIDE": 535,  # nothing made yet on this step
+        })
+
+    jobs, by_key, skipped = domain.build_jobs([batch], masters)
+
+    assert skipped == []
+    job = jobs[0]
+    assert job.qty_for(1) == 88          # CNC FIRST SIDE: per-step remaining
+    assert job.qty_for(2) == 535         # CNC SECOND SIDE: multi-word step survives
+    assert job.qty_for(3) == 535         # DEBURING: absent from process_qty -> full qty
 
 
 def test_machining_predicate_agrees_with_the_classic_setup_rule():
