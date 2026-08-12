@@ -15,8 +15,11 @@ Contract notes that are load-bearing elsewhere:
     ``delay_report._OFF_LANES``, ``analytics.NON_MACHINE_LANES`` and
     ``freeze._OS_LANES`` all match on them literally; anything else bills
     outsourcing to an in-house machine (the 2026-08-09 defect).
-  * every real machine entry that occupies time names an operator, because
-    ``freeze.py`` pins machine AND operator, so an empty name freezes a ghost.
+  * EVERY real-machine entry names an operator and carries at least one segment —
+    not merely the ones that occupy time. ``freeze.py`` pins machine AND operator,
+    so an empty name freezes a ghost, and a zero-work step (a real bench with a
+    blank cycle time) is not invisible: overlap opens it early and pacing holds
+    its end to its predecessor's, so it is drawn, billed and frozen like any other.
 
 THE FROZEN-ROW TRANSLATION is the delicate part and it lives in ``_pins``. The
 producer is ``engine.freeze.compute_frozen_set``, whose rows are
@@ -34,6 +37,7 @@ from datetime import datetime
 
 from engine.loaders import normalize_process_name, normalize_resource_id
 from engine.models import ScheduleEntry
+from engine.pipeline import RuleError
 from roster_engine import SCHEDULER_FINGERPRINT  # noqa: F401  (re-exported)
 from roster_engine import scheduler
 from roster_engine.domain import OUTSOURCED, build_jobs, build_shop
@@ -68,13 +72,37 @@ def run(batches, config=None, notes=None, masters=None, machine_lost_min=None,
 
     shop = build_shop(masters, _absent_from_reserved(reserved, masters, say))
     pins = _pins(frozen, batch_by_key, masters, say)
-    plan = scheduler.schedule(
-        jobs, [j.key for j in jobs], shop, config,
-        overlap=_overlap(config),
-        crew_rank=dict(getattr(config, "crew_rank", None) or {}),
-        frozen=pins)
+    try:
+        plan = scheduler.schedule(
+            jobs, [j.key for j in jobs], shop, config,
+            overlap=_overlap(config),
+            crew_rank=dict(getattr(config, "crew_rank", None) or {}),
+            frozen=pins)
+    except scheduler.Unschedulable as err:
+        raise _rule_error(err) from err
     _check_pins_landed(pins, plan, say)
     return _entries(plan, batch_by_key)
+
+
+def _rule_error(err) -> RuleError:
+    """``roster_engine`` fails loud with its own ``Unschedulable`` — it knows
+    nothing about this app and must not, so it cannot raise ``RuleError`` itself.
+    Translating it here is the whole reason this file exists.
+
+    Why it matters that it is translated at all: ``pipeline.run_rule`` catches
+    ``RuleError`` and nothing else. An escaping ``RuntimeError`` unwinds
+    ``run_forward`` entirely — the trace Rules 1-3 filled in is discarded, every
+    per-rule tab goes blank and ``POST /run`` returns a 500 with nothing to show
+    the planner. CLAUDE.md principle 5(b): a rule-level contract violation is
+    typed and LOCALIZED, so the frontend can say exactly where it broke.
+
+    The commonest cause is a routing pointing at a machine nobody in Settings is
+    qualified for — including the documented PROVISIONAL machine, one a routing
+    names before the Machine master has caught up.
+    """
+    blocked = getattr(err, "blocked", ()) or ()
+    record_id = str(blocked[0][0]) if blocked else "-"
+    return RuleError("rule6", record_id, str(err))
 
 
 # --------------------------------------------------------------------------- #

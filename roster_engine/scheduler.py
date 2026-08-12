@@ -69,6 +69,23 @@ _STALL_WINDOWS = 120
 _SUPERSEDED = "superseded by an earlier-started row for the same operation"
 
 
+class Unschedulable(RuntimeError):
+    """No shift inside the horizon could ever staff some operation.
+
+    A ``RuntimeError`` subclass, so a caller that only knows the base class is
+    unaffected and the message is unchanged. It additionally carries ``blocked``
+    — ``((job_key, op_seq, op_name, machine_options), ...)`` — because this package
+    deliberately knows nothing about the application embedding it and therefore
+    cannot raise that application's own localized error type. The embedder reads
+    ``blocked`` and re-raises in its own terms; without it, the only way to name
+    the offending job is to parse the message back apart.
+    """
+
+    def __init__(self, message: str, blocked=()):
+        super().__init__(message)
+        self.blocked = tuple(blocked)
+
+
 @dataclass(frozen=True)
 class Placement:
     """One operation, placed. ``segments`` is the per-shift operator record:
@@ -184,12 +201,14 @@ def schedule(jobs, sequence, shop, config, *, overlap=1.0, crew_rank=None,
         for key in unfinished[:5]:
             js = state[key]
             op = js.job.ops[js.idx]
-            blocked.append(f"{key} step {op.seq} '{op.name}' on "
-                           f"{'/'.join(op.machine_options) or '(no machine)'}")
-        raise RuntimeError(
+            blocked.append((key, op.seq, op.name, tuple(op.machine_options)))
+        raise Unschedulable(
             "roster scheduler could not place every operation within the horizon "
             "— no shift ever had a qualified, rostered operator for: "
-            + "; ".join(blocked))
+            + "; ".join(f"{key} step {seq} '{name}' on "
+                        f"{'/'.join(options) or '(no machine)'}"
+                        for key, seq, name, options in blocked),
+            blocked)
 
     placements = _pace(placements, completion)
     return Plan(tuple(placements), completion, tuple(unpinned))
@@ -319,8 +338,13 @@ def _settle_milestones(state, now, completion) -> list:
                 at = js.prev_end
                 if at > now:
                     continue
+                # The batch quantity, the same as every other placement here and
+                # the same as the engine this replaces writes on an off-machine
+                # milestone. The dispatch row is displayed and exported like any
+                # other, so a milestone reading "Qty 0" is a visible difference
+                # that has nothing to do with scheduling.
                 out.append(Placement(js.job.key, op.seq, op.name, DISPATCH, None,
-                                     0, at, at, 0.0, ()))
+                                     int(max(qty, 0)), at, at, 0.0, ()))
                 _advance(js, at, completion)
             elif qty <= 0 or not op.machine_options:
                 # Nothing left to make at this step (a re-plan's already-finished
@@ -748,8 +772,18 @@ def _work(mid, ms, order, state, window, start, operator, overlap, setup_min,
             return seg_end                        # still in the chuck next step
     else:
         # A step with a machine but no work at all (zero cycle time, no setup):
-        # a zero-duration placement, so the chain still advances and it is visible.
+        # a zero-length segment, so the chain still advances and it is visible.
+        #
+        # The segment is recorded even though it consumes nothing, because this
+        # placement is NOT invisible downstream: overlap can open it early and
+        # ``pace_floor`` holds its end to its predecessor's, so the published
+        # entry spans real wall-clock time. A reader that trusts the operator
+        # record — the Gantt bar, the delay report's running-op list, and above
+        # all ``freeze``, which pins machine AND operator — would otherwise get a
+        # machine placement with nobody on it and freeze a ghost. The person IS
+        # standing at the bench: ``operator`` is right here.
         seg_end = start
+        ms.segments.append((start, seg_end, operator))
         if ms.started is None:
             ms.started = start
 

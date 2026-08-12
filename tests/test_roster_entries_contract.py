@@ -11,8 +11,18 @@ SILENTLY on a live screen:
     (``delay_report._OFF_LANES``, ``analytics.NON_MACHINE_LANES``,
     ``freeze._OS_LANES``) — the 2026-08-09 defect was outsourcing being billed to
     an in-house machine;
-  * every real-machine entry that occupies time names an operator, because
-    ``engine/freeze.py`` pins machine AND operator.
+  * EVERY real-machine entry names an operator and carries a segment, because
+    ``engine/freeze.py`` pins machine AND operator. Not only the ones that occupy
+    time: a zero-work bench step still spans wall-clock time once overlap and
+    pacing have had it, so guarding on ``end <= start`` lets exactly the
+    dangerous entry through.
+
+A fourth thing is pinned here because it is otherwise pinned VACUOUSLY: a
+multi-shift fixture, so ``op_segments``' sorted-by-start order is checked on an
+entry that really has three segments, and an overlap fixture with no OS step
+between its two machining steps, so the optimizer's primary lever is measured
+rather than assumed. And an unstaffable book must surface as a typed
+``RuleError``, not a bare ``RuntimeError`` that discards the whole trace.
 
 The frozen-row translation has its own section. The rows are built by actually
 calling ``engine.freeze.compute_frozen_set`` — the real producer — because its
@@ -37,6 +47,7 @@ _MACHINES = {
     "CNC1": Machine("CNC1", "CNC 1", "CNC lathe", available_hrs_per_day=19.5),
     "CNC4": Machine("CNC4", "CNC 4", "CNC lathe", available_hrs_per_day=19.5),
     "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5),
+    "MPK1": Machine("MPK1", "MPK 1", "manual", available_hrs_per_day=9.5),
 }
 
 # Seq, name, cycle_time, total_time, suggested_machine, allotted_machine — the
@@ -50,6 +61,32 @@ _PROCESSES = [
     Process(4, "DISPATCH", None, None, None, None),
 ]
 
+# A step on a REAL machine whose cycle time is blank — Test5's packing benches are
+# exactly this shape. The machine is occupied for no minutes, but overlap starts
+# the step early and pacing holds its end to its predecessor's, so the published
+# entry spans real wall-clock time and is drawn, billed and frozen like any other.
+_ZERO_CYCLE_PROCESSES = [
+    Process(1, "CNC FIRST SIDE", 10.0, None, None, "CNC1"),
+    Process(2, "PACKING", None, None, None, "MPK1"),
+]
+
+# One operation long enough to cross both shift boundaries: 30 x 60 min + 90 min
+# setup = 1890, against a 660-minute first shift, a 600-minute second and 630 of
+# the next first. Three segments, two handoffs.
+_HANDOFF_PROCESSES = [Process(1, "CNC FIRST SIDE", 60.0, None, None, "CNC1")]
+
+# Two machining steps back to back with NO vendor block between them — the only
+# routing shape in which overlap is observable at all (nothing overlaps into OS).
+_OVERLAP_PROCESSES = [
+    Process(1, "CNC FIRST SIDE", 10.0, None, None, "CNC1"),
+    Process(2, "CNC SECOND SIDE", 5.0, None, None, "CNC4"),
+]
+
+_TWO_SHIFT_CREW = [
+    Operator("Narayan", "CNC1", ["CNC1"], "First shift"),
+    Operator("Sidhu", "CNC1", ["CNC1"], "Second shift"),
+]
+
 
 def _masters(processes=None, operators=None):
     return Masters(
@@ -57,7 +94,7 @@ def _masters(processes=None, operators=None):
         routings={"ITEM": Routing("ITEM", "d", "", "", None,
                                   list(processes or _PROCESSES))},
         operators=list(operators or [
-            Operator("Anturam", "MD1", ["MD1"], "First shift"),
+            Operator("Anturam", "MD1/MPK1", ["MD1", "MPK1"], "First shift"),
             Operator("Narayan", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift"),
             Operator("Sidhu", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift"),
         ]),
@@ -107,8 +144,16 @@ def test_returns_schedule_entries():
     assert sorted(e.process_seq for e in entries) == [1, 2, 3, 4]
 
 
-def test_op_segments_are_start_end_operator_triples_in_order():
-    for e in _run():
+@pytest.mark.parametrize("processes,operators,qty", [
+    (None, None, 20),
+    (_ZERO_CYCLE_PROCESSES, None, 20),
+    (_HANDOFF_PROCESSES, _TWO_SHIFT_CREW, 30),
+])
+def test_op_segments_are_start_end_operator_triples_in_order(processes, operators,
+                                                             qty):
+    entries = _run([_batch(qty=qty)],
+                   masters=_masters(processes=processes, operators=operators))
+    for e in entries:
         assert isinstance(e.op_segments, list), "rule6_allocate assigns by index"
         for seg in e.op_segments:
             assert isinstance(seg, tuple) and len(seg) == 3
@@ -118,20 +163,73 @@ def test_op_segments_are_start_end_operator_triples_in_order():
         assert starts == sorted(starts)
 
 
-def test_every_machine_entry_names_an_operator():
+@pytest.mark.parametrize("processes,operators,qty,expect", [
+    (None, None, 20, 2),
+    (_ZERO_CYCLE_PROCESSES, None, 20, 2),
+    (_HANDOFF_PROCESSES, _TWO_SHIFT_CREW, 30, 1),
+])
+def test_every_machine_entry_names_an_operator(processes, operators, qty, expect):
     """engine/freeze.py pins machine AND operator; an empty operator freezes a
-    ghost. Entries that occupy no time at all are milestones in all but name."""
+    ghost.
+
+    The guard is ``op_segments``, NOT ``end <= start``. A step on a real machine
+    with a blank cycle time occupies no minutes, but overlap starts it early and
+    pacing holds its end to its predecessor's — so it spans real wall-clock time,
+    ``delay_report._order_ops`` counts it as running, the Gantt draws a bar for it
+    and ``freeze.schedule_projection`` emits it. Skipping it on duration let
+    exactly that entry out with ``operator == ""``.
+    """
+    entries = _run([_batch(qty=qty)],
+                   masters=_masters(processes=processes, operators=operators))
     seen = 0
-    for e in _run():
+    for e in entries:
         if e.machine in (roster_adapter.OS_LANE, roster_adapter.OFF_LANE):
             continue
-        if e.end <= e.start:
-            continue
         seen += 1
+        assert e.op_segments, f"{e.process_name} on {e.machine} has no segments"
         assert e.operator, f"{e.process_name} has no operator"
-        assert e.op_segments and all(seg[2] for seg in e.op_segments)
+        assert all(seg[2] for seg in e.op_segments)
         assert e.operator == e.op_segments[0][2]
-    assert seen >= 2, "fixture must actually produce real-machine entries"
+    assert seen == expect, "fixture must actually produce real-machine entries"
+
+
+def test_a_zero_work_machine_entry_still_names_an_operator():
+    """The reachable violation, named: a PACKING bench with a blank cycle time,
+    released early by overlap and paced out to the CNC step in front of it."""
+    entries = _run([_batch()], masters=_masters(_ZERO_CYCLE_PROCESSES))
+    packing = _at(entries, 2)
+    assert packing.machine == "MPK1"
+    assert packing.occupancy_min == 0.0
+    assert packing.end > packing.start, "the fixture must span real time"
+    assert packing.operator == "Anturam"
+    assert packing.op_segments == [(packing.start, packing.start, "Anturam")]
+
+    # ...and the strictest downstream reader agrees.
+    from engine.freeze import schedule_projection
+    rows = schedule_projection(entries)
+    assert {r["process_seq"] for r in rows} == {1, 2}
+    assert all(r["operator"] for r in rows), rows
+
+
+def test_a_shift_handoff_produces_ordered_segments_at_the_seam():
+    """The multi-segment path five surfaces read. Every other fixture here gives
+    each entry exactly ONE segment, so the sorted-by-start contract and
+    ``operator == op_segments[0][2]`` are both pinned vacuously without this."""
+    entries = _run([_batch(qty=30)],
+                   masters=_masters(_HANDOFF_PROCESSES, _TWO_SHIFT_CREW))
+    e = _at(entries, 1)
+    assert e.op_segments == [
+        # first shift          -> second shift        -> Thursday off -> first
+        (datetime(2026, 8, 12, 8, 0), datetime(2026, 8, 12, 19, 0), "Narayan"),
+        (datetime(2026, 8, 12, 19, 0), datetime(2026, 8, 13, 5, 0), "Sidhu"),
+        (datetime(2026, 8, 14, 8, 0), datetime(2026, 8, 14, 18, 30), "Narayan"),
+    ]
+    starts = [s[0] for s in e.op_segments]
+    assert starts == sorted(starts) and len(set(starts)) == 3
+    assert e.operator == "Narayan", "the operator is the FIRST segment's"
+    # operator_label de-duplicates, so it reads as two names for three segments.
+    assert e.operator_label() == "Narayan → Sidhu"
+    assert e.occupancy_min == 90.0 + 30 * 60.0     # worked minutes, not elapsed
 
 
 def test_off_lane_names_match_the_consumers():
@@ -161,6 +259,23 @@ def test_so_refs_batch_id_and_qty_survive_onto_every_entry():
         assert list(e.so_refs) == ["26-27SO1", "26-27SO2"]
     assert _at(entries, 1).qty == 20
     assert _at(entries, 1).occupancy_min == 90.0 + 20 * 10.0
+
+
+def test_off_machine_milestones_carry_the_batch_quantity():
+    """The classic engine writes ``_qty_for(batch, p)`` on an off-machine milestone
+    (rule6_allocate.py:633), so the Schedule tab and the shift-wise export show the
+    order's quantity on its DISPATCH row. This seam exists to be A/B-compared
+    against that engine — a milestone reading ``Qty 0`` is a visible difference
+    that has nothing to do with scheduling."""
+    entries = _run()
+    assert _at(entries, 2).qty == 20, "OS block"
+    assert _at(entries, 4).qty == 20, "DISPATCH milestone"
+
+    # ...and it is the BATCH's per-process quantity, never the ordered qty, on a
+    # re-plan where part of the book is already made.
+    batch = _batch(qty=369, so_refs=("26-27SO1", "26-27SO2"),
+                   process_qty={"DISPATCH": 242})
+    assert _at(_run([batch]), 4).qty == 242
 
 
 def test_operator_label_renders_a_shift_handoff():
@@ -229,6 +344,36 @@ def test_operator_absences_reach_the_shop():
     absent = _at(_run([_batch()], masters=masters, reserved=away), 1)
     assert absent.start >= datetime(2026, 8, 14, 8, 0), \
         "an absent operator was rostered anyway"
+
+
+def test_overlap_percent_is_translated_as_a_fraction_of_pieces_cleared():
+    """``overlap_percent`` 0-100 -> the fraction of pieces that must clear. Both
+    ends are clamped, and ``overlap_mode`` is deliberately ignored (the value is
+    optimizer-owned and persisted as a percentage)."""
+    assert roster_adapter._overlap(_cfg(overlap_percent=80)) == 0.8
+    assert roster_adapter._overlap(_cfg(overlap_percent=0)) == 0.0
+    assert roster_adapter._overlap(_cfg(overlap_percent=100)) == 1.0
+
+
+def test_the_overlap_setting_actually_moves_the_successor():
+    """The optimizer's primary lever, measured end to end on a routing with NO
+    vendor block between the two machining steps — nothing overlaps into OS, so
+    the default fixture cannot see this at all.
+
+    Step 1 is 90 min setup + 20 x 10 min. At 100% the successor waits for all 290
+    minutes (12:50); at 50% it opens once 10 pieces have cleared, i.e. after
+    90 + 100 = 190 minutes (11:10).
+    """
+    masters = _masters(_OVERLAP_PROCESSES)
+    starts = {}
+    for pct in (50, 100):
+        entries = _run([_batch()], masters=masters,
+                       config=_cfg(overlap_percent=pct))
+        assert _at(entries, 1).end == datetime(2026, 8, 12, 12, 50)
+        starts[pct] = _at(entries, 2).start
+    assert starts[50] == datetime(2026, 8, 12, 11, 10)
+    assert starts[100] == datetime(2026, 8, 12, 12, 50)
+    assert starts[50] < starts[100], "overlap did not reach the scheduler"
 
 
 def test_a_reserved_key_that_is_not_an_operator_is_reported():
@@ -391,3 +536,51 @@ def test_a_malformed_or_stale_row_never_raises(bad):
     entries = _run(frozen=rows, notes=notes)
     assert _at(entries, 1).machine == "CNC1"
     assert notes, f"row {bad} was dropped in silence"
+
+
+# --------------------------------------------------------------------------- #
+# A book the shop cannot staff: a TYPED rule error, never a bare RuntimeError
+# --------------------------------------------------------------------------- #
+
+def test_an_unstaffable_book_raises_a_typed_rule_error_at_the_seam():
+    """CLAUDE.md principle 5(b): a rule-level contract violation raises
+    ``RuleError(rule, record_id, message)`` so ``pipeline.run_rule`` can record
+    exactly where it broke. ``roster_engine`` raises a plain ``RuntimeError`` —
+    which it must, it does not know the app — so the adapter is where that becomes
+    typed. It is the one file allowed to know both worlds."""
+    from engine.pipeline import RuleError
+
+    masters = _masters(operators=[Operator("Anturam", "MD1", ["MD1"],
+                                           "First shift")])
+    with pytest.raises(RuleError) as caught:
+        _run(masters=masters)
+    err = caught.value
+    assert err.rule == "rule6"
+    assert err.record_id == "B001", "the trace must name the blocking batch"
+    assert "CNC1" in err.message and "CNC FIRST SIDE" in err.message
+
+
+def test_an_unstaffable_book_keeps_the_trace_through_run_forward(monkeypatch,
+                                                                 loaded):
+    """Through the REAL entry point, on the repo's canonical sample workbook,
+    which carries the documented provisional machine ``CNC9``.
+
+    Uncaught, the ``RuntimeError`` unwinds ``run_forward`` entirely: the trace is
+    discarded, every per-rule tab goes blank and ``POST /run`` 500s with nothing to
+    show. Rules 1-3 succeeded and their snapshots must survive."""
+    from engine import pipeline
+    from engine.models import PlanRun
+
+    monkeypatch.setattr(Config, "validate", lambda self: None)   # Task 10's job
+    so_lines, masters = loaded
+    trace = pipeline.run_forward(
+        PlanRun(so_lines=so_lines),
+        Config(plan_start_date=date(2025, 3, 1), scheduler="roster"), masters)
+
+    assert trace["rule1"]["reached"] is True and trace["rule1"]["error"] is None
+    assert trace["rule3"]["output"]["rows"], "Rules 1-3 must keep their snapshots"
+    err = trace["rule6"]["error"]
+    assert err is not None, "the RuntimeError escaped and the trace was thrown away"
+    assert err["rule"] == "rule6" and err["record_id"]
+    assert "CNC9" in err["message"], err        # the provisional machine
+    assert trace["rule7"]["reached"] is False
