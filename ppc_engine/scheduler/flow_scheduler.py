@@ -555,8 +555,18 @@ def _lay_on_machine(
             name = staffing.candidate_operator(
                 machine, win.shift_date, win.shift, seg_start, seg_end, masters, config)
             if name is None:
-                cursor = win.end
-                continue
+                # Nobody free for the WHOLE chunk. Take the longest stretch
+                # somebody IS free for instead of idling the window: the machine
+                # calendar means a shorter slice no longer blocks the machine,
+                # and setup is charged once per operation, not per slice.
+                name, avail_end = staffing.longest_available_prefix(
+                    machine, win.shift_date, win.shift, seg_start, seg_end,
+                    masters, config)
+                if name is None:
+                    cursor = win.end
+                    continue
+                seg_end = avail_end
+                take = (seg_end - seg_start).total_seconds() / 60.0
         # Record (don't commit) — the decoder commits only the chosen placement; each
         # segment's interval is booked so the operator's busy time is tracked exactly.
         assignments.append((machine.id, win.shift_date, win.shift, name, seg_start, seg_end))

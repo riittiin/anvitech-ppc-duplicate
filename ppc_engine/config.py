@@ -69,6 +69,11 @@ class PlanConfig:
     #   "flexible" : the MOST-flexible free operator (for contrast / A-B testing).
     operator_pick: str = "scarce"
 
+    # Smallest slice worth laying when only PART of a window has a free operator.
+    # Costs no extra setup (setup is charged once per operation), so this only
+    # keeps the shift-wise sheet readable.
+    min_slice_min: float = 30.0
+
     # Parallel batch splitting: run ONE operation on several of the machines its
     # routing allows, at the same time, each with its own operator for the whole
     # shift. Every extra machine costs another setup (setup_min), so a part is only

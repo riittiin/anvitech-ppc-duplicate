@@ -19,7 +19,7 @@ overlay is needed while laying a single operation.)
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from ppc_engine.config import PlanConfig
 from ppc_engine.domain.masters import Masters
@@ -148,6 +148,37 @@ class StaffingBoard:
             # least cumulative load; ties → scarce (fewer machines) → name.
             return min(free, key=lambda o: (self._load.get(o.name, 0.0), o.flexibility, o.name)).name
         return free[0].name  # "scarce" (default): least flexible
+
+    def longest_available_prefix(self, machine, day, shift, start, end,
+                                 masters, config):
+        """(operator, usable_end) — the longest stretch from ``start`` that some
+        qualified operator on this shift is free for, or (None, start).
+
+        ``candidate_operator`` is all-or-nothing: it needs somebody free for the
+        WHOLE interval, so a single minute of conflict rejects them and the caller
+        idles the entire window. This answers the weaker, more useful question:
+        how long can somebody actually start now for?
+        """
+        best_name, best_end = None, start
+        floor = timedelta(minutes=float(getattr(config, "min_slice_min", 30.0) or 0.0))
+        for op in self._pools.get(machine.id, ()):
+            if effective_shift(op, day, config) != shift:
+                continue
+            if not masters.calendar.is_operator_available(op.name, day):
+                continue
+            limit = end
+            for s_, e_ in self._intervals.get(op.name, ()):
+                if e_ <= start or s_ >= end:
+                    continue
+                if s_ <= start:
+                    limit = start
+                    break
+                limit = min(limit, s_)
+            if limit > best_end:
+                best_name, best_end = op.name, limit
+        if best_name is None or best_end - start < floor:
+            return None, start
+        return best_name, best_end
 
     def commit(self, machine_id: str, day: date, shift: Shift, name: str,
                start: datetime, end: datetime) -> None:
