@@ -53,24 +53,28 @@ def test_contest_jobs_order_matches_run_contest():
     payload = _new_engine_payload()
     jobs = osvc.contest_jobs(payload)
     # new engine → two machine-sets × the contenders, flex-outer/overlap-inner.
+    # Jobs carry a SEED as well (2026-08-12): with no "seeds" in the payload that
+    # is just the payload's own seed, so the job COUNT and order are unchanged.
     cfg = Config.from_dict(payload["config"])
     knob, _ = optimizer.knob_for(cfg)
     contenders = optimizer.sweep_contenders(getattr(cfg, knob), payload["candidates"])
-    expected = [(ov, flex) for flex in (False, True) for ov in contenders]
+    seed = payload["seed"]
+    expected = [(ov, flex, seed) for flex in (False, True) for ov in contenders]
     assert jobs == expected
 
 
 def test_contest_jobs_classic_single_machineset(loaded, config):
     payload = _classic_payload(loaded, config)  # config fixture is scheduler="classic"
     jobs = osvc.contest_jobs(payload)
-    assert all(flex is False for _ov, flex in jobs)
+    assert all(flex is False for _ov, flex, _sd in jobs)
 
 
 def test_merge_shard_rows_equivalent_to_run_contest():
     payload = _new_engine_payload()
     full = osvc.run_contest(payload, processes=1)
     # Reproduce the rows the contest computed, then merge them ourselves:
-    rows = [osvc.run_candidate(payload, ov, flex) for ov, flex in osvc.contest_jobs(payload)]
+    rows = [osvc.run_candidate(payload, ov, flex, seed=sd)
+            for ov, flex, sd in osvc.contest_jobs(payload)]
     merged = osvc.merge_shard_rows(payload, rows,
                                    sum(r["evals"] for r in rows),
                                    any(r["cancelled"] for r in rows))
@@ -93,7 +97,7 @@ def test_slices_union_equals_full_contest():
         all_rows.extend(out["rows"])
         all_evals += out["evals"]
         any_cancel = any_cancel or out["cancelled"]
-        seen_pairs.extend((r["overlap"], r["flexible"]) for r in out["rows"])
+        seen_pairs.extend((r["overlap"], r["flexible"], r["seed"]) for r in out["rows"])
     # every candidate covered exactly once, no overlap
     assert sorted(seen_pairs) == sorted(osvc.contest_jobs(payload))
     merged = osvc.merge_shard_rows(payload, all_rows, all_evals, any_cancel)

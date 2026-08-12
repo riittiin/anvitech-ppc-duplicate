@@ -164,7 +164,8 @@ def book_signature(so_lines, absences=None, frozen=None):
 def build_payload(orders: dict, actuals, masters_bytes, config: Config, *,
                   seed: int, candidates=CLOUD_OVERLAP_CANDIDATES,
                   budget_per_candidate=CLOUD_BUDGET_PER_CANDIDATE,
-                  absences=None, operator_table=None, frozen=None) -> dict:
+                  absences=None, operator_table=None, frozen=None,
+                  seeds=None) -> dict:
     """Snapshot everything one contest depends on. JSON-safe. ``operator_table``
     (the app-owned {week_anchor, operators} dict) is carried verbatim — the
     worker applies the SAME as-of-effective-start rotation the API does, so a
@@ -178,6 +179,10 @@ def build_payload(orders: dict, actuals, masters_bytes, config: Config, *,
                              if masters_bytes else None),
         "config": config.to_dict(),
         "seed": seed,
+        # Extra RNG seeds for the search to multi-start from. Omitted (None) =>
+        # the contest runs at ``seed`` alone, exactly as it always did, so an
+        # in-flight job from an older deploy is unaffected. See contest_jobs.
+        **({"seeds": list(seeds)} if seeds else {}),
         "candidates": list(candidates),
         "budget_per_candidate": budget_per_candidate,
         "absences": list(absences or []),
@@ -273,10 +278,18 @@ def prepare_contest(orders: dict, actuals, masters, config: Config,
 # --------------------------------------------------------------------------- #
 # The contest itself — per-candidate runs + the shared winner rule.
 # --------------------------------------------------------------------------- #
-def pick_winner(current_overlap, current_flexible, rows):
-    """Best score wins; an exact tie keeps the current (overlap, machine-set)."""
+def pick_winner(current_overlap, current_flexible, rows, base_seed=None):
+    """Best score wins; an exact tie keeps the current (overlap, machine-set, seed).
+
+    ``base_seed`` is the payload's own seed. Including it in the tie-break means a
+    second seed that merely EQUALS the incumbent never displaces it — same
+    no-churn rule the overlap dimension already has. Rows from an older worker
+    carry no ``seed`` key and simply never win a tie.
+    """
     def _is_current(r):
-        return r.get("overlap") == current_overlap and bool(r.get("flexible")) == bool(current_flexible)
+        return (r.get("overlap") == current_overlap
+                and bool(r.get("flexible")) == bool(current_flexible)
+                and (base_seed is None or r.get("seed") == base_seed))
     ordered = sorted(rows, key=lambda r: (not _is_current(r), r.get("overlap")))
     best = None
     for r in ordered:
@@ -288,7 +301,7 @@ def pick_winner(current_overlap, current_flexible, rows):
 
 
 def run_candidate(payload: dict, overlap: int, flexible: bool = False, *, on_progress=None,
-                  should_cancel=None) -> dict:
+                  should_cancel=None, seed=None) -> dict:
     """One contender, fully self-contained (safe to run in a subprocess): it
     rebuilds the book from the payload and searches every active line as one
     pool (lanes have no scheduling effect). ``reserved=`` is only the operator
@@ -310,9 +323,10 @@ def run_candidate(payload: dict, overlap: int, flexible: bool = False, *, on_pro
                              reserved=setup.absence_reserved,
                              frozen=setup.frozen,
                              budget_evals=int(payload["budget_per_candidate"]),
-                             seed=int(payload["seed"]),
+                             seed=int(payload["seed"] if seed is None else seed),
                              on_progress=on_progress, should_cancel=should_cancel)
-    return {"overlap": int(overlap), "flexible": bool(flexible), "eligible": True,
+    return {"overlap": int(overlap), "flexible": bool(flexible),
+            "seed": int(payload["seed"] if seed is None else seed), "eligible": True,
             "best": res.best, "evals": res.evals, "ranks": res.ranks, "cancelled": res.cancelled}
 
 
@@ -326,7 +340,7 @@ def _pool_init(counter, stop):
 
 
 def _pool_run(args):
-    payload, overlap, flexible = args
+    payload, overlap, flexible, seed = args
     last = {"evals": 0}
 
     def cb(evals, _best):
@@ -337,14 +351,33 @@ def _pool_run(args):
                 c.value += delta
 
     stop = _POOL["stop"]
-    return run_candidate(payload, overlap, flexible, on_progress=cb,
+    return run_candidate(payload, overlap, flexible, seed=seed, on_progress=cb,
                          should_cancel=(lambda: bool(stop.value)) if stop else None)
 
 
+def contest_seeds(payload: dict) -> list:
+    """The RNG seeds this contest searches from, base seed FIRST.
+
+    The search is an iterated local search, so its answer depends on the random
+    stream: on the live book at a fixed overlap, three seeds gave 389/365/365
+    late-days. Searching several and keeping the best turns that luck into a
+    choice. No ``seeds`` in the payload => just the base seed, i.e. exactly the
+    contest that ran before this existed.
+    """
+    base = int(payload["seed"])
+    out = [base]
+    for s in payload.get("seeds") or ():
+        if int(s) not in out:
+            out.append(int(s))
+    return out
+
+
 def contest_jobs(payload: dict) -> list:
-    """The ordered (overlap, flexible) candidate list a contest evaluates — the
-    SINGLE source of truth for run_contest AND the sharded worker, so they can
-    never drift. Order: machine-set outer, overlap inner (matches run_contest)."""
+    """The ordered (overlap, flexible, seed) candidate list a contest evaluates —
+    the SINGLE source of truth for run_contest AND the sharded worker, so they can
+    never drift. Order: seed outer, machine-set, overlap inner. The BASE seed's
+    whole sweep therefore runs first, so an early "Stop & keep best" still has the
+    current settings fully searched."""
     config = Config.from_dict(payload["config"])
     knob, _ = optimizer.knob_for(config)
     cur_value = getattr(config, knob)
@@ -355,17 +388,18 @@ def contest_jobs(payload: dict) -> list:
     # identical to their local counterpart (Task 3 established this same gate in
     # engine/optimizer.sweep_optimize / engine/new_engine.sweep_optimize).
     machine_sets = (False, True) if getattr(config, "scheduler", "classic") == "new" else (False,)
-    return [(ov, flex) for flex in machine_sets for ov in contenders]
+    return [(ov, flex, sd) for sd in contest_seeds(payload)
+            for flex in machine_sets for ov in contenders]
 
 
 def _run_jobs(payload: dict, pairs: list, *, processes=1, on_progress=None,
              should_cancel=None, poll_seconds=5.0):
-    """Run a list of (overlap, flexible) candidates. Returns (rows, done_evals,
+    """Run a list of (overlap, flexible, seed) candidates. Returns (rows, done_evals,
     cancelled). processes>1 fans them across subprocesses (shared progress
     counter); processes<=1 runs them sequentially in-process."""
     rows, done_evals, cancelled = [], 0, False
     if processes <= 1:
-        for ov, flex in pairs:
+        for ov, flex, sd in pairs:
             if should_cancel and should_cancel():
                 cancelled = True
                 break
@@ -375,7 +409,8 @@ def _run_jobs(payload: dict, pairs: list, *, processes=1, on_progress=None,
                 if on_progress:
                     on_progress(_base + evals, best)
 
-            row = run_candidate(payload, ov, flex, on_progress=cb, should_cancel=should_cancel)
+            row = run_candidate(payload, ov, flex, seed=sd, on_progress=cb,
+                                should_cancel=should_cancel)
             rows.append(row)
             done_evals += row.get("evals", 0)
             cancelled = cancelled or bool(row.get("cancelled"))
@@ -384,7 +419,7 @@ def _run_jobs(payload: dict, pairs: list, *, processes=1, on_progress=None,
         ctx = mp.get_context()
         counter = ctx.Value("i", 0)
         stop = ctx.Value("b", 0)
-        jobs = [(payload, ov, flex) for ov, flex in pairs]
+        jobs = [(payload, ov, flex, sd) for ov, flex, sd in pairs]
         with ctx.Pool(processes=processes, initializer=_pool_init,
                       initargs=(counter, stop)) as pool:
             async_res = pool.map_async(_pool_run, jobs)
@@ -408,14 +443,17 @@ def merge_shard_rows(payload: dict, rows: list, evals: int, cancelled: bool) -> 
     knob, _ = optimizer.knob_for(config)
     cur_value = getattr(config, knob)
     cur_flex = bool(getattr(config, "flexible_machines", False))
-    winner = pick_winner(cur_value, cur_flex, rows)
-    table = [{k: r[k] for k in ("overlap", "flexible", "eligible", "best", "evals")
+    winner = pick_winner(cur_value, cur_flex, rows, base_seed=int(payload["seed"]))
+    table = [{k: r[k] for k in ("overlap", "flexible", "seed", "eligible", "best", "evals")
               if k in r} for r in rows]
     if winner is None:
         return {"winner_overlap": cur_value, "winner_flexible": cur_flex, "rows": table,
                 "knob": knob, "best": None, "ranks": {}, "evals": evals,
                 "cancelled": cancelled}
     return {"winner_overlap": winner["overlap"], "winner_flexible": bool(winner["flexible"]),
+            # Informational only: the seed is a SEARCH artifact, not a plan input.
+            # The ranks are what gets applied, and they already encode the answer.
+            "winner_seed": winner.get("seed"),
             "rows": table, "knob": knob, "best": winner["best"],
             "ranks": winner.get("ranks", {}), "evals": evals, "cancelled": cancelled}
 
