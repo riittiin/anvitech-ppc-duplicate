@@ -61,6 +61,13 @@ _SECOND = timedelta(seconds=1)
 # of walking the whole 400-day horizon.
 _STALL_WINDOWS = 120
 
+# Several clubbed SO lines can each be part-finished on the SAME batch operation,
+# so freeze legitimately emits more than one row for it. An operation runs once,
+# on one machine, so exactly one of those rows becomes the pin and the others are
+# reported under this reason — not an error, but it keeps the row accounting in
+# `Plan.unpinned` exact rather than approximately exact.
+_SUPERSEDED = "superseded by an earlier-started row for the same operation"
+
 
 @dataclass(frozen=True)
 class Placement:
@@ -86,13 +93,19 @@ class Placement:
 
 @dataclass(frozen=True)
 class Plan:
+    """``unpinned`` is the frozen rows this plan could NOT honour, as
+    ``((row, reason), ...)`` — see ``_apply_frozen``. It defaults to empty, so a
+    caller that does not care is unaffected; a caller that does can check the
+    accounting closes (every row in is either an applied pin or a row here)."""
+
     placements: tuple
     completion: dict
+    unpinned: tuple = ()
 
 
 class _JobState:
     __slots__ = ("job", "idx", "ready", "prev_end", "worked", "on_machine",
-                 "released_at", "pinned", "pin_rank")
+                 "released_at", "pinned", "pin_rank", "pin_operator")
 
     def __init__(self, job, plan_start):
         self.job = job
@@ -104,6 +117,7 @@ class _JobState:
         self.released_at = None        # overlap release moment for the NEXT op
         self.pinned = {}               # op_seq -> machine the part is PHYSICALLY on
         self.pin_rank = {}             # op_seq -> previous-plan resume order
+        self.pin_operator = {}         # op_seq -> who the LAST plan had on it
 
 
 class _MachineState:
@@ -143,7 +157,7 @@ def schedule(jobs, sequence, shop, config, *, overlap=1.0, crew_rank=None,
 
     placements: list = []
     completion: dict = {}
-    _apply_frozen(frozen, state, machines)
+    unpinned = _apply_frozen(frozen, state, machines, shop)
 
     stalled = 0
     for window in iter_shifts(plan_start, shop.calendar, config):
@@ -178,7 +192,7 @@ def schedule(jobs, sequence, shop, config, *, overlap=1.0, crew_rank=None,
             + "; ".join(blocked))
 
     placements = _pace(placements, completion)
-    return Plan(tuple(placements), completion)
+    return Plan(tuple(placements), completion, tuple(unpinned))
 
 
 # --------------------------------------------------------------------------- #
@@ -387,7 +401,9 @@ def _run_shift(window, cursor, order, state, machines, shop, crew_rank, overlap,
                setup_min, placements, completion):
     demand, in_progress = _shift_demand(order, state, machines, window, overlap,
                                         setup_min)
-    rostered = crew.roster_for_shift(window, shop, demand, in_progress, crew_rank)
+    prefer = _preferred_operators(state, machines)
+    rostered = crew.roster_for_shift(window, shop, demand, in_progress, crew_rank,
+                                     prefer=prefer)
     floating = _floating_operators(shop, window, set(rostered.values()))
 
     # A CNC/VMC has ONE person for the whole shift; a bench has a POOL, and who
@@ -439,7 +455,8 @@ def _run_shift(window, cursor, order, state, machines, shop, crew_rank, overlap,
         if mid in benches:
             who, retry_at = _bench_operator(mid, machines[mid], order, state,
                                             window, start, setup_min,
-                                            benches[mid], booked)
+                                            benches[mid], booked,
+                                            prefer.get(mid))
             if who is None:
                 # Every qualified helper is on another bench across this run.
                 # The bench waits for one of them — it does not take half a
@@ -545,8 +562,31 @@ def _bench_run_minutes(mid, ms, order, state, window, start, setup_min):
                (window.end - start).total_seconds() / 60.0)
 
 
+def _preferred_operators(state, machines) -> dict:
+    """machine id -> the person the LAST plan had on the part that machine is
+    holding now. A preference for the roster, never a booking.
+
+    Only the pin that will resume FIRST on each machine is consulted — that is the
+    part actually in the chuck; a later pin's person is not owed the shift. Empty
+    on an ordinary plan (no machine has any pins), so this costs one pass over the
+    machine ids per shift and nothing else.
+    """
+    prefer: dict = {}
+    for mid in sorted(machines):
+        for _rank, _pos, key in machines[mid].pinned_jobs:
+            js = state[key]
+            op = _current_op(js)
+            if op is None or js.pinned.get(op.seq) != mid:
+                continue          # that part has moved on; this pin is spent
+            who = js.pin_operator.get(op.seq)
+            if who:
+                prefer[mid] = who
+            break
+    return prefer
+
+
 def _bench_operator(mid, ms, order, state, window, start, setup_min, pool,
-                    booked):
+                    booked, prefer=None):
     """Staff a manual / inspection station, by INTERVAL EXCLUSION.
 
     Returns ``(operator_name, None)`` and books them, or ``(None, retry_at)`` when
@@ -567,11 +607,18 @@ def _bench_operator(mid, ms, order, state, window, start, setup_min, pool,
     is never interrupted, so a helper who starts a bench stays on it until the
     operation finishes or the shift ends. Between operations they are free to
     walk. Ties resolve by name (``pool`` is name-sorted), so the caller's operator
-    order cannot move a bench.
+    order cannot move a bench — except that ``prefer``, the person the last plan
+    had on the part now on this bench, is tried first. That is a tie-break among
+    people who are all equally entitled to the bench, and it is what stops a
+    re-plan renaming the operator on a job that is physically running (finding 4);
+    the clash check below still applies to them exactly as to anyone else, so a
+    preferred helper who is busy elsewhere simply loses.
     """
     minutes = _bench_run_minutes(mid, ms, order, state, window, start, setup_min)
     if minutes is None:
         return None, window.end                   # nothing here to staff
+    if prefer and prefer in pool:
+        pool = (prefer,) + tuple(n for n in pool if n != prefer)
     finish = start + timedelta(minutes=minutes)
     retry_at = None
     for name in pool:
@@ -785,8 +832,38 @@ def _prev_start_key(row):
     return (0, text) if text else (1, "")
 
 
-def _apply_frozen(frozen, state, machines):
-    """Pin every in-progress operation to the machine it is physically on.
+def _staffable(mid, shop) -> bool:
+    """Could ANYBODY in Settings man this machine, on a shift it runs?
+
+    Qualification is exactly the machine list the admin set (roster.eligible says
+    the same, for the same 2026-08-07 reason). Absences are deliberately NOT
+    consulted: they are dated windows, not a statement that the machine has lost
+    its crew, and a pin dropped because somebody took a Tuesday off would be a
+    worse error than the one this guards.
+    """
+    machine = shop.machines.get(mid)
+    for operator in shop.operators:
+        if mid not in (getattr(operator, "machines", None) or ()):
+            continue
+        if machine is None:
+            return True
+        if machine_runs_shift(machine, operator_shift(operator)):
+            return True
+    return False
+
+
+def _apply_frozen(frozen, state, machines, shop):
+    """Pin every in-progress operation to the machine it is physically on, and
+    return ``[(row, reason)]`` for every row whose pin could NOT be applied.
+
+    THE ACCOUNTING CLOSES: each row that arrives is either the applied pin for its
+    (job, op) or it is in the returned list, so ``len(frozen) == pins + len(
+    dropped)``. A dropped pin used to be silent, and against the real producer
+    (``engine.freeze.compute_frozen_set``, whose rows this engine had never
+    actually been fed) the drop rate was 100% — the plan looked well-formed while
+    the part was planned on a machine it is not on, paying a setup it does not
+    owe. A silently dropped constraint is a named recurring defect class here, so
+    the caller is told rather than trusted to notice.
 
     A frozen row pins WHERE and WHEN, never HOW MUCH. ``remaining_qty`` is
     deliberately NOT read: it is one SO LINE's remainder, while the operation it
@@ -807,43 +884,79 @@ def _apply_frozen(frozen, state, machines):
     alternative is a machine list of exactly one impossible machine, which takes
     the whole book out of the plan at the horizon.
 
-    ``operator`` is read only to break ties. Who runs the machine is decided by
-    the roster, which qualifies people from Settings alone: the work is physically
-    on that machine, but the PERSON is re-staffed (live 2026-08-03 — removing a
-    machine from someone with work in progress froze them straight back onto it).
+    A pin the CREW cannot honour is dropped for the same reason and it is the same
+    hazard: if Settings no longer qualifies anybody for the pinned machine, that
+    one job can never be placed and ``schedule`` fails the ENTIRE book at the
+    horizon. One machine losing its operator must not cost every other order its
+    plan — that condition is real, but the app already reports it on its own
+    (MACHINE_NO_OPERATOR), and degrading here is what the engine this replaces
+    does ("unstaffable — leave to the main loop").
+
+    ``operator`` breaks ties, and is remembered as a PREFERENCE (``pin_operator``)
+    — never as a re-pin. Who runs the machine is decided by the roster, which
+    qualifies people from Settings alone (live 2026-08-03 — removing a machine
+    from someone with work in progress froze them straight back onto it). But
+    ignoring the name entirely churns the shift-wise sheet, a live floor document,
+    by re-assigning the person on a physically-running job for no reason at all;
+    ``roster.roster_for_shift``'s ``prefer`` keeps them there when they are still
+    qualified and free, and yields to anything real.
     """
     pins: dict = {}
+    dropped: list = []
     for row in frozen or ():
         key = _field(row, "order_key", "job_key", "batch_id")
         seq = _field(row, "op_seq", "process_seq")
         mid = _field(row, "machine_id", "machine")
         if key is None or seq is None or mid is None:
+            dropped.append((row, "the row names no job, step or machine"))
             continue
         try:
             seq = int(seq)
         except (TypeError, ValueError):
+            dropped.append((row, f"step {seq!r} is not a number"))
             continue
         key, mid = str(key), str(mid)
         js = state.get(key)
-        if js is None or mid not in machines:
+        if js is None:
+            dropped.append((row, f"no job {key!r} in this plan"))
+            continue
+        if mid not in machines:
+            dropped.append((row, f"{mid} is not in the Machine master"))
             continue
         op = next((o for o in js.job.ops if o.seq == seq), None)
-        if op is None or mid not in op.machine_options:
+        if op is None:
+            dropped.append((row, f"{key} has no step {seq} in its routing"))
+            continue
+        if mid not in op.machine_options:
+            dropped.append((row, f"{key} step {seq} no longer runs on {mid}"))
+            continue
+        if not _staffable(mid, shop):
+            dropped.append(
+                (row, f"no operator in Settings is qualified for {mid}"))
             continue
         rank = (_prev_start_key(row), mid,
                 str(_field(row, "operator") or ""))
         current = pins.get((key, seq))
-        if current is None or rank < current[0]:
-            pins[(key, seq)] = (rank, mid)
+        if current is None:
+            pins[(key, seq)] = (rank, mid, row)
+        elif rank < current[0]:
+            dropped.append((current[2], _SUPERSEDED))
+            pins[(key, seq)] = (rank, mid, row)
+        else:
+            dropped.append((row, _SUPERSEDED))
 
     # ``state`` is built in the caller's sequence order, so a job's position in it
     # IS its priority — the tie-break when two parts were started at the same
     # moment in the previous plan.
     position = {key: pos for pos, key in enumerate(state)}
-    for (key, seq), (rank, mid) in sorted(pins.items()):
+    for (key, seq), (rank, mid, row) in sorted(pins.items()):
         js = state[key]
         js.pinned[seq] = mid
         js.pin_rank[seq] = rank
+        who = str(_field(row, "operator") or "")
+        if who:
+            js.pin_operator[seq] = who
         machines[mid].pinned_jobs.append((rank, position[key], key))
     for ms in machines.values():
         ms.pinned_jobs.sort()
+    return dropped

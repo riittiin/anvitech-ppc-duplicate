@@ -36,6 +36,17 @@ LOOKAHEAD_UNIT = 45.0
 # touches `crew_rank` directly (see the comment there for why).
 UNRANKED = float("inf")
 
+# Continuity: the person the previous plan had on a part that is STILL in the
+# chuck. Two orders of magnitude below LOOKAHEAD_UNIT and four below CARRY_BONUS,
+# so it decides only between people who are otherwise weight-identical on the same
+# machine — which, before this term existed, was every eligible person, and the
+# matching then picked by row index. It can never man a machine with no work (a
+# zero-demand, non-carry pairing is never added to `values` at all) and it is far
+# too small to re-rank one machine against another. Deliberately a preference:
+# qualification comes from Settings alone (live 2026-08-03), so a pinned operator
+# the admin has since disqualified is simply not in `values` and loses outright.
+PREFERRED_BONUS = 1.0
+
 
 def eligible(operator, machine_id: str, window, shop) -> bool:
     """May this person man this machine in this shift?
@@ -62,7 +73,7 @@ def eligible(operator, machine_id: str, window, shop) -> bool:
 
 
 def roster_for_shift(window, shop, demand: dict, in_progress: dict,
-                     crew_rank: dict) -> dict:
+                     crew_rank: dict, prefer: dict | None = None) -> dict:
     """Assign operators to CNC/VMC machines for ``window``.
 
     Args:
@@ -72,6 +83,10 @@ def roster_for_shift(window, shop, demand: dict, in_progress: dict,
         in_progress: machine id -> job key of a part physically mid-run on it.
         crew_rank:   machine id -> rank (0 = first claim). The optimizer's lever;
                      empty means no bias.
+        prefer:      machine id -> the operator the previous plan had on the part
+                     that machine is holding. A tie-break worth PREFERRED_BONUS,
+                     so a re-plan does not rename the person on a job that is
+                     physically running; None/empty means no preference.
 
     Returns:
         {machine_id: operator_name}. A machine absent from the result is dark this
@@ -92,6 +107,7 @@ def roster_for_shift(window, shop, demand: dict, in_progress: dict,
         return {}
 
     n_ranks = len(machines)
+    prefer = prefer or {}
     values = {}
     for r, operator in enumerate(operators):
         for c, mid in enumerate(machines):
@@ -115,6 +131,8 @@ def roster_for_shift(window, shop, demand: dict, in_progress: dict,
             # outweigh real pending work, dropping the pairing from the match
             # entirely (2026-08-12 review finding).
             value += LOOKAHEAD_UNIT * (n_ranks - c)
+            if operator.name == prefer.get(mid):
+                value += PREFERRED_BONUS
             values[(r, c)] = value
 
     matched = max_weight_matching(values, len(operators), len(machines))

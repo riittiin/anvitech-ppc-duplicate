@@ -408,3 +408,190 @@ def test_a_frozen_plan_is_deterministic_across_hash_seeds():
                                 text=True, check=True)
         outputs.add(result.stdout)
     assert len(outputs) == 1, f"plan varied across PYTHONHASHSEED: {outputs}"
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 1 — the five findings of the 2026-08-13 review
+# --------------------------------------------------------------------------- #
+
+def _rival_masters():
+    """Two CNCs; ITEM may run on either, OWN only on CNC1. OWN is what gives CNC1
+    demand of its own, so the roster mans it on its own merits and the pin guard
+    is the ONLY thing keeping a pinned ITEM off it."""
+    return Masters(
+        machines={k: _MACHINES[k] for k in _BOTH},
+        routings={
+            "ITEM": Routing("ITEM", "d", "", "", None,
+                            [Process(1, "CNC FIRST SIDE", 10.0, None, None,
+                                     "CNC1/CNC4")]),
+            "OWN": Routing("OWN", "d", "", "", None,
+                           [Process(1, "CNC FIRST SIDE", 10.0, None, None,
+                                    "CNC1")]),
+        },
+        operators=[Operator("Narayan", "CNC1/CNC4", list(_BOTH), "First shift"),
+                   Operator("Sidhu", "CNC1/CNC4", list(_BOTH), "First shift")],
+        calendar=WorkCalendar())
+
+
+def test_a_manned_rival_machine_may_not_take_a_pinned_part():
+    """Finding 1. Every other fixture here pins the only interesting machine, so
+    ``_shift_demand`` reports no demand for the rival, the roster never mans it,
+    and ``_next_job``'s pin guard is masked — deleting the guard left all 15 tests
+    green.
+
+    Here Z gives CNC1 real demand of its own, so BOTH machines are manned in the
+    same shift and A — pinned to CNC4 and FIRST in the sequence — is offered to
+    CNC1 first. Only the guard sends it to CNC4.
+    """
+    masters = _rival_masters()
+    jobs, _by, _sk = build_jobs([_B("A", "ITEM", 20), _B("Z", "OWN", 20)], masters)
+    shop, cfg = build_shop(masters), _cfg()
+
+    # Control: with no pin, A takes CNC1 (machines are offered in id order), so
+    # the pin really is the only thing that can move it.
+    assert _at(_run(jobs, shop, cfg, sequence=["A", "Z"]), 1, "A").machine == "CNC1"
+
+    plan = _run(jobs, shop, cfg, sequence=["A", "Z"],
+                frozen=_frozen(order_key="A", machine_id="CNC4"))
+    pinned, rival = _at(plan, 1, "A"), _at(plan, 1, "Z")
+    assert pinned.machine == "CNC4"
+    assert pinned.work_min == 20 * 10.0                  # resumed: still no setup
+    # Non-vacuity: CNC1 was manned and working at the same instant, on its own job.
+    assert rival.machine == "CNC1"
+    assert pinned.start == rival.start == datetime(2026, 8, 12, 8, 0)
+
+
+def test_a_pin_no_one_can_staff_degrades_instead_of_killing_the_book():
+    """Finding 2. ``_apply_frozen`` dropped a pin the ROUTING could not honour but
+    not one the CREW could not: if Settings no longer qualifies anybody for the
+    pinned machine, that job can never be placed and the whole book raised
+    RuntimeError. One machine losing its operator must not cost every other order
+    its plan — the condition is already reported separately as MACHINE_NO_OPERATOR.
+    """
+    masters = Masters(
+        machines={k: _MACHINES[k] for k in _BOTH},
+        routings={"ITEM": Routing("ITEM", "d", "", "", None,
+                                  [Process(1, "CNC FIRST SIDE", 10.0, None, None,
+                                           "CNC1/CNC4")])},
+        operators=[Operator("Narayan", "CNC1", ["CNC1"], "First shift")],
+        calendar=WorkCalendar())
+    jobs, _by, _sk = build_jobs([_B("B1", "ITEM", 20), _B("B2", "ITEM", 20)],
+                                masters)
+    plan = _run(jobs, build_shop(masters), _cfg(), sequence=["B1", "B2"],
+                frozen=_frozen(machine_id="CNC4"))
+    pinned = _at(plan, 1, "B1")
+    assert pinned.machine == "CNC1"
+    assert pinned.work_min == 90.0 + 20 * 10.0     # not frozen any more -> setup
+    assert _at(plan, 1, "B2").machine == "CNC1"    # the rest of the book survives
+    rows = [(row.get("machine_id"), why) for row, why in plan.unpinned]
+    assert len(rows) == 1 and rows[0][0] == "CNC4"
+    assert "qualified" in rows[0][1]
+
+
+def test_every_pin_that_could_not_be_applied_is_reported():
+    """Finding 3. Against the REAL producer every row was dropped for want of a
+    job key and nothing said so: the plan looked well-formed while the part was
+    planned on a machine it is not on, paying a setup it does not owe. A silently
+    dropped constraint is a named recurring defect class in this repo.
+
+    The accounting closes exactly — every row is either the applied pin for its
+    (job, op) or it is in ``unpinned`` — which is what Task 7's adapter checks.
+    """
+    jobs, shop, cfg = _fixture()
+    rows = [
+        dict(_frozen()[0]),                                    # applied
+        dict(_frozen(order_key="NOPE")[0]),                    # no such job
+        dict(_frozen(op_seq=99)[0]),                           # no such step
+        dict(_frozen(machine_id="CNC9")[0]),                   # not in the master
+        dict(_frozen(machine_id="MD1")[0]),                    # routing says no
+        {"op_seq": 1, "machine_id": "CNC4"},                   # names no job
+        dict(_frozen(operator="Sidhu",
+                     prev_start=datetime(2026, 8, 11, 14, 0))[0]),   # superseded
+    ]
+    plan = _run(jobs, shop, cfg, frozen=rows)
+    assert _at(plan, 1).machine == "CNC4"                      # one pin applied
+    assert len(plan.unpinned) == len(rows) - 1                 # ...and six dropped
+    whys = [why for _row, why in plan.unpinned]
+    assert sum("job" in w for w in whys) >= 2                  # unknown job x2
+    assert any("step 99" in w for w in whys)
+    assert any("CNC9" in w for w in whys)
+    assert any("MD1" in w for w in whys)
+    assert any("superseded" in w for w in whys)
+    # The rows come back verbatim, so a caller can name the SO on screen.
+    assert plan.unpinned[0][0]["order_key"] == "NOPE"
+
+
+def test_a_plan_with_nothing_frozen_reports_no_dropped_pins():
+    jobs, shop, cfg = _fixture()
+    assert _run(jobs, shop, cfg).unpinned == ()
+    assert _run(jobs, shop, cfg, frozen=[]).unpinned == ()
+    assert _run(jobs, shop, cfg, frozen=_frozen()).unpinned == ()
+
+
+def test_the_planned_operator_is_kept_on_a_part_that_is_still_in_the_chuck():
+    """Finding 4. The pinned OPERATOR was ignored entirely, so every re-plan
+    free-reassigned the person on a physically-running job even when the planned
+    person was still qualified and free. What churns is the name on the shift-wise
+    sheet — a live floor document the directors read.
+
+    Both people are equally eligible and equally free, so nothing but the
+    preference can decide this: with no operator term in the value function the
+    matching picks by index and Narayan wins both runs.
+    """
+    for who in ("Narayan", "Sidhu"):
+        jobs, shop, cfg = _fixture()
+        plan = _run(jobs, shop, cfg, frozen=_frozen(machine_id="CNC4",
+                                                    operator=who))
+        first = _at(plan, 1)
+        assert first.machine == "CNC4"
+        assert {s[2] for s in first.segments} == {who}
+
+
+def test_a_preferred_operator_who_is_busy_elsewhere_does_not_starve_a_machine():
+    """The bonus is a tie-break, not a reservation: one person cannot be preferred
+    onto two machines at once, and preferring them on one must not leave the other
+    dark. Sidhu is named on BOTH pinned parts; he can only have one."""
+    masters = _rival_masters()
+    jobs, _by, _sk = build_jobs([_B("A", "ITEM", 20), _B("Z", "OWN", 20)], masters)
+    plan = _run(jobs, build_shop(masters), _cfg(), sequence=["A", "Z"], frozen=[
+        {"order_key": "A", "op_seq": 1, "machine_id": "CNC4", "operator": "Sidhu",
+         "prev_start": datetime(2026, 8, 11, 8, 0)},
+        {"order_key": "Z", "op_seq": 1, "machine_id": "CNC1", "operator": "Sidhu",
+         "prev_start": datetime(2026, 8, 11, 8, 0)},
+    ])
+    staffed = {_at(plan, 1, k).machine: {s[2] for s in _at(plan, 1, k).segments}
+               for k in ("A", "Z")}
+    assert set(staffed) == {"CNC1", "CNC4"}          # neither machine went dark
+    assert staffed["CNC1"] | staffed["CNC4"] == {"Narayan", "Sidhu"}
+    assert "Sidhu" in staffed["CNC4"] | staffed["CNC1"]
+
+
+def test_a_frozen_step_is_not_charged_a_setup_in_the_shift_demand_estimate():
+    """Finding 5. ``_shift_demand`` calls ``_setup_min_for`` so a resumed step is
+    costed the way it will really run; charging the nominal 90 minutes there
+    over-states its demand and can move the roster in a tight shift, while the
+    real placement pays nothing. Deleting that call left all 15 tests green.
+
+    One operator, two machines, and the two demands 90 minutes apart: B2's 100
+    minutes on CNC1 beat B1's 60 resumed minutes on CNC4, so B2 runs first. Charge
+    B1 a phantom setup and it becomes 150 and takes the shift instead.
+    """
+    masters = Masters(
+        machines={k: _MACHINES[k] for k in _BOTH},
+        routings={
+            "ITEM": Routing("ITEM", "d", "", "", None,
+                            [Process(1, "CNC FIRST SIDE", 10.0, None, None,
+                                     "CNC1/CNC4")]),
+            "OWN": Routing("OWN", "d", "", "", None,
+                           [Process(1, "CNC FIRST SIDE", 10.0, None, None,
+                                    "CNC1")]),
+        },
+        operators=[Operator("Narayan", "CNC1/CNC4", list(_BOTH), "First shift")],
+        calendar=WorkCalendar())
+    jobs, _by, _sk = build_jobs([_B("B1", "ITEM", 6), _B("B2", "OWN", 1)], masters)
+    plan = _run(jobs, build_shop(masters), _cfg(), sequence=["B1", "B2"],
+                frozen=_frozen(machine_id="CNC4"))
+    assert _at(plan, 1, "B1").machine == "CNC4"          # the pin still holds
+    first_out = min(plan.placements, key=lambda p: (p.start, p.job_key))
+    assert first_out.job_key == "B2"
+    assert first_out.start == datetime(2026, 8, 12, 8, 0)
