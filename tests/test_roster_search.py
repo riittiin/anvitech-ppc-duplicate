@@ -159,7 +159,9 @@ def test_the_score_matches_the_incumbent_engines_formula():
     roster_engine may not import ppc_engine, so the formula is written fresh — and
     that is exactly the kind of duplication that drifts. This pins them together
     numerically instead: the same lateness map, scored by both, over signed,
-    zero, inside-band, beyond-band and beyond-CAP values.
+    zero, inside-band, beyond-band and beyond-CAP values — and at every worst-order
+    CEILING the live path actually sets, which is not only None (see
+    `test_the_worst_order_ceiling_is_reproduced_not_assumed_dormant`).
     """
     import random
 
@@ -167,32 +169,84 @@ def test_the_score_matches_the_incumbent_engines_formula():
     from ppc_engine.objective import objective as ppc_objective
     from ppc_engine.objective.metrics import PlanMetrics
 
-    ppc_cfg = PlanConfig(plan_start=datetime(2026, 8, 12, 8, 0))
     rng = random.Random(11)
     cases = [{"A": 0.0}, {"A": 4.0}, {"A": -4.0}, {"A": 4.5}, {"A": -4.5},
              {"A": 64.0}, {"A": 64.1}, {"A": 900.0}, {"A": -900.0}, {}]
     for _ in range(40):
         cases.append({f"O{i}": float(rng.randint(-90, 90)) for i in range(8)})
-    for lateness in cases:
-        for makespan in (0.0, 1.0, 37.5):
-            mine = objective.Metrics(dict(lateness), makespan, 0.0, 0.0)
-            theirs = PlanMetrics(
-                total_tardiness_days=0.0, max_tardiness_days=0.0,
-                late_order_count=0, makespan_days=makespan,
-                lateness_by_order=dict(lateness))
-            assert objective.score(mine, _cfg()) == ppc_objective.score(
-                theirs, ppc_cfg), (lateness, makespan)
+    for ceiling in (None, 0.0, 10.0, 46.0):
+        cfg = _cfg(worst_ceiling_days=ceiling)
+        ppc_cfg = PlanConfig(plan_start=datetime(2026, 8, 12, 8, 0),
+                             ceiling_days=ceiling)
+        for lateness in cases:
+            for makespan in (0.0, 1.0, 37.5):
+                mine = objective.Metrics(dict(lateness), makespan, 0.0, 0.0)
+                theirs = PlanMetrics(
+                    total_tardiness_days=0.0, max_tardiness_days=0.0,
+                    late_order_count=0, makespan_days=makespan,
+                    lateness_by_order=dict(lateness))
+                assert objective.score(mine, cfg) == ppc_objective.score(
+                    theirs, ppc_cfg), (ceiling, lateness, makespan)
+
+
+def test_the_worst_order_ceiling_is_reproduced_not_assumed_dormant():
+    """The ceiling is NOT dormant in the path this engine is compared against:
+    `api.main` sets `worst_ceiling_days` to the incumbent's `max_late_days` on
+    EVERY optimize run, auto and manual. Without this term the roster search would
+    happily propose a plan the live search is structurally forbidden to propose —
+    one that pushes an order past today's worst case.
+    """
+    late = objective.Metrics({"A": 20.0}, 0.0, 20.0, 20.0)
+    unbarred = objective.score(late, _cfg())
+    barred = objective.score(late, _cfg(worst_ceiling_days=10.0))
+    # The live weight is 100.0 — a thousand times the makespan tie-break.
+    assert barred - unbarred == 100.0 * (20.0 - 10.0) ** 2
+    # Under the ceiling costs nothing extra...
+    inside = objective.Metrics({"A": 9.0}, 0.0, 9.0, 9.0)
+    assert objective.score(inside, _cfg(worst_ceiling_days=10.0)) == objective.score(
+        inside, _cfg())
+    # ...and so does finishing EARLY: the barrier is one-sided, unlike the on-time
+    # term. `late - ceiling`, never `abs(late) - ceiling`.
+    early = objective.Metrics({"A": -20.0}, 0.0, 0.0, 0.0)
+    assert objective.score(early, _cfg(worst_ceiling_days=10.0)) == objective.score(
+        early, _cfg())
 
 
 def test_makespan_is_measured_from_the_plan_start_like_the_incumbent():
     """Not from the first placement: an idle first morning is real makespan, and
-    ppc's compute_metrics measures (last completion - plan_start)."""
-    jobs, shop, cfg = _scarce_fixture()
+    ppc's compute_metrics measures (last completion - plan_start).
+
+    The fixture is deliberately one whose first placement is NOT at plan start —
+    every other fixture here starts cutting at 08:00 on day one, which makes the
+    two formulas agree and the test vacuous (measured: reverting to
+    `min(p.start ...)` passed all 26 tests).
+    """
+    jobs, shop, cfg = _night_shift_fixture()
     plan = scheduler.schedule(jobs, [j.key for j in jobs], shop, cfg, overlap=1.0)
-    m = objective.compute_metrics(plan, jobs, cfg)
     start = datetime(2026, 8, 12, 8, 0)
+    first = min(p.start for p in plan.placements)
+    assert first > start, "fixture no longer idles before its first placement"
+    m = objective.compute_metrics(plan, jobs, cfg)
     expected = (max(plan.completion.values()) - start).total_seconds() / 86400.0
     assert m.makespan_days == round(expected, 4)
+    # And the two formulas really do disagree on this plan.
+    assert m.makespan_days != round(
+        (max(plan.completion.values()) - first).total_seconds() / 86400.0, 4)
+
+
+def _night_shift_fixture():
+    """One machine, one SECOND-shift operator: nothing can run before 19:00, so
+    the plan's first placement is 11 hours after the plan starts."""
+    masters = Masters(
+        machines={"CNC1": Machine("CNC1", "CNC 1", "CNC lathe",
+                                  available_hrs_per_day=19.5)},
+        routings={"ITEM": _routing("ITEM", "CNC1")},
+        operators=[Operator("Sidhu", "", ["CNC1"], "Second shift")],
+        calendar=WorkCalendar())
+    batches = [_B(f"B{i}", 30, date(2026, 8, 20) + timedelta(days=i))
+               for i in range(2)]
+    jobs, _by, _sk = build_jobs(batches, masters)
+    return jobs, build_shop(masters), _cfg()
 
 
 def test_tardiness_totals_count_only_late_orders():
@@ -289,6 +343,122 @@ def test_cancellation_keeps_the_best_so_far():
     assert sorted(res.sequence) == sorted(j.key for j in jobs)
 
 
+def test_stopping_before_any_feasible_plan_is_not_reported_as_a_broken_book():
+    """A Stop press must stop the search, never diagnose the data.
+
+    On this book the seed crew genome is infeasible (see `_inverted_serial_fixture`),
+    so until the crew phase gets a turn every candidate scores +inf. Cancelling in
+    that window used to re-raise `Unschedulable` — a typed error whose message
+    reads as a missing operator qualification and would send the owner hunting for
+    a data problem that does not exist.
+    """
+    jobs, shop, cfg = _inverted_serial_fixture()
+    calls = {"n": 0}
+
+    def stop():
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    res = search.optimize(jobs, shop, cfg, overlap=0.8, budget_evals=500, seed=7,
+                          should_cancel=stop)
+    assert res.cancelled
+    assert res.evaluations < 500
+
+
+def test_a_budget_too_small_to_reach_the_crew_phase_is_not_a_broken_book():
+    """Same class, no cancellation: a budget of 1 or 2 is spent entirely on seeds
+    that share the infeasible seed crew, so the search never reaches the dimension
+    that could fix it. That is a budget too small, not a book that cannot be run —
+    and with a budget of 3 the very same call succeeds."""
+    jobs, shop, cfg = _inverted_serial_fixture()
+    for budget in (1, 2):
+        res = search.optimize(jobs, shop, cfg, overlap=0.8, budget_evals=budget,
+                              seed=7)
+        assert res.evaluations <= budget
+    assert search.optimize(jobs, shop, cfg, overlap=0.8, budget_evals=3,
+                           seed=7).score < float("inf")
+
+
+def test_an_infeasible_seed_crew_does_not_burn_the_sequence_share():
+    """When the incumbent crew cannot be run, every sequence neighbour is +inf
+    too — nothing is ever accepted, but each draw is a real evaluation, so the
+    sequence phase used to draw its whole 60% share against a genome it could not
+    fix. Measured before: 30 of 50, 90 of 150, 180 of 300 — a flat 60% at every
+    budget. Feasibility lives in the CREW genome, so that phase goes first.
+    """
+    jobs, shop, cfg = _inverted_serial_fixture(n=8)
+    wasted = {}
+    for budget in (50, 150):
+        seen = []
+        res = search.optimize(jobs, shop, cfg, overlap=0.8, budget_evals=budget,
+                              seed=7, on_eval=lambda n, m: seen.append(m))
+        wasted[budget] = sum(1 for metrics in seen if metrics is None)
+        assert res.evaluations == budget, budget      # the budget IS spent
+        assert res.score < float("inf")
+        assert wasted[budget] <= 5, (budget, wasted)  # was 30 and 90
+    # And what waste is left is the unavoidable seeds, not a SHARE: tripling the
+    # budget must not triple it.
+    assert wasted[150] <= wasted[50] + 2, wasted
+
+
+class _FakeEvaluator:
+    """A landscape with a known global minimum and no scheduler in sight.
+
+    `score = sum(position x item)` is minimised, by the rearrangement inequality,
+    exactly when the items descend — so from that genome EVERY neighbour is
+    strictly worse, which is the only state in which an acceptance rule can be
+    caught misbehaving.
+    """
+
+    def __init__(self, budget):
+        self.count, self._budget = 0, budget
+
+    @property
+    def exhausted(self):
+        return self.count >= self._budget
+
+    def __call__(self, sequence, _crew):
+        self.count += 1
+        value = float(sum(pos * item for pos, item in enumerate(sequence)))
+        return value, value, False
+
+
+def test_a_climb_never_accepts_a_worse_genome():
+    """Pins the acceptance rule where it lives, not where its effect is visible.
+
+    Keeping the best across restarts means the RESULT is protected by the ledger
+    even if the climb wandered — measured: mutating `cand_value < value` to accept
+    everything left all 32 tests green once restarts existed. A climb that accepts
+    anything is a random walk wearing a hill-climber's name, and it would quietly
+    waste the whole budget, so it is asserted directly.
+    """
+    import random
+
+    ev = _FakeEvaluator(60)
+    start = list(range(7, -1, -1))        # the global minimum of this landscape
+    floor = float(sum(pos * item for pos, item in enumerate(start)))
+    genome, value, _metrics = search._climb(
+        start, floor, floor, ev, random.Random(0), lambda g: (g, ()), None)
+    assert ev.count == 60, "the climb must actually have tried neighbours"
+    assert value == floor
+    assert genome == start
+
+
+def test_leftover_budget_is_spent_instead_of_being_handed_back():
+    """The alternating descent converges long before a real budget is gone — this
+    6-job book spent exactly 60 evaluations of 150, 400 or 1000 alike. That
+    remainder is free, and at a small budget on a big book restarts are what pay.
+    So on convergence the search restarts from a fresh genome and keeps the GLOBAL
+    best, under the same strict-improvement gate.
+    """
+    jobs, shop, cfg = _fixture()
+    res = search.optimize(jobs, shop, cfg, overlap=0.8, budget_evals=400, seed=7)
+    assert res.evaluations > 300, res.evaluations
+    assert res.evaluations <= 400
+    # And the restarts may never hand back something worse than the seed.
+    assert res.score <= res.baseline_score
+
+
 def test_on_eval_is_called_once_per_real_evaluation():
     jobs, shop, cfg = _fixture()
     seen = []
@@ -297,23 +467,46 @@ def test_on_eval_is_called_once_per_real_evaluation():
     assert [n for n, _m in seen] == list(range(1, res.evaluations + 1))
 
 
-def test_repeated_genomes_do_not_burn_budget():
+def test_no_genome_is_ever_decoded_twice():
     """The search revisits genomes constantly; re-deciding a plan it has already
-    decided is pure waste at ~35 ms a go."""
+    decided is pure waste at ~35 ms a go.
+
+    Asserting `schedule() calls == res.evaluations` — the obvious check — is an
+    IDENTITY that holds with or without the cache, because a cache miss counts an
+    evaluation and a cache hit does neither. Measured: deleting the memo entirely
+    left 26 of 26 tests green. What only the memo can deliver is that no genome is
+    decoded a SECOND time, so that is what is asserted here, together with the
+    non-vacuity fact that the evaluator really was asked the same question twice.
+    """
     jobs, shop, cfg = _fixture()
-    plans = {"n": 0}
-    real = scheduler.schedule
+    genomes = []
+    real_sched = scheduler.schedule
+    real_call = search._Evaluator.__call__
+    asked = {"n": 0}
 
-    def counting(*a, **kw):
-        plans["n"] += 1
-        return real(*a, **kw)
+    def counting_schedule(jobs_, sequence, shop_, config_, **kw):
+        genomes.append((tuple(sequence),
+                        tuple(sorted((kw.get("crew_rank") or {}).items()))))
+        return real_sched(jobs_, sequence, shop_, config_, **kw)
 
-    search.scheduler.schedule = counting
+    def counting_call(self, sequence, crew):
+        asked["n"] += 1
+        return real_call(self, sequence, crew)
+
+    search.scheduler.schedule = counting_schedule
+    search._Evaluator.__call__ = counting_call
     try:
         res = search.optimize(jobs, shop, cfg, overlap=0.8, budget_evals=40, seed=7)
     finally:
-        search.scheduler.schedule = real
-    assert plans["n"] == res.evaluations
+        search.scheduler.schedule = real_sched
+        search._Evaluator.__call__ = real_call
+
+    assert len(genomes) == res.evaluations
+    assert len(set(genomes)) == len(genomes), (
+        f"{len(genomes) - len(set(genomes))} genomes were decoded more than once")
+    # Non-vacuous: the search DID ask for genomes it had already seen, and the
+    # memo is what served them. (Measured on this fixture: 73 asks, 40 decodes.)
+    assert asked["n"] > res.evaluations
 
 
 def test_an_empty_book_is_not_a_crash():
@@ -388,6 +581,39 @@ def _serial_fixture():
                for i in range(3)]
     jobs, _by, _sk = build_jobs(batches, masters)
     return jobs, build_shop(masters), _cfg()
+
+
+def _inverted_serial_fixture(n=3):
+    """`_serial_fixture` with the machine NAMES inverted: step 1 runs only on CNC9
+    and step 2 only on CNC1, so `sorted(machining_ids)` — the crew genome the
+    search starts from — ranks the DOWNSTREAM machine first and the SEED itself is
+    infeasible. That is the state in which a Stop press, or a budget too small to
+    reach the crew phase, must not be reported as a broken book."""
+    machines = {m: Machine(m, m, "CNC lathe", available_hrs_per_day=19.5)
+                for m in ("CNC1", "CNC9")}
+    masters = Masters(
+        machines=machines,
+        routings={"ITEM": Routing("ITEM", "d", "", "", None,
+                                  [Process(1, "CNC FIRST SIDE", 4.0, None, None, "CNC9"),
+                                   Process(2, "CNC SECOND SIDE", 3.0, None, None, "CNC1")])},
+        operators=[Operator("Narayan", "", ["CNC1", "CNC9"], "First shift")],
+        calendar=WorkCalendar())
+    batches = [_B(f"B{i}", 40 + 5 * i, date(2026, 9, 1) + timedelta(days=i))
+               for i in range(n)]
+    jobs, _by, _sk = build_jobs(batches, masters)
+    return jobs, build_shop(masters), _cfg()
+
+
+def test_the_seed_crew_genome_really_can_be_infeasible():
+    """Pins the fixture the three tests above depend on: if `sorted()` ever stopped
+    ranking the downstream machine first, they would all pass vacuously."""
+    import pytest
+
+    jobs, shop, cfg = _inverted_serial_fixture()
+    with pytest.raises(scheduler.Unschedulable):
+        scheduler.schedule(jobs, [j.key for j in jobs], shop, cfg, overlap=0.8,
+                           crew_rank={mid: i for i, mid
+                                      in enumerate(sorted(shop.machining_ids))})
 
 
 def test_a_crew_genome_the_shop_cannot_run_is_scored_out_not_crashed():

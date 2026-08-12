@@ -12,29 +12,46 @@ and climb the crew, and repeat until neither moves. The crew genome is
 deliberately a PERMUTATION, the same object type as the sequence, so one set of
 moves serves both.
 
+The descent converges long before a real budget is gone — a 6-job book spent 60
+evaluations of 150, 400 and 1000 alike. Unspent budget is free, so on convergence
+the search RESTARTS from a fresh random genome and keeps climbing until the budget
+really is gone, holding the best plan seen across every restart.
+
 Guarantees, matching the live search so the A/B is fair:
 
   * **Never worse than the starting point.** The dispatch-rule seeds are evaluated
     first, the best of them becomes the incumbent, and a move is accepted only if
-    it STRICTLY improves. The incumbent IS the returned result — there is no
-    separate "best seen" ledger, deliberately: a ledger would keep the promise
-    true by bookkeeping even if the acceptance rule were broken, and this promise
-    is the reason an owner will press Apply.
+    it STRICTLY improves — both inside a climb and when a restart's converged
+    genome is offered to the global best. The two gates are separate on purpose:
+    a restart must be free to explore a worse region, and only a strictly better
+    result may replace what is returned.
   * **Deterministic.** A fixed seed and eval budget give the same result every
     run, in any process: every collection that feeds a decision is a sorted list,
     never a set or a dict in iteration order, and the only randomness is one
     seeded `random.Random`.
   * **Budgeted and cancellable.** `should_cancel()` stops the search where it
-    stands and the incumbent so far is returned.
+    stands and the best so far is returned — never an exception, even when the
+    stop lands before any feasible plan has been found.
   * **Objective-blind.** It knows nothing about how the score is built.
 
 Some genomes are INFEASIBLE, and the crew genome is why. Rank a downstream
 machine ahead of the one that feeds it and the shop's only operator mans an empty
 chuck every shift while the upstream machine stays dark — the plan never places
 anything and `scheduler.schedule` fails loud, exactly as it should. A candidate
-like that is scored `+inf` and dropped, never crashed on; but if NO genome could
-be planned, the scheduler's own typed error is re-raised, because then it is the
-book that cannot be built and the caller must hear about it.
+like that is scored `+inf` and dropped, never crashed on.
+
+Feasibility lives in the CREW genome, so when the incumbent is infeasible the
+sequence phase is skipped entirely: re-ordering jobs cannot man a dark machine,
+and every neighbour it drew was a real evaluation spent on a `+inf` plan (measured
+at a flat 60% of the budget — the sequence phase's whole share — at every budget
+tried).
+
+The scheduler's own typed error is re-raised ONLY when the search genuinely
+exhausted an uncancelled budget with the crew dimension having had its turn: then
+it is the book that cannot be built and the caller must hear about it. A stop
+press, or a budget too small to reach the crew phase, is neither — reporting a
+data problem there would send the owner hunting for a missing qualification that
+does not exist.
 
 Because a plan costs ~35 ms at 50 jobs and the contest builds thousands of them,
 every decoded genome is memoised: revisiting one costs a dict lookup and does not
@@ -134,7 +151,15 @@ class _Evaluator:
 
 def optimize(jobs, shop, config, *, overlap, budget_evals=150, seed=42,
              on_eval=None, should_cancel=None, frozen=None) -> Result:
-    """Search the job sequence and the crew priorities together."""
+    """Search the job sequence and the crew priorities together.
+
+    ``on_eval(count, metrics)`` — the progress hook — is called once per REAL
+    evaluation, with the running 1-based count and that candidate's
+    ``objective.Metrics``. **It is called with ``metrics=None`` when the candidate
+    could not be scheduled at all**, which is a normal event here (see the module
+    docstring), not an error: a caller that reads the metrics must tolerate None.
+    A memo hit calls nothing, because it cost nothing.
+    """
     if not jobs:
         return Result()
 
@@ -145,37 +170,64 @@ def optimize(jobs, shop, config, *, overlap, budget_evals=150, seed=42,
                     budget)
 
     seeds = _seed_sequences(jobs)
-    best_seq, best_crew = seeds[0], list(machines)
-    best_score, best_metrics = float("inf"), None
+    seq, crew = seeds[0], list(machines)
+    value, metrics = float("inf"), None
     for candidate in seeds:
-        value, metrics, _free = ev(candidate, best_crew)
-        if value < best_score:
-            best_seq, best_score, best_metrics = candidate, value, metrics
+        cand_value, cand_metrics, _free = ev(candidate, crew)
+        if cand_value < value:
+            seq, value, metrics = candidate, cand_value, cand_metrics
         if ev.exhausted:
             break
-    baseline = best_score
+    baseline = value
+
+    # The result, held apart from the genome the descent is currently working on:
+    # a restart may explore a worse region, and only a STRICT improvement is ever
+    # allowed to replace what will be returned.
+    best_seq, best_crew = list(seq), list(crew)
+    best_score, best_metrics = value, metrics
+    crew_searched = False
 
     job_ceiling = int(budget * _JOB_SHARE)
     while not ev.exhausted:
         spent = ev.count
-        best_seq, best_score, best_metrics = _climb(
-            best_seq, best_score, best_metrics, ev, rng,
-            lambda seq: (seq, best_crew), job_ceiling)
-        best_crew, best_score, best_metrics = _climb(
-            best_crew, best_score, best_metrics, ev, rng,
-            lambda crew: (best_seq, crew), None)
-        capped = job_ceiling is not None
-        job_ceiling = None                    # the share applies to round 1 only
+        # An infeasible incumbent is a CREW problem — no job order can man a dark
+        # machine — so the sequence phase is skipped until there is a plan to
+        # improve. Without this it draws its whole share against `+inf`.
+        climbed = value < float("inf")
+        if climbed:
+            seq, value, metrics = _climb(seq, value, metrics, ev, rng,
+                                         lambda s: (s, crew), job_ceiling)
+        crew, value, metrics = _climb(crew, value, metrics, ev, rng,
+                                      lambda c: (seq, c), None)
+        crew_searched = True
+        capped = climbed and job_ceiling is not None
+        if climbed:
+            job_ceiling = None                # the share applies to round 1 only
+        if value < best_score:
+            best_seq, best_crew = list(seq), list(crew)
+            best_score, best_metrics = value, metrics
         if ev.count == spent and not capped:
-            # Both neighbourhoods saturated with budget still in hand: there is
-            # nothing left to try. Checked only on an UNCAPPED round, or a round
-            # in which the share had already stopped the sequence phase would end
-            # the whole search with budget unspent.
-            break
+            # Both neighbourhoods saturated. Checked only on an UNCAPPED round, or
+            # a round in which the share had already stopped the sequence phase
+            # would end the whole search with budget unspent. There IS budget
+            # left, so restart from a fresh genome rather than hand it back.
+            if ev.exhausted:
+                break
+            seq = rng.sample(best_seq, len(best_seq))
+            crew = rng.sample(machines, len(machines))
+            value, metrics, free = ev(seq, crew)
+            if free:
+                # Even a fresh draw costs nothing: every genome this search can
+                # reach is already in the memo, so there is genuinely nothing left
+                # to try. (This also bounds the loop — every other iteration
+                # spends at least one evaluation.)
+                break
 
-    if best_score == float("inf") and ev.first_error is not None:
-        # Nothing this search tried could be built. That is not a bad plan, it is
-        # a book the shop cannot run, and the scheduler's own typed error names
+    if (best_score == float("inf") and ev.first_error is not None
+            and not ev.cancelled and crew_searched):
+        # Nothing this search tried could be built, and it was not stopped and did
+        # reach the dimension that decides feasibility. That is not a bad plan, it
+        # is a book the shop cannot run, and the scheduler's own typed error names
         # the blocking step — fail loud rather than hand back an empty plan.
         raise ev.first_error
 

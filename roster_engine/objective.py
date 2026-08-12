@@ -6,6 +6,7 @@ imported, because this package stands alone and never imports the engine it is
 being compared against.
 
     score = w_ontime  x  sum( (|miss| - band, capped)^2 )     # the whole objective
+          + w_ceiling x  sum( (late - ceiling)^2 )            # a no-regression bar
           + w_makespan x  makespan_days                       # a strict tie-break
 
 `abs()` is the owner's rule that early and late are equally bad. Squaring is the
@@ -22,13 +23,26 @@ production uses. A numeric differential test scores the same lateness maps
 through both implementations and pins them equal
 (`tests/test_roster_search.py::test_the_score_matches_the_incumbent_engines_formula`).
 
-Two terms of the live score are deliberately NOT reproduced: the worst-order
-CEILING barrier (`ceiling_days` defaults to None, so it contributes exactly 0)
-and the COMMITTED-PROMISE penalty (`promise_slip_by_order` is empty unless an
-order is committed, and the commitment feature is switched off in production —
-`api.main.COMMITMENT_FEATURE_ENABLED = False`). Both are dormant, and neither
-has an input this engine's `Job` even carries. When one wakes up, it belongs
-here too.
+The worst-order CEILING is a live term, not a dormant one, and it is reproduced
+here. Its default IS None — but the path this engine is measured against never
+runs on the default: the API sets the ceiling to the CURRENT plan's worst
+lateness on every optimize run, auto and manual alike, at weight 100.0 (a
+thousand times the makespan tie-break). It is a no-regression barrier — a
+re-optimization may not push any order past today's worst case — so a search
+without it can propose plans the live search is structurally forbidden to
+propose, and the A/B would be measuring two different questions. It is read off
+`config.worst_ceiling_days`, the field the live config carries.
+
+Unlike the on-time term the ceiling is ONE-SIDED (`late - ceiling`, not
+`abs(late) - ceiling`): finishing early can never breach a lateness barrier.
+
+ONE term of the live score is deliberately not reproduced: the COMMITTED-PROMISE
+penalty. That one is genuinely dormant — it is driven by per-order promise dates,
+which exist only on a COMMITTED order, and the whole commitment feature is
+switched off in production (`api.main.COMMITMENT_FEATURE_ENABLED = False`), so
+its input map is empty and it contributes exactly 0. It also has no input this
+engine's `Job` carries. If commitments are ever switched back on, it belongs here
+too.
 """
 
 from __future__ import annotations
@@ -46,6 +60,7 @@ _ONTIME_WEIGHT = 1.0
 _MAKESPAN_WEIGHT = 0.1
 _BAND_DAYS = 4.0
 _CAP_DAYS = 60.0
+_CEILING_WEIGHT = 100.0
 
 
 @dataclass(frozen=True)
@@ -102,9 +117,38 @@ def score(metrics: Metrics, config) -> float:
             if over > cap:
                 over = cap
             breach += over * over
+    # Term order matches the live score's, deliberately: float addition is not
+    # associative, and the differential test asserts EXACT equality.
     return (_knob(config, "ontime_weight", _ONTIME_WEIGHT) * breach
+            + _knob(config, "ceiling_weight", _CEILING_WEIGHT)
+            * _ceiling_breach(metrics, config)
             + _knob(config, "makespan_weight", _MAKESPAN_WEIGHT)
             * metrics.makespan_days)
+
+
+def _ceiling_breach(metrics: Metrics, config) -> float:
+    """Squared lateness beyond the worst-order ceiling; 0.0 when there is none.
+
+    The barrier that stops a re-optimization pushing any order past the plan the
+    floor already has. One-sided on purpose — an order that finishes EARLY has not
+    breached a lateness ceiling, so this reads the SIGNED lateness and never
+    `abs()`. The knob is `worst_ceiling_days` on the live config; `ceiling_days` is
+    accepted as the same thing under the name the pure engine layer uses.
+    """
+    ceiling = None
+    for name in ("worst_ceiling_days", "ceiling_days"):
+        value = getattr(config, name, None)
+        if value is not None:
+            ceiling = float(value)
+            break
+    if ceiling is None:
+        return 0.0
+    total = 0.0
+    for late in metrics.lateness_by_order.values():
+        over = late - ceiling
+        if over > 0:
+            total += over * over
+    return total
 
 
 def _knob(config, name: str, default: float) -> float:
