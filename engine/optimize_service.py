@@ -74,23 +74,31 @@ CLOUD_NEW_BUDGET_PER_CANDIDATE = 150
 # exchange, so the job count, plan budget and wall-clock are unchanged (pinned by
 # TestCostInvariant). Seeds are traded for overlap breadth, never added on top.
 #
-# Measured on the live book (3 overlaps x 3 seeds, each replayed at the overlap
-# it was searched for), in late-days:
+# Extra RNG seeds the cloud contest multi-starts from, on top of the base seed.
+#
+# OFF. Multi-seed search was built, measured and switched off again (2026-08-12).
+#
+# The case for it looked strong in isolation. On the live book, 3 overlaps x 3
+# seeds, each replayed at the overlap it was searched for, in late-days:
 #
 #     overlap   seed 42   seed 7   seed 99     best
 #        78       403       402      371        371
 #        86       365       389      365        365
 #        93       374       366      394        366
 #
-#     spread of the BEST result per overlap  (what the overlap grid buys) :  6
-#     average spread between seeds at one overlap (what seeds buy)        : 28
+#     spread of the BEST result per overlap (what overlap breadth buys) :  6
+#     average spread between seeds at one overlap (what seeds buy)      : 28
 #
-# Seed choice is worth ~5x what overlap choice is worth, and NO seed is good
-# everywhere: 99 wins at 78 by 32 days and loses at 93 by 28; 42 wins at 86 and
-# is worst at 78. Picking a seed in advance is therefore guesswork — searching
-# several and keeping the best is the only way to stop the answer depending on a
-# lucky random stream. OPTIMIZE_CLOUD_SEEDS overrides this from the dashboard.
-CLOUD_EXTRA_SEEDS: tuple = (7, 99)
+# So seed choice looked worth ~5x overlap choice, and no seed was good everywhere.
+# But those were SINGLE-CANDIDATE probes. In the real contest the winner is the
+# best of 24 (or 72) candidates, and that maximum is already stable: on the live
+# book a 2-seed contest (16,800 plans) and a 3-seed contest (50,400 plans) both
+# returned exactly 389 late-days. Tripling the search bought nothing, because the
+# full contest was already finding the best answer its objective can express.
+#
+# The lesson: variance between individual searches does NOT imply variance in the
+# best-of-N. Keep this off unless the objective changes and re-opens the gap.
+CLOUD_EXTRA_SEEDS: tuple = ()
 
 
 def cloud_seeds() -> list:

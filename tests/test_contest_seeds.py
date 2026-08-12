@@ -350,6 +350,9 @@ class TestWallClockSafety:
         monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (7, 99))
         assert osvc.cloud_candidates(cfg) == before
 
-    def test_three_seeds_are_configured(self):
-        """Base seed + two extras. No seed was best everywhere in the grid."""
-        assert len(osvc.contest_seeds({"seed": 42, "seeds": osvc.cloud_seeds()})) == 3
+    def test_multi_seed_is_OFF(self):
+        """Switched off after measurement: a 2-seed contest (16,800 plans) and a
+        3-seed contest (50,400) both returned 389 late-days on the live book.
+        Variance between individual searches did not survive into the best-of-N."""
+        assert osvc.CLOUD_EXTRA_SEEDS == ()
+        assert osvc.contest_seeds({"seed": 42, "seeds": osvc.cloud_seeds()}) == [42]
