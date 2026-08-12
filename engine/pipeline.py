@@ -145,6 +145,13 @@ def scheduler_for(config):
         # the whole UI keeps consuming the same ScheduleEntry list.
         from . import new_engine
         return new_engine.run
+    if sched == "roster":
+        # The roster-first engine (roster_engine/, 2026-08-12 spec): the crew is
+        # rostered at the shift boundary and an operation runs to completion, so
+        # "one operator per machine per shift" is structural rather than checked.
+        # engine/roster_adapter.py is the only file that knows both worlds.
+        from . import roster_adapter
+        return roster_adapter.run
     if sched == "flow":
         from . import flow_scheduler
         return flow_scheduler.run
