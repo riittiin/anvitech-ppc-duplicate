@@ -46,23 +46,17 @@ CLOUD_FLOW_CHUNK_CANDIDATES = (4, 6)
 def cloud_candidates(config) -> tuple:
     """The cloud contest lineup for this config's scheduler mode.
 
-    Under the new engine, turning multi-seed search ON **halves** the overlap
-    grid. That keeps the contest the same SIZE — same jobs, same plans, same
-    wall-clock — so seeds are traded against overlap breadth rather than added
-    on top. The alternative would take 24 jobs to 48, roughly double a ~25-minute
-    run, blow OPTIMIZE_CLOUD_TIMEOUT_MIN (40) and fall back to Render's 0.1-CPU
-    local compute — worse than never searching seeds at all.
-
-    Thinning is safe because ``optimizer.sweep_contenders`` always injects the
-    CURRENT overlap even when it is off-list, so the setting the shop runs today
-    is searched either way.
+    The full grid is always returned. Multi-seed search used to halve it to keep
+    the job count fixed, on an estimate that a contest takes ~25 minutes against a
+    40-minute watchdog. A measured live run does 24 jobs in **391.8 s** (~6.5 min,
+    20 shards in parallel), so there is ample headroom to ADD seeds rather than
+    trade for them — which is strictly better, since the grid measurement below
+    shows overlap breadth is worth far less than seed breadth.
     """
     sched = getattr(config, "scheduler", "classic")
     if sched == "flow":
         return CLOUD_FLOW_CHUNK_CANDIDATES
     if sched == "new":
-        if cloud_seeds():
-            return CLOUD_NEW_OVERLAP_CANDIDATES[::2]
         return CLOUD_NEW_OVERLAP_CANDIDATES
     return CLOUD_OVERLAP_CANDIDATES
 
@@ -80,13 +74,23 @@ CLOUD_NEW_BUDGET_PER_CANDIDATE = 150
 # exchange, so the job count, plan budget and wall-clock are unchanged (pinned by
 # TestCostInvariant). Seeds are traded for overlap breadth, never added on top.
 #
-# Why 99: on the live book at overlap 78, seeds 42/7/99 gave 403/402/371
-# late-days and 3,186/3,319/2,940 objective — seed 99 found a materially better
-# optimum on BOTH measures, while production's fixed seed 42 never reaches it.
-# The point of multi-start is not that 99 is special, though: it is that the
-# answer should not depend on one lucky stream. OPTIMIZE_CLOUD_SEEDS overrides
-# this from the dashboard without a deploy.
-CLOUD_EXTRA_SEEDS: tuple = (99,)
+# Measured on the live book (3 overlaps x 3 seeds, each replayed at the overlap
+# it was searched for), in late-days:
+#
+#     overlap   seed 42   seed 7   seed 99     best
+#        78       403       402      371        371
+#        86       365       389      365        365
+#        93       374       366      394        366
+#
+#     spread of the BEST result per overlap  (what the overlap grid buys) :  6
+#     average spread between seeds at one overlap (what seeds buy)        : 28
+#
+# Seed choice is worth ~5x what overlap choice is worth, and NO seed is good
+# everywhere: 99 wins at 78 by 32 days and loses at 93 by 28; 42 wins at 86 and
+# is worst at 78. Picking a seed in advance is therefore guesswork — searching
+# several and keeping the best is the only way to stop the answer depending on a
+# lucky random stream. OPTIMIZE_CLOUD_SEEDS overrides this from the dashboard.
+CLOUD_EXTRA_SEEDS: tuple = (7, 99)
 
 
 def cloud_seeds() -> list:

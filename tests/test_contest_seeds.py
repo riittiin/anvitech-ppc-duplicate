@@ -273,72 +273,73 @@ class TestApiWiring:
 # Turning seeds ON must not cost more wall-clock
 # --------------------------------------------------------------------------- #
 
-class TestCostInvariant:
-    """The load-bearing safety property of activation.
+class TestWallClockSafety:
+    """Seeds are ADDED to the full overlap grid, not traded against it.
 
-    A contest runs on 20 GitHub shards under a 40-minute watchdog
-    (OPTIMIZE_CLOUD_TIMEOUT_MIN); a live run takes ~25 min. Adding a seed on top
-    of the 12-value overlap grid would take 24 jobs to 48, roughly double the
-    wall-clock, blow the watchdog, and fall back to Render's 0.1-CPU local
-    compute — which is far worse than not searching seeds at all.
+    The earlier design halved the grid to hold the job count fixed, on an
+    estimate that a contest takes ~25 minutes against OPTIMIZE_CLOUD_TIMEOUT_MIN
+    (40). A measured live run does 24 jobs in 391.8 s — ~6.5 min across 20
+    parallel shards, i.e. ~196 s per job — so the trade was unnecessary, and it
+    cost real coverage: the thinned grid dropped overlap 93, which measured
+    objective 2,981 on the live book.
 
-    So enabling seeds HALVES the overlap grid: the job count, the plan budget
-    and therefore the wall-clock all stay put. Seeds are traded for overlap
-    breadth, never added on top.
+    What must hold instead is that the contest still finishes inside the
+    watchdog, with margin, on the slowest shard.
     """
 
-    def _jobs(self, cfg, monkeypatch, seeds):
-        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", tuple(seeds))
-        monkeypatch.delenv("OPTIMIZE_CLOUD_SEEDS", raising=False)
-        payload = _payload(candidates=osvc.cloud_candidates(cfg),
-                           seeds=osvc.cloud_seeds() or None)
-        return osvc.contest_jobs(payload)
+    MEASURED_SECONDS_PER_JOB = 196      # live run: 16,800 plans / 24 jobs / 391.8 s
+    SHARDS = 20                         # .github/workflows/optimize.yml matrix
+    WATCHDOG_MIN = 40                   # OPTIMIZE_CLOUD_TIMEOUT_MIN default
 
-    def _new_cfg(self):
+    def _cfg(self, overlap=82):
         cfg = Config(scheduler="new", plan_start_date=date(2025, 3, 3),
-                     apply_operator_logic=True, overlap_percent=86)
+                     apply_operator_logic=True, overlap_percent=overlap)
         cfg.validate()
         return cfg
 
-    def test_one_extra_seed_does_not_increase_the_job_count(self, monkeypatch):
-        cfg = self._new_cfg()
-        off = len(self._jobs(cfg, monkeypatch, ()))
-        on = len(self._jobs(cfg, monkeypatch, (99,)))
-        assert on == off, f"cost changed: {off} jobs -> {on} jobs"
+    def _jobs(self, cfg):
+        contenders = optimizer.sweep_contenders(
+            cfg.overlap_percent, osvc.cloud_candidates(cfg))
+        return len(contenders) * 2 * len(osvc.contest_seeds(
+            {"seed": 42, "seeds": osvc.cloud_seeds()}))
 
-    def test_seeds_on_halves_the_overlap_grid(self, monkeypatch):
-        cfg = self._new_cfg()
+    def test_the_contest_fits_inside_the_watchdog_with_margin(self):
+        jobs = self._jobs(self._cfg())
+        per_shard = -(-jobs // self.SHARDS)          # ceil
+        minutes = per_shard * self.MEASURED_SECONDS_PER_JOB / 60
+        assert minutes < self.WATCHDOG_MIN / 2, (
+            f"{jobs} jobs -> {per_shard}/shard -> ~{minutes:.0f} min, "
+            f"too close to the {self.WATCHDOG_MIN} min watchdog")
+
+    def test_the_full_overlap_grid_is_searched(self):
+        """The thinning is gone: no overlap value may be dropped."""
+        assert osvc.cloud_candidates(self._cfg()) == osvc.CLOUD_NEW_OVERLAP_CANDIDATES
+
+    def test_the_top_overlap_is_not_lost(self):
+        """93 measured objective 2,981 — better than the incumbent's region.
+        The thinned grid dropped it; regression guard."""
+        assert 93 in osvc.cloud_candidates(self._cfg())
+
+    def test_seeds_do_not_change_the_overlap_grid(self, monkeypatch):
+        cfg = self._cfg()
         monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", ())
-        full = osvc.cloud_candidates(cfg)
-        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (99,))
-        half = osvc.cloud_candidates(cfg)
-        assert len(half) == len(full) // 2
+        off = osvc.cloud_candidates(cfg)
+        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (7, 99))
+        assert osvc.cloud_candidates(cfg) == off
 
-    def test_the_thinned_grid_keeps_the_endpoints(self, monkeypatch):
-        cfg = self._new_cfg()
-        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", ())
-        full = osvc.cloud_candidates(cfg)
-        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (99,))
-        half = osvc.cloud_candidates(cfg)
-        assert half[0] == full[0]
-        assert set(half) <= set(full)
-
-    def test_the_incumbent_overlap_is_still_searched_after_thinning(self, monkeypatch):
-        """sweep_contenders injects the CURRENT overlap even when off-list, so
-        thinning the grid can never lose the setting the shop runs today."""
-        cfg = Config(scheduler="new", plan_start_date=date(2025, 3, 3),
-                     apply_operator_logic=True, overlap_percent=88)  # not in the half grid
-        cfg.validate()
-        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (99,))
-        contenders = optimizer.sweep_contenders(88, osvc.cloud_candidates(cfg))
-        assert 88 in contenders
+    def test_the_incumbent_overlap_is_always_searched(self):
+        """sweep_contenders injects the current value even when off-grid."""
+        for overlap in (82, 86, 77):
+            cfg = self._cfg(overlap)
+            assert overlap in optimizer.sweep_contenders(
+                overlap, osvc.cloud_candidates(cfg))
 
     def test_classic_mode_is_untouched_by_seeds(self, monkeypatch):
         cfg = Config(scheduler="classic", plan_start_date=date(2025, 3, 3))
         cfg.validate()
         monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", ())
         before = osvc.cloud_candidates(cfg)
-        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (99,))
+        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (7, 99))
         assert osvc.cloud_candidates(cfg) == before
 
     def test_flow_mode_is_untouched_by_seeds(self, monkeypatch):
@@ -346,5 +347,9 @@ class TestCostInvariant:
         cfg.validate()
         monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", ())
         before = osvc.cloud_candidates(cfg)
-        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (99,))
+        monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (7, 99))
         assert osvc.cloud_candidates(cfg) == before
+
+    def test_three_seeds_are_configured(self):
+        """Base seed + two extras. No seed was best everywhere in the grid."""
+        assert len(osvc.contest_seeds({"seed": 42, "seeds": osvc.cloud_seeds()})) == 3
