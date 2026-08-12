@@ -1,0 +1,95 @@
+"""Who mans which machine, for a whole shift. This is Rule 1.
+
+An operator appears in at most one machine's roster for a shift, so "one operator
+hopping between machines mid-shift" is not a thing this engine can express. The
+live engine states the same rule in staffing.py's docstring and then implements a
+"short-job exception" that books people per-minute; that is the defect this
+package exists to remove.
+
+Only CNC/VMC are rostered. A helper physically walks between deburring and
+packing, and forbidding that would delete capacity that really exists.
+"""
+
+from __future__ import annotations
+
+from roster_engine.assign import max_weight_matching
+from roster_engine.worktime import machine_runs_shift, operator_shift
+
+# Continuing a part already in the chuck must beat any amount of raw demand
+# elsewhere, or an operation would be segmented at every shift boundary. A shift
+# is at most ~660 minutes, so this cannot be outweighed by real work.
+CARRY_BONUS = 1_000_000.0
+
+# How much one rank of the crew genome is worth, in "minutes of pending work".
+# Big enough that the optimizer can genuinely move a decision; small enough that
+# it can never man a machine with nothing to do. That guard is NOT arithmetic —
+# a zero/negative-demand, non-carry pairing is never added to `values` at all
+# (see the `pending <= 0.0 and mid not in in_progress: continue` below), so no
+# value of LOOKAHEAD_UNIT could lift it above the "opt out" dummy column in
+# max_weight_matching (which is always worth exactly 0). Kept well below
+# CARRY_BONUS regardless, so it can never be mistaken for a carry-over.
+LOOKAHEAD_UNIT = 45.0
+
+
+def eligible(operator, machine_id: str, window, shop) -> bool:
+    """May this person man this machine in this shift?
+
+    Qualification is EXACTLY the machine list the admin set in Settings. Role is
+    not a gate: it is inherited by name from the workbook's operator sheet, a
+    fossil, and gating on it silently discarded the admin's assignment (live
+    2026-08-07 — Sandeep Kumar was given CNC4, dropped from its pool for being a
+    workbook "helper", and CNC4 sat idle with work waiting).
+    """
+    if machine_id not in (getattr(operator, "machines", None) or ()):
+        return False
+    if operator_shift(operator) != window.shift:
+        return False
+    if not shop.calendar.is_working_day(window.day):
+        return False
+    for start, end in shop.absent.get(operator.name, ()):
+        if start < window.end and window.start < end:
+            return False
+    return True
+
+
+def roster_for_shift(window, shop, demand: dict, in_progress: dict,
+                     crew_rank: dict) -> dict:
+    """Assign operators to CNC/VMC machines for ``window``.
+
+    Args:
+        window:      the shift being rostered.
+        shop:        the Shop (machines, operators, calendar, absences).
+        demand:      machine id -> minutes of work that could run on it this shift.
+        in_progress: machine id -> job key of a part physically mid-run on it.
+        crew_rank:   machine id -> rank (0 = first claim). The optimizer's lever;
+                     empty means no bias.
+
+    Returns:
+        {machine_id: operator_name}. A machine absent from the result is dark this
+        shift, which is a true constraint, not a failure.
+    """
+    machines = sorted(
+        (mid for mid in shop.machining_ids
+         if machine_runs_shift(shop.machines[mid], window.shift)),
+        key=lambda mid: (crew_rank.get(mid, len(shop.machines)), mid))
+    operators = sorted(shop.operators, key=lambda o: o.name)
+    if not machines or not operators:
+        return {}
+
+    n_ranks = len(machines)
+    values = {}
+    for r, operator in enumerate(operators):
+        for c, mid in enumerate(machines):
+            if not eligible(operator, mid, window, shop):
+                continue
+            pending = float(demand.get(mid, 0.0))
+            if pending <= 0.0 and mid not in in_progress:
+                continue                      # never man a machine with no work
+            value = min(window.minutes, pending)
+            if mid in in_progress:
+                value += CARRY_BONUS
+            value += LOOKAHEAD_UNIT * (n_ranks - crew_rank.get(mid, n_ranks))
+            values[(r, c)] = value
+
+    matched = max_weight_matching(values, len(operators), len(machines))
+    return {machines[c]: operators[r].name for r, c in matched.items()}
