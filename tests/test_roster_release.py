@@ -8,8 +8,8 @@ def _op(seq, kind, cycle=5.0, name="OP"):
     return Op(seq, name, kind, cycle, ("CNC1",) if kind == "machining" else ("MD1",))
 
 
-def _job(ops, qty=100):
-    return Job("B1", "ITEM", qty, None, ("SO1",), tuple(ops), None)
+def _job(ops, qty=100, remaining=None):
+    return Job("B1", "ITEM", qty, None, ("SO1",), tuple(ops), remaining)
 
 
 @pytest.mark.parametrize("overlap,qty,expected", [
@@ -62,3 +62,48 @@ def test_a_finished_step_releases_immediately():
     job = _job([_op(1, "machining")], qty=0)
     assert release.work_min_before_release(
         job, job.ops[0], overlap=0.8, setup_min=90.0) == 0.0
+
+
+def test_release_is_computed_from_remaining_qty_not_batch_qty():
+    """CLAUDE.md 2026-08-11: a re-plan's release must derive from what this STEP
+    still owes (batch-level), never from the original batch qty a per-line number
+    might reflect. Batch of 100, but this step (seq 1) has only 40 left — at
+    overlap 0.8 the release must be ceil(0.8 * 40) = 32 pieces, NOT
+    ceil(0.8 * 100) = 80. The two numbers are chosen far enough apart that only
+    one can be right."""
+    job = _job([_op(1, "machining", cycle=1.0)], qty=100, remaining={1: 40})
+    # From remaining (correct): 90 setup + 32 pieces x 1 min = 122.0
+    # From job.qty instead (the reverted mutant): 90 + 80 x 1 = 170.0
+    assert release.work_min_before_release(
+        job, job.ops[0], overlap=0.8, setup_min=90.0) == 122.0
+
+
+def test_release_falls_back_to_batch_qty_when_step_absent_from_remaining():
+    """The other direction of the same interaction: a step with NO entry in
+    ``remaining`` (e.g. a step nothing has been punched against yet) must fall
+    back to the full batch qty, not to zero or some other default."""
+    op1 = _op(1, "machining", cycle=1.0)
+    op2 = _op(2, "machining", cycle=1.0)
+    job = _job([op1, op2], qty=100, remaining={1: 40})  # op 2 has no entry
+    # op 2 falls back to the full batch qty of 100: 90 setup + ceil(0.8*100)=80 x 1
+    assert release.work_min_before_release(
+        job, op2, overlap=0.8, setup_min=90.0) == 170.0
+
+
+def test_dispatch_as_predecessor_never_overlaps():
+    """DISPATCH is a milestone, not just a non-overlapping successor (already
+    covered) — it also never hands anything over gradually as a PREDECESSOR."""
+    assert not release.overlaps(_op(1, "dispatch"), _op(2, "machining"))
+
+
+def test_a_no_cutting_step_waits_for_full_completion_not_a_partial_release():
+    """Direct test of work_min_before_release's full-completion-wait branch
+    (RULES.md:127) — ``overlaps()`` above only covers the start GATE; this covers
+    the minutes-before-release CALCULATION for the same rule: a no-cycle-time step
+    must not use ``released_pieces`` at all."""
+    job = _job([_op(1, "manual", cycle=0.0)], qty=50)
+    # Manual carries no setup, and a zero-cycle step contributes 0 minutes of
+    # work regardless of overlap -- the successor still waits for it to
+    # "complete" (immediately), never for a partial release.
+    assert release.work_min_before_release(
+        job, job.ops[0], overlap=0.2, setup_min=90.0) == 0.0
