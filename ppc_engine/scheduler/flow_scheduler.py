@@ -108,7 +108,7 @@ def decode(
     if frozen:
         segments.extend(_preplace_frozen(
             frozen, order_by_key, ops_of, idx_of, ready_of, prev_end_of,
-            machine_free, staffing, completion, masters, config))
+            machine_free, staffing, completion, masters, config, machine_busy))
 
     # Orders that still have operations left to schedule.
     remaining = [key for key in sequence if idx_of[key] < len(ops_of[key])]
@@ -675,7 +675,8 @@ def _ready_after(order, just, nxt, start, paced_end, config, *,
 
 
 def _preplace_frozen(frozen, order_by_key, ops_of, idx_of, ready_of, prev_end_of,
-                     machine_free, staffing, completion, masters, config):
+                     machine_free, staffing, completion, masters, config,
+                     machine_busy=None):
     """Pin every in-progress op onto its machine+operator BEFORE the main loop.
 
     Frozen ops resume in previous-plan (``prev_start``) order — but an op is never
@@ -757,6 +758,15 @@ def _preplace_frozen(frozen, order_by_key, ops_of, idx_of, ready_of, prev_end_of
         for a in laid["assignments"]:
             staffing.commit(*a)
         machine_free[mid] = laid["end"]
+        # Record the booking too. `machine_free` alone is a watermark; the main
+        # decode loop now places work from the CALENDAR, so a frozen op that is
+        # not booked here is invisible to it and a second job lands on top of the
+        # part already running (live: two ops on CNC4 at 14-08 08:00).
+        if machine_busy is not None:
+            for seg in laid["segments"]:
+                if seg.machine_id:
+                    machine_busy.setdefault(seg.machine_id, []).append((seg.start, seg.end))
+                    machine_busy[seg.machine_id].sort()
         for seg in laid["segments"]:
             if seg.operator is not None:
                 staffing.add_load(seg.operator,
