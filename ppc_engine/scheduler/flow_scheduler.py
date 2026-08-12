@@ -95,6 +95,12 @@ def decode(
         prev_end_of[key] = config.plan_start
 
     machine_free: dict[str, datetime] = {mid: config.plan_start for mid in masters.machines}
+    # The machine's actual bookings. `machine_free` is a single watermark and so
+    # cannot express a hole: once it passes a moment, nothing can ever be placed
+    # there. On the live book that strands 1,530 working hours of gaps between
+    # operations, 219 of them with a free operator and ready work. This calendar
+    # lets a later operation be placed in an earlier hole.
+    machine_busy: dict[str, list] = {mid: [] for mid in masters.machines}
     staffing = StaffingBoard(build_machine_pools(masters))
     segments: list[Segment] = []
     completion: dict[tuple[str, str], datetime] = {}
@@ -120,7 +126,7 @@ def decode(
         placements = {
             key: _place_operation(
                 ops_of[key][idx_of[key]], order_by_key[key], ready_of[key],
-                machine_free, staffing, masters, config,
+                machine_free, staffing, masters, config, machine_busy,
             )
             for key in remaining
         }
@@ -160,7 +166,7 @@ def decode(
                 _r = placement["start"] + (prev_end_of[key] - placement["end"])
                 placement = _place_operation(
                     ops_of[key][idx_of[key]], order_by_key[key], _r,
-                    machine_free, staffing, masters, config)
+                    machine_free, staffing, masters, config, machine_busy)
                 if placement["end"] >= prev_end_of[key]:
                     break
         # Commit the winning placement onto the real state. The machine frees after its
@@ -170,9 +176,14 @@ def decode(
         # A split operation occupies SEVERAL machines; each becomes free at its own
         # part's end, not at the operation's end.
         for mid, mend in (placement.get("machine_ends") or {}).items():
-            machine_free[mid] = mend
+            machine_free[mid] = max(machine_free.get(mid, mend), mend)
         if not placement.get("machine_ends") and placement["machine_id"] is not None:
-            machine_free[placement["machine_id"]] = placement["end"]
+            _m = placement["machine_id"]
+            machine_free[_m] = max(machine_free.get(_m, placement["end"]), placement["end"])
+        for seg in placement["segments"]:
+            if seg.machine_id:
+                machine_busy.setdefault(seg.machine_id, []).append((seg.start, seg.end))
+                machine_busy[seg.machine_id].sort()
         for seg in placement["segments"]:
             if seg.operator is not None:  # track load for the "balanced" operator pick
                 staffing.add_load(seg.operator, (seg.end - seg.start).total_seconds() / 60.0)
@@ -242,6 +253,7 @@ def _place_operation(
     staffing: StaffingBoard,
     masters: Masters,
     config: PlanConfig,
+    machine_busy=None,
 ) -> dict:
     """Work out where/when ``op`` would run if scheduled next for ``order``.
 
@@ -292,8 +304,10 @@ def _place_operation(
         machine = masters.machines.get(mid)
         if machine is None:
             continue  # unknown machine id (provisional handling comes with the loader)
-        earliest = max(ready, machine_free.get(mid, config.plan_start))
-        laid = _lay_on_machine(machine, earliest, dur, order, op, int(op_qty), staffing, masters, config)
+        earliest = max(ready, config.plan_start)
+        laid = _lay_on_machine(machine, earliest, dur, order, op, int(op_qty),
+                               staffing, masters, config,
+                               (machine_busy or {}).get(mid))
         if laid is None:
             continue
         cand = (laid["end"], opt_idx)
@@ -465,8 +479,16 @@ def _lay_on_machine(
     staffing: StaffingBoard,
     masters: Masters,
     config: PlanConfig,
+    machine_busy=None,
 ) -> dict | None:
     """Lay ``dur_min`` minutes of work for ``op`` onto ``machine`` from ``earliest``.
+
+    ``machine_busy`` — the machine's already-booked (start, end) intervals. Work is
+    laid only in the holes between them, so an operation can be placed in a gap an
+    earlier decision left behind. Without it the caller can only track one
+    watermark per machine, and every gap is unreachable forever (live book: 1,530
+    working hours of gaps between operations, 219 of them with a free operator and
+    ready work).
 
     Walks the machine's working windows, splitting the work into per-window segments,
     and staffs each shift with a stable operator (reusing the shift's operator if one
@@ -489,10 +511,36 @@ def _lay_on_machine(
             break
 
         seg_start = max(cursor, win.start)
-        avail = (win.end - seg_start).total_seconds() / 60.0
-        if avail <= 0:
+        # Skip over anything already booked on this machine, and never run past
+        # the next booking.
+        win_end = win.end
+        for bs, be in (machine_busy or ()):
+            if bs <= seg_start < be:
+                seg_start = be                      # inside a booking -> jump past it
+            if seg_start < bs < win_end:
+                win_end = bs                        # stop before the next booking
+        if seg_start >= win.end:
             cursor = win.end
             continue
+        avail = (win_end - seg_start).total_seconds() / 60.0
+        if avail <= 0:
+            cursor = max(seg_start, win.end)
+            continue
+
+        # Don't BEGIN an operation in a window too small to start it properly.
+        # A machining op needs its setup to fit: the machine is reserved from the
+        # first segment to the last (machine_free is one watermark per machine, so
+        # a hole cannot even be represented), and a token start therefore blocks it
+        # across every gap that follows. Live case: an op began at 18:48, managed
+        # 12 minutes of a 90-minute setup, and held CNC7 for 88 hours to do 13.5
+        # hours of work. Continuing an already-started op is untouched — a shift
+        # handover costs nothing and must stay free.
+        if first_start is None:
+            need = config.setup_min if op.kind == OperationKind.MACHINING else 0.0
+            need = min(max(need, 0.0), remaining)
+            if avail + _EPS_MIN < need:
+                cursor = win.end
+                continue
 
         take = min(avail, remaining)
         seg_end = seg_start + timedelta(minutes=take)
@@ -524,7 +572,7 @@ def _lay_on_machine(
 
 
 def _lay_frozen(machine, earliest, dur_min, order, op, op_qty, planned_operator,
-                staffing, masters, config):
+                staffing, masters, config, machine_busy=None):
     """Lay a frozen (in-progress) op onto its PINNED machine from ``earliest``.
     Prefer the planned operator each shift; if they are absent/busy, staff a
     substitute (candidate_operator). Same window-walking as _lay_on_machine, but the
@@ -545,9 +593,20 @@ def _lay_frozen(machine, earliest, dur_min, order, op, op_qty, planned_operator,
         if remaining <= _EPS_MIN:
             break
         seg_start = max(cursor, win.start)
-        avail = (win.end - seg_start).total_seconds() / 60.0
-        if avail <= 0:
+        # Skip over anything already booked on this machine, and never run past
+        # the next booking.
+        win_end = win.end
+        for bs, be in (machine_busy or ()):
+            if bs <= seg_start < be:
+                seg_start = be                      # inside a booking -> jump past it
+            if seg_start < bs < win_end:
+                win_end = bs                        # stop before the next booking
+        if seg_start >= win.end:
             cursor = win.end
+            continue
+        avail = (win_end - seg_start).total_seconds() / 60.0
+        if avail <= 0:
+            cursor = max(seg_start, win.end)
             continue
         take = min(avail, remaining)
         seg_end = seg_start + timedelta(minutes=take)
