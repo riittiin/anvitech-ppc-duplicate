@@ -1601,10 +1601,16 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
             # and the whole cloud contest would error out, never running in flow mode.
             _cands = optimize_service.cloud_candidates(setup.search_config)
             _bpc = optimize_service.cloud_budget(setup.search_config)
+            # Extra RNG seeds to multi-start the search from. Empty (the default)
+            # = one seed = the contest exactly as it ran before. The search is an
+            # iterated local search, so its answer depends on the random stream:
+            # at a fixed overlap on the live book, three seeds spread 24 late-days.
+            _seeds = optimize_service.cloud_seeds()
             payload = optimize_service.build_payload(
                 orders, actuals, book_store.load_masters_bytes(), config,
                 seed=_OPT_SEED, candidates=_cands, budget_per_candidate=_bpc,
-                absences=absences, operator_table=operator_table, frozen=frozen)
+                absences=absences, operator_table=operator_table, frozen=frozen,
+                seeds=_seeds)
             # Use contest_jobs (not sweep_contenders) for the true candidate
             # count: under the new engine the contest also sweeps the
             # machine-set dimension (Allotted-only vs Allotted+Suggested), so

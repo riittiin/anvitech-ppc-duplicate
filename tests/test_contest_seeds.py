@@ -240,3 +240,30 @@ class TestCloudSeedsKnob:
         monkeypatch.setattr(osvc, "CLOUD_EXTRA_SEEDS", (7,))
         monkeypatch.setenv("OPTIMIZE_CLOUD_SEEDS", "abc")
         assert osvc.cloud_seeds() == [7]
+
+
+# --------------------------------------------------------------------------- #
+# The API actually passes the knob through
+# --------------------------------------------------------------------------- #
+
+class TestApiWiring:
+    """A knob nothing reads is worse than no knob — it looks configured and
+    does nothing (the exact shape of the balance_operator_load and
+    split_parallel findings on this project)."""
+
+    def test_start_optimize_passes_cloud_seeds_into_the_payload(self, monkeypatch):
+        import inspect
+        pytest.importorskip("fastapi")
+        from api import main
+        src = inspect.getsource(main._start_optimize)
+        assert "optimize_service.cloud_seeds()" in src
+        assert "seeds=_seeds" in src
+
+    def test_the_progress_denominator_counts_seed_jobs(self):
+        """denom = budget x len(contest_jobs), so it scales with seeds on its own —
+        pinned so a future refactor back to sweep_contenders is caught."""
+        import inspect
+        pytest.importorskip("fastapi")
+        from api import main
+        src = inspect.getsource(main._start_optimize)
+        assert "len(optimize_service.contest_jobs(payload))" in src
