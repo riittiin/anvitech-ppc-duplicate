@@ -92,7 +92,7 @@ class Plan:
 
 class _JobState:
     __slots__ = ("job", "idx", "ready", "prev_end", "worked", "on_machine",
-                 "released_at")
+                 "released_at", "pinned", "pin_rank")
 
     def __init__(self, job, plan_start):
         self.job = job
@@ -102,11 +102,14 @@ class _JobState:
         self.worked = 0.0              # worked minutes on the op in progress
         self.on_machine = None         # machine that has CLAIMED the current op
         self.released_at = None        # overlap release moment for the NEXT op
+        self.pinned = {}               # op_seq -> machine the part is PHYSICALLY on
+        self.pin_rank = {}             # op_seq -> previous-plan resume order
 
 
 class _MachineState:
     __slots__ = ("job_key", "op_seq", "remaining", "last_key", "segments",
-                 "started", "pace_floor", "busy_until", "setup_charged")
+                 "started", "pace_floor", "busy_until", "setup_charged",
+                 "pinned_jobs")
 
     def __init__(self):
         self.job_key = None
@@ -118,6 +121,7 @@ class _MachineState:
         self.pace_floor = None         # this op may not END before its predecessor
         self.busy_until = None         # occupied to here, ACROSS shift boundaries
         self.setup_charged = 0.0       # setup ACTUALLY in the segments (0 if skipped)
+        self.pinned_jobs = []          # (rank, seq pos, job key) frozen HERE
 
 
 # --------------------------------------------------------------------------- #
@@ -139,7 +143,7 @@ def schedule(jobs, sequence, shop, config, *, overlap=1.0, crew_rank=None,
 
     placements: list = []
     completion: dict = {}
-    _apply_frozen(frozen, state, machines, by_key)
+    _apply_frozen(frozen, state, machines)
 
     stalled = 0
     for window in iter_shifts(plan_start, shop.calendar, config):
@@ -242,6 +246,26 @@ def _work_min(job, op, setup_min: float) -> float:
         return 0.0
     setup = setup_min if op.kind == MACHINING else 0.0
     return setup + qty * float(op.cycle_min or 0.0)
+
+
+def _setup_min_for(js, op, setup_min: float) -> float:
+    """The nominal setup this step would pay, before the machine's own
+    already-set-up check. Zero for a FROZEN step: the part is in the chuck and the
+    fixture is on — a resumed operation is not set up a second time."""
+    if op.seq in js.pinned:
+        return 0.0
+    return setup_min if op.kind == MACHINING else 0.0
+
+
+def _setup_for(js, op, ms, setup_min: float) -> float:
+    """The setup this operation actually pays on this machine: none when it is
+    resumed (frozen), none when the machine is already set up for the same
+    (item, process), the nominal figure otherwise."""
+    if op.seq in js.pinned:
+        return 0.0
+    if op.kind != MACHINING or ms.last_key == (js.job.item_code, op.seq):
+        return 0.0
+    return setup_min
 
 
 # --------------------------------------------------------------------------- #
@@ -399,7 +423,7 @@ def _run_shift(window, cursor, order, state, machines, shop, crew_rank, overlap,
                 continue
             if machines[mid].job_key is not None:
                 start = now                      # the part is already in the chuck
-            elif _next_job(mid, order, state, now) is not None:
+            elif _next_job(mid, machines[mid], order, state, now) is not None:
                 start = now
             else:
                 # Nothing startable yet — but work released later in THIS shift is
@@ -450,18 +474,28 @@ def _shift_demand(order, state, machines, window, overlap, setup_min):
         idx, at, worked = js.idx, js.ready, js.worked
         while idx < len(ops) and at < window.end:
             op = ops[idx]
-            span = _work_min(js.job, op, setup_min)
+            # A frozen step pays no setup, so counting one would over-state its
+            # demand and its release moment alike.
+            eff_setup = _setup_min_for(js, op, setup_min)
+            span = _work_min(js.job, op, eff_setup)
             left = max(0.0, span - worked)
             if op.machine_options and left > _EPS:
-                # A claimed step can only run where it already is.
-                targets = ((js.on_machine,) if idx == js.idx and js.on_machine
-                           else op.machine_options)
+                # A claimed step can only run where it already is — and so can a
+                # frozen one, whose part is physically on its pinned machine.
+                # Reporting its minutes against every alternative would man a
+                # machine that can never touch it.
+                if idx == js.idx and js.on_machine:
+                    targets = (js.on_machine,)
+                elif op.seq in js.pinned:
+                    targets = (js.pinned[op.seq],)
+                else:
+                    targets = op.machine_options
                 for mid in targets:
                     demand[mid] = demand.get(mid, 0.0) + left
             if idx + 1 >= len(ops):
                 break
             if rel.overlaps(op, ops[idx + 1]):
-                need = rel.work_min_before_release(js.job, op, overlap, setup_min)
+                need = rel.work_min_before_release(js.job, op, overlap, eff_setup)
             else:
                 need = span
             at = max(at, window.start) + timedelta(minutes=max(0.0, need - worked))
@@ -501,12 +535,11 @@ def _bench_run_minutes(mid, ms, order, state, window, start, setup_min):
     if ms.job_key is not None:
         remaining = ms.remaining                  # part already on the bench
     else:
-        picked = _next_job(mid, order, state, start)
+        picked = _next_job(mid, ms, order, state, start)
         if picked is None:
             return None
         js, op = picked
-        setup = (setup_min if op.kind == MACHINING
-                 and ms.last_key != (js.job.item_code, op.seq) else 0.0)
+        setup = _setup_for(js, op, ms, setup_min)
         remaining = setup + js.job.qty_for(op.seq) * float(op.cycle_min or 0.0)
     return min(max(remaining, 0.0),
                (window.end - start).total_seconds() / 60.0)
@@ -554,14 +587,37 @@ def _bench_operator(mid, ms, order, state, window, start, setup_min, pool,
     return None, (retry_at if retry_at is not None else window.end)
 
 
-def _next_job(mid, order, state, now):
-    """The next job this machine should start: the caller's sequence order.
+def _next_job(mid, ms, order, state, now):
+    """The next job this machine should start: a part it is already physically
+    holding first, then the caller's sequence order.
 
     Only jobs that are ready NOW and that no other machine has claimed. The claim
     is what stops two alternative machines from both building the same batch —
     ``_next_job`` sees only job state, so without it a step listing "CNC3/CNC7"
     is run twice, once on each.
+
+    A FROZEN step may run only on the machine it is pinned to, and the frozen
+    steps this machine is holding go first, in previous-plan start order: the shop
+    cannot start a new part in a chuck that already holds a half-finished one
+    (``ms.pinned_jobs``, built once by ``_apply_frozen`` and already in that
+    order). That is a preference among things that are all READY — the routing
+    gate is the same one every other step passes, so a frozen step still never
+    runs before the step that feeds it (2026-08-09).
+
+    ``ms.pinned_jobs`` is empty on an ordinary plan, so the frozen pass costs
+    nothing and the sequence scan still returns on its first hit; walking the
+    whole order to look for pins instead cost ~18% of a plan (68-job book).
     """
+    for _rank, _pos, key in ms.pinned_jobs:
+        js = state[key]
+        if js.on_machine is not None:
+            continue
+        op = _current_op(js)
+        if op is None or js.pinned.get(op.seq) != mid:
+            continue
+        if js.ready > now or js.job.qty_for(op.seq) <= 0:
+            continue
+        return js, op
     for key in order:
         js = state[key]
         if js.on_machine is not None:
@@ -569,6 +625,8 @@ def _next_job(mid, order, state, now):
         op = _current_op(js)
         if op is None or mid not in op.machine_options:
             continue
+        if js.pinned and js.pinned.get(op.seq, mid) != mid:
+            continue                      # frozen elsewhere; not this machine's
         if js.ready > now or js.job.qty_for(op.seq) <= 0:
             continue
         return js, op
@@ -586,6 +644,8 @@ def _earliest_ready(mid, order, state, after, before):
         op = _current_op(js)
         if op is None or mid not in op.machine_options:
             continue
+        if js.pinned and js.pinned.get(op.seq, mid) != mid:
+            continue                      # this machine can never take that part
         if js.job.qty_for(op.seq) <= 0:
             continue
         if js.ready <= after or js.ready >= before:
@@ -605,14 +665,14 @@ def _work(mid, ms, order, state, window, start, operator, overlap, setup_min,
     shift.
     """
     if ms.job_key is None:
-        picked = _next_job(mid, order, state, start)
+        picked = _next_job(mid, ms, order, state, start)
         if picked is None:
             return window.end                     # nothing to do; park it
         js, op = picked
-        # Setup is charged once per OPERATION (not per shift), and not at all when
-        # the same (item, process) is already set up on this machine.
-        setup = (setup_min if op.kind == MACHINING
-                 and ms.last_key != (js.job.item_code, op.seq) else 0.0)
+        # Setup is charged once per OPERATION (not per shift), not at all when the
+        # same (item, process) is already set up on this machine, and not at all
+        # when the operation is RESUMED — a frozen part is already in the chuck.
+        setup = _setup_for(js, op, ms, setup_min)
         ms.job_key, ms.op_seq = js.job.key, op.seq
         ms.remaining = setup + js.job.qty_for(op.seq) * float(op.cycle_min or 0.0)
         ms.setup_charged = setup
@@ -698,10 +758,92 @@ def _pace(placements, completion) -> list:
     return out
 
 
-def _apply_frozen(frozen, state, machines, by_key):
-    """Pin in-progress operations to the machine they are physically on.
+def _field(row, *names):
+    """One value out of a frozen row, whatever it is spelled and whatever type it
+    is. ``engine.freeze.compute_frozen_set`` emits ``machine`` and an ISO STRING
+    ``prev_start``; the app's adapter renames some of that to ``machine_id`` /
+    ``order_key``. A pin that silently does nothing because of a key name is the
+    worst failure available here — the plan looks fine and the part is on the
+    wrong machine — so both spellings are read, and a row is only ever ignored on
+    its merits."""
+    for name in names:
+        value = (row.get(name) if hasattr(row, "get")
+                 else getattr(row, name, None))
+        if value is not None and value != "":
+            return value
+    return None
 
-    Implemented in Task 6. Until then this is a documented no-op, so ``frozen=None``,
-    ``frozen=[]`` and no argument at all are identical.
+
+def _prev_start_key(row):
+    """A sortable, type-stable previous-plan start. Datetimes and ISO strings both
+    normalise to an ISO string, which sorts chronologically; a missing one sorts
+    last rather than blowing up a comparison."""
+    value = _field(row, "prev_start", "start")
+    if isinstance(value, datetime):
+        return (0, value.isoformat())
+    text = str(value).strip() if value is not None else ""
+    return (0, text) if text else (1, "")
+
+
+def _apply_frozen(frozen, state, machines):
+    """Pin every in-progress operation to the machine it is physically on.
+
+    A frozen row pins WHERE and WHEN, never HOW MUCH. ``remaining_qty`` is
+    deliberately NOT read: it is one SO LINE's remainder, while the operation it
+    pins belongs to the BATCH Rule 1 clubbed that line into. Taking it dropped 281
+    pieces of a clubbed order into no plan at all (live 2026-08-11). The quantity
+    comes from ``Job.qty_for`` — the same expression every other placement in this
+    module uses — because the pin never touches quantity at all.
+
+    Rows are collapsed to ONE pin per (job, op): several clubbed lines can each be
+    in progress on the same step, and an operation runs once, on one machine. The
+    surviving row is the earliest-started one, with the machine and operator names
+    breaking a tie, so the answer cannot depend on the order rows arrive in.
+
+    A pin the CURRENT routing cannot honour — an unknown job or step, a machine
+    that has left the master, or a step whose routing no longer lists that machine
+    — is dropped, and that step falls through to normal scheduling. This mirrors
+    ``engine.freeze``, which does not freeze a step it cannot resolve; the
+    alternative is a machine list of exactly one impossible machine, which takes
+    the whole book out of the plan at the horizon.
+
+    ``operator`` is read only to break ties. Who runs the machine is decided by
+    the roster, which qualifies people from Settings alone: the work is physically
+    on that machine, but the PERSON is re-staffed (live 2026-08-03 — removing a
+    machine from someone with work in progress froze them straight back onto it).
     """
-    return
+    pins: dict = {}
+    for row in frozen or ():
+        key = _field(row, "order_key", "job_key", "batch_id")
+        seq = _field(row, "op_seq", "process_seq")
+        mid = _field(row, "machine_id", "machine")
+        if key is None or seq is None or mid is None:
+            continue
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError):
+            continue
+        key, mid = str(key), str(mid)
+        js = state.get(key)
+        if js is None or mid not in machines:
+            continue
+        op = next((o for o in js.job.ops if o.seq == seq), None)
+        if op is None or mid not in op.machine_options:
+            continue
+        rank = (_prev_start_key(row), mid,
+                str(_field(row, "operator") or ""))
+        current = pins.get((key, seq))
+        if current is None or rank < current[0]:
+            pins[(key, seq)] = (rank, mid)
+
+    # ``state`` is built in the caller's sequence order, so a job's position in it
+    # IS its priority — the tie-break when two parts were started at the same
+    # moment in the previous plan.
+    position = {key: pos for pos, key in enumerate(state)}
+    for (key, seq), (rank, mid) in sorted(pins.items()):
+        js = state[key]
+        js.pinned[seq] = mid
+        js.pin_rank[seq] = rank
+        machines[mid].pinned_jobs.append((rank, position[key], key))
+    for ms in machines.values():
+        ms.pinned_jobs.sort()
