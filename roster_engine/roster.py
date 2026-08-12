@@ -30,6 +30,12 @@ CARRY_BONUS = 1_000_000.0
 # CARRY_BONUS regardless, so it can never be mistaken for a carry-over.
 LOOKAHEAD_UNIT = 45.0
 
+# Sentinel default for a machine `crew_rank` says nothing about: sorts it after
+# every real rank, whatever the real ranks happen to be (they need not be a
+# dense 0..n-1 range). Used ONLY to order `machines`; the bias term below never
+# touches `crew_rank` directly (see the comment there for why).
+UNRANKED = float("inf")
+
 
 def eligible(operator, machine_id: str, window, shop) -> bool:
     """May this person man this machine in this shift?
@@ -39,12 +45,15 @@ def eligible(operator, machine_id: str, window, shop) -> bool:
     fossil, and gating on it silently discarded the admin's assignment (live
     2026-08-07 — Sandeep Kumar was given CNC4, dropped from its pool for being a
     workbook "helper", and CNC4 sat idle with work waiting).
+
+    Does NOT check the working-day calendar — that is machine- and
+    operator-independent, so `roster_for_shift` checks it exactly once, up
+    front, rather than re-deriving the same answer here for every operator x
+    machine pair.
     """
     if machine_id not in (getattr(operator, "machines", None) or ()):
         return False
     if operator_shift(operator) != window.shift:
-        return False
-    if not shop.calendar.is_working_day(window.day):
         return False
     for start, end in shop.absent.get(operator.name, ()):
         if start < window.end and window.start < end:
@@ -68,10 +77,16 @@ def roster_for_shift(window, shop, demand: dict, in_progress: dict,
         {machine_id: operator_name}. A machine absent from the result is dark this
         shift, which is a true constraint, not a failure.
     """
+    # Machine- and operator-independent, so it is one guard here rather than a
+    # per-pair re-check inside `eligible` (n_operators x n_machines redundant
+    # evaluations of the same answer).
+    if not shop.calendar.is_working_day(window.day):
+        return {}
+
     machines = sorted(
         (mid for mid in shop.machining_ids
          if machine_runs_shift(shop.machines[mid], window.shift)),
-        key=lambda mid: (crew_rank.get(mid, len(shop.machines)), mid))
+        key=lambda mid: (crew_rank.get(mid, UNRANKED), mid))
     operators = sorted(shop.operators, key=lambda o: o.name)
     if not machines or not operators:
         return {}
@@ -88,7 +103,18 @@ def roster_for_shift(window, shop, demand: dict, in_progress: dict,
             value = min(window.minutes, pending)
             if mid in in_progress:
                 value += CARRY_BONUS
-            value += LOOKAHEAD_UNIT * (n_ranks - crew_rank.get(mid, n_ranks))
+            # `c` is this machine's column index AFTER sorting by crew_rank, so
+            # it is monotone in rank and, unlike a raw rank, always lands in
+            # [0, n_ranks - 1] no matter how sparse or out-of-range the caller's
+            # ranks are (a persisted crew genome from a bigger/different machine
+            # set, or a shift that runs only some machines). n_ranks - c is
+            # therefore always in [1, n_ranks] — strictly positive — so this
+            # bias can never zero out or invert a genuine >0 pairing. The raw
+            # rank could: `crew_rank.get(mid, n_ranks)` can exceed n_ranks,
+            # making the old `n_ranks - crew_rank...` term go negative and
+            # outweigh real pending work, dropping the pairing from the match
+            # entirely (2026-08-12 review finding).
+            value += LOOKAHEAD_UNIT * (n_ranks - c)
             values[(r, c)] = value
 
     matched = max_weight_matching(values, len(operators), len(machines))
