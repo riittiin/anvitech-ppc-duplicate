@@ -538,6 +538,31 @@ def _report_for_book(masters, so_lines, absences=None, config=None, schedule=Non
                 rows.extend(_ne3.batch_quantity_violations(schedule, batches))
             except Exception:  # noqa: BLE001 — a self-check must never break the report
                 pass
+        # The roster engine's four guarantees, checked on every plan it builds:
+        # one operator per machine per shift, an operation never interrupted,
+        # no machine dark while a qualified operator is unassigned, and no
+        # successor released on a fraction of a piece.
+        #
+        # GATED TO THE ROSTER ENGINE ON PURPOSE. The live engine genuinely
+        # breaks the first two on every plan — hundreds of rows — and this
+        # banner is the one the directors read on a site that has not switched
+        # engines yet. Flooding it would break the rebuild's own rule that
+        # nothing changes until DEFAULT_SCHEDULER=roster. The cross-engine
+        # comparison is measured in the A/B harness, which calls
+        # roster_engine.report directly on BOTH engines' output — that is where
+        # the numbers belong, and where they are reported from.
+        if str(getattr(config if config is not None else _load_plan_config(),
+                       "scheduler", "") or "") == "roster":
+            try:
+                from roster_engine import report as _rr
+                rows.extend(_rr.all_violations(
+                    schedule, masters,
+                    config if config is not None else _load_plan_config(),
+                    absent=optimize_service.absence_reservations(
+                        absences if absences is not None
+                        else book_store.load_absences())))
+            except Exception:  # noqa: BLE001 — a self-check must never break the report
+                pass
     return to_table([
         {"Kind": r["kind"], "Reference": r["ref"], "Message": r["message"]}
         for r in rows
