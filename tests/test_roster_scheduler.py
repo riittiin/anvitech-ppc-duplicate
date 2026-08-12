@@ -263,17 +263,30 @@ def test_the_plan_is_deterministic_across_hash_seeds():
 def test_two_machines_never_run_the_same_operation():
     """The brief's `_next_job` filters on ready/qty/machine options only — nothing
     records that a machine has ALREADY claimed that job's current operation, so
-    two alternative machines both pick it up in the same shift and the batch is
-    built twice (the operation is also `_advance`d twice). Every job here can run
-    on either CNC, and there are more machines than jobs."""
+    two alternative machines both pick it up and the batch is built twice.
+
+    The fixture has to be an operation that does NOT finish inside one window.
+    The earlier two-short-jobs version of this test was VACUOUS (2026-08-12
+    review): both jobs completed inside a single `_work` call, so the job was
+    already advanced past that operation before a second machine ever looked at
+    it, and the test passed with the claim guard deleted. Here 100 pieces x 10
+    min + 90 setup = 1090 minutes against a 660-minute shift, so CNC1 is still
+    holding the part when CNC4 asks for work in the same shift. Without the claim
+    CNC4 takes it too, both machines run it to the end, and the second one to
+    finish walks off the end of the routing — `IndexError: tuple index out of
+    range` in `_work`.
+    """
     masters = _masters(
         [Process(1, "CNC FIRST SIDE", 10.0, None, None, "CNC1/CNC4")],
-        [Operator("Narayan", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift"),
-         Operator("Sidhu", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift")])
-    plan = _run(masters, [_B("B1", "ITEM", 20), _B("B2", "ITEM", 20)])
-    keys = sorted((p.job_key, p.op_seq) for p in plan.placements)
-    assert keys == [("B1", 1), ("B2", 1)]
-    assert len({p.machine for p in plan.placements}) == 2   # genuinely both used
+        [Operator("Narayan", "CNC1", ["CNC1"], "First shift"),
+         Operator("Sidhu", "CNC4", ["CNC4"], "First shift")])
+    plan = _run(masters, [_B("B1", "ITEM", 100)])
+    assert [(p.job_key, p.op_seq, p.machine) for p in plan.placements] == [
+        ("B1", 1, "CNC1")]
+    placed = plan.placements[0]
+    assert placed.work_min == 90.0 + 1000.0
+    # Genuinely spans the window end — that is what makes the guard load-bearing.
+    assert placed.end.date() > placed.start.date()
 
 
 def test_release_is_measured_in_worked_minutes_not_wall_clock():
@@ -294,6 +307,45 @@ def test_release_is_measured_in_worked_minutes_not_wall_clock():
     assert first.work_min == 90.0 + 1000.0
     assert second.start == datetime(2026, 8, 14, 11, 50)
     assert second.end >= first.end
+
+
+def test_overlap_still_happens_when_the_setup_was_skipped():
+    """`release.work_min_before_release` charges a MACHINING step the NOMINAL
+    setup unconditionally, but `_release_moment` walks the operation's real
+    segments — which contain no setup when the machine was already set up for
+    this (item, process). `need` then exceeds every minute the machine worked,
+    the walk clamps to the last segment's end, and `released_at == end`: overlap
+    silently switches itself off, fully sequential, at every setting.
+
+    This fires on exactly the repeat-item case the setup-skip exists for, so it
+    is systematic. Here B1 charges its setup and overlaps correctly at 10:50;
+    B2 runs the same (item, process) straight after with NO setup, so its 8th of
+    10 pieces is cut 80 worked minutes in — 12:30, not 12:50.
+    """
+    machines = {
+        "CNC1": Machine("CNC1", "CNC 1", "CNC lathe", available_hrs_per_day=19.5),
+        "CNC4": Machine("CNC4", "CNC 4", "CNC lathe", available_hrs_per_day=19.5),
+        "CNC5": Machine("CNC5", "CNC 5", "CNC lathe", available_hrs_per_day=19.5),
+    }
+    masters = _masters(
+        [Process(1, "CNC FIRST SIDE", 10.0, None, None, "CNC1"),
+         Process(2, "CNC SECOND SIDE", 10.0, None, None, "CNC4/CNC5")],
+        [Operator("Narayan", "CNC1", ["CNC1"], "First shift"),
+         Operator("Sidhu", "CNC4", ["CNC4"], "First shift"),
+         Operator("Ravi", "CNC5", ["CNC5"], "First shift")],
+        machines=machines)
+    plan = _run(masters, [_B("B1", "ITEM", 10), _B("B2", "ITEM", 10)],
+                overlap=0.8)
+    at = {(p.job_key, p.op_seq): p for p in plan.placements}
+    # B1 charges the setup: 90 + 8 x 10 = 170 worked minutes from 08:00.
+    assert at[("B1", 1)].work_min == 90.0 + 100.0
+    assert at[("B1", 2)].start == datetime(2026, 8, 12, 10, 50)
+    # B2 is the same fixture on the same machine — no second setup, so its
+    # release is 8 x 10 = 80 worked minutes from 11:10.
+    assert at[("B2", 1)].work_min == 100.0
+    assert at[("B2", 1)].start == datetime(2026, 8, 12, 11, 10)
+    assert at[("B2", 2)].start == datetime(2026, 8, 12, 12, 30)
+    assert at[("B2", 2)].start < at[("B2", 1)].end        # genuinely overlapped
 
 
 def test_a_downstream_machine_is_manned_for_work_released_mid_shift():
@@ -469,6 +521,58 @@ def _bench_masters(operators):
                            [Process(1, "DEBURING", 2.0, None, None, "MD2")]),
         },
         operators=operators, calendar=WorkCalendar())
+
+
+def _assert_no_operator_double_booking(plan):
+    """Nobody is in two places at the same moment. Reads the published segments,
+    which are the operator record."""
+    by_operator: dict = {}
+    for p in plan.placements:
+        for start, end, who in p.segments:
+            by_operator.setdefault(who, []).append((start, end, p.machine))
+    for who, spans in sorted(by_operator.items()):
+        spans.sort()
+        for earlier, later in zip(spans, spans[1:]):
+            assert earlier[1] <= later[0], (
+                f"{who} is on {earlier[2]} and {later[2]} at the same moment "
+                f"({earlier[0]}-{earlier[1]} vs {later[0]}-{later[1]})")
+
+
+def test_a_helper_is_never_on_two_benches_at_the_same_instant():
+    """The brief's station rule was "any floating qualified person mans this
+    station", which hands the SAME person to every bench they are qualified for —
+    49 same-instant double-bookings on a 50-job book. Both benches here have work
+    ready at 08:00 and exactly one helper is on shift, so the sketch runs both at
+    once with Anturam's name on both bars."""
+    masters = _bench_masters(
+        [Operator("Anturam", "MD1/MD2", ["MD1", "MD2"], "First shift")])
+    plan = _run(masters, [_B("B1", "ONE", 30), _B("B2", "TWO", 30)])
+    _assert_no_operator_double_booking(plan)
+
+
+def test_one_helper_serves_two_benches_at_different_times_in_one_shift():
+    """The other half, and the one that stops the fix regressing into a
+    shift-long lock. The brief's prose is "on that shift, present, and not
+    already occupied AT THAT MOMENT" — interval exclusion. Locking the helper to
+    one bench for the whole shift also removes the double-booking, but it deletes
+    capacity the shop really has: measured on helper-scarce books it cost +52%
+    late-days (41 vs 27 on 50 jobs / 6 stations / 2 helpers) and left one helper
+    idle 600 of 660 minutes.
+
+    One helper, an hour of work on each of two benches. He does MD1 08:00-09:00,
+    walks over, and does MD2 09:00-10:00 — same shift, never both at once.
+    """
+    masters = _bench_masters(
+        [Operator("Anturam", "MD1/MD2", ["MD1", "MD2"], "First shift")])
+    plan = _run(masters, [_B("B1", "ONE", 30), _B("B2", "TWO", 30)])
+    by_machine = {p.machine: p for p in plan.placements}
+    assert sorted(by_machine) == ["MD1", "MD2"]
+    assert (by_machine["MD1"].start, by_machine["MD1"].end) == (
+        datetime(2026, 8, 12, 8, 0), datetime(2026, 8, 12, 9, 0))
+    assert (by_machine["MD2"].start, by_machine["MD2"].end) == (
+        datetime(2026, 8, 12, 9, 0), datetime(2026, 8, 12, 10, 0))
+    assert {s[2] for p in plan.placements for s in p.segments} == {"Anturam"}
+    _assert_no_operator_double_booking(plan)
 
 
 def test_a_bench_with_a_part_on_it_keeps_its_helper():

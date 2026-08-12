@@ -13,12 +13,20 @@ per shift, and answered exactly.
 
 Two shop rules are STRUCTURAL here, not checked afterwards:
 
-  * one operator mans one machine for a whole shift — the roster is computed once
-    per window and an operator appears in exactly one machine's roster, so a
-    hopping schedule cannot be expressed;
+  * one operator mans one CNC/VMC for a whole shift — the roster is computed once
+    per window and an operator appears in exactly one machining machine's roster,
+    so a hopping schedule cannot be expressed there. Manual and inspection
+    stations are staffed by INTERVAL EXCLUSION instead: a helper physically walks
+    between deburring and packing, so they may serve several benches in a shift,
+    but never two at the same instant (``_bench_operator``). Locking a helper to
+    one bench for the whole shift would also remove the double-booking, and it
+    deletes capacity the shop really has — measured at +52% late-days on books
+    where helpers are scarcer than benches;
   * an operation runs to completion on its machine — a machine holds ONE job from
     the moment it claims it until the moment it finishes, across shift boundaries
     and dark shifts alike, so there is no hole another job could be dropped into.
+    A helper who starts a bench is booked for the whole projected run, so the
+    person cannot walk away mid-operation either.
 
 Within a shift the manned machines are advanced by an event loop rather than one
 at a time to the end of the window: at each step the machine that can act EARLIEST
@@ -39,7 +47,6 @@ from datetime import datetime, time, timedelta
 
 from roster_engine import release as rel
 from roster_engine import roster as crew
-from roster_engine.assign import max_weight_matching
 from roster_engine.domain import DISPATCH, MACHINING, OUTSOURCED
 from roster_engine.worktime import iter_shifts, machine_runs_shift, operator_shift
 
@@ -99,7 +106,7 @@ class _JobState:
 
 class _MachineState:
     __slots__ = ("job_key", "op_seq", "remaining", "last_key", "segments",
-                 "started", "pace_floor", "busy_until")
+                 "started", "pace_floor", "busy_until", "setup_charged")
 
     def __init__(self):
         self.job_key = None
@@ -110,6 +117,7 @@ class _MachineState:
         self.started = None
         self.pace_floor = None         # this op may not END before its predecessor
         self.busy_until = None         # occupied to here, ACROSS shift boundaries
+        self.setup_charged = 0.0       # setup ACTUALLY in the segments (0 if skipped)
 
 
 # --------------------------------------------------------------------------- #
@@ -309,15 +317,24 @@ def _advance(js, end_at, completion):
     js.released_at = None
 
 
-def _release_successor(js, op, segments, overlap, setup_min):
-    """Open the next operation once whole pieces have cleared this one."""
+def _release_successor(js, op, segments, overlap, setup_charged):
+    """Open the next operation once whole pieces have cleared this one.
+
+    ``setup_charged`` is the setup this machine ACTUALLY put in the segments, not
+    the nominal ``config.setup_time_min``: a repeat of the same (item, process) is
+    already set up and pays none. Passing the nominal figure here made ``need``
+    exceed every minute the machine worked, so ``_release_moment`` clamped to the
+    last segment's end and ``released_at == end`` — overlap silently switched
+    itself OFF, at every setting, on exactly the repeat-item case the setup-skip
+    exists for (2026-08-12 review, finding 2).
+    """
     js.released_at = None
     if js.idx + 1 >= len(js.job.ops):
         return
     nxt = js.job.ops[js.idx + 1]
     if not rel.overlaps(op, nxt):
         return
-    need = rel.work_min_before_release(js.job, op, overlap, setup_min)
+    need = rel.work_min_before_release(js.job, op, overlap, setup_charged)
     js.released_at = _release_moment(segments, need)
 
 
@@ -348,26 +365,35 @@ def _run_shift(window, cursor, order, state, machines, shop, crew_rank, overlap,
                                         setup_min)
     rostered = crew.roster_for_shift(window, shop, demand, in_progress, crew_rank)
     floating = _floating_operators(shop, window, set(rostered.values()))
-    stationed = _station_operators(shop, window, demand, in_progress, floating)
 
+    # A CNC/VMC has ONE person for the whole shift; a bench has a POOL, and who
+    # of them is on it is decided per operation, at the moment it starts.
+    benches: dict = {}
+    booked = {o.name: [] for o in floating}
     manned = {}
     for mid in sorted(shop.machines):
         if not machine_runs_shift(shop.machines[mid], window.shift):
             continue
-        who = (rostered if mid in shop.machining_ids else stationed).get(mid)
-        if who is not None:
-            manned[mid] = who
-    if not manned:
+        if mid in shop.machining_ids:
+            who = rostered.get(mid)
+            if who is not None:
+                manned[mid] = who
+            continue
+        pool = tuple(o.name for o in floating
+                     if mid in (getattr(o, "machines", None) or ()))
+        if pool:
+            benches[mid] = pool
+    if not manned and not benches:
         return                      # every machine dark; anything in a chuck HOLDS
 
     free_at = {}
-    for mid in manned:
+    for mid in list(manned) + list(benches):
         busy = machines[mid].busy_until
         free_at[mid] = max(cursor, busy) if busy else cursor
 
     while True:
         best = None
-        for mid in sorted(manned):
+        for mid in sorted(free_at):
             now = free_at[mid]
             if now >= window.end - _SECOND:
                 continue
@@ -386,9 +412,20 @@ def _run_shift(window, cursor, order, state, machines, shop, crew_rank, overlap,
         if best is None:
             return
         start, mid = best
+        if mid in benches:
+            who, retry_at = _bench_operator(mid, machines[mid], order, state,
+                                            window, start, setup_min,
+                                            benches[mid], booked)
+            if who is None:
+                # Every qualified helper is on another bench across this run.
+                # The bench waits for one of them — it does not take half a
+                # person, and it does not go home for the shift.
+                free_at[mid] = min(retry_at, window.end)
+                continue
+        else:
+            who = manned[mid]
         free_at[mid] = _work(mid, machines[mid], order, state, window, start,
-                             manned[mid], overlap, setup_min, placements,
-                             completion)
+                             who, overlap, setup_min, placements, completion)
 
 
 def _shift_demand(order, state, machines, window, overlap, setup_min):
@@ -452,40 +489,69 @@ def _floating_operators(shop, window, rostered_names) -> list:
                         for s, e in shop.absent.get(o.name, ()))]
 
 
-def _station_operators(shop, window, demand, in_progress, floating) -> dict:
-    """Man the manual / inspection stations the CNC roster deliberately leaves out.
+def _bench_run_minutes(mid, ms, order, state, window, start, setup_min):
+    """How long this bench would hold a person from ``start``, or None if it has
+    nothing to run.
+
+    A pure peek: it mirrors exactly what ``_work`` is about to compute (the same
+    claim rule, the same setup-skip, the same clip at the window end) without
+    touching a thing. It has to be computed BEFORE the claim, because a bench with
+    no free helper must not claim the job at all.
+    """
+    if ms.job_key is not None:
+        remaining = ms.remaining                  # part already on the bench
+    else:
+        picked = _next_job(mid, order, state, start)
+        if picked is None:
+            return None
+        js, op = picked
+        setup = (setup_min if op.kind == MACHINING
+                 and ms.last_key != (js.job.item_code, op.seq) else 0.0)
+        remaining = setup + js.job.qty_for(op.seq) * float(op.cycle_min or 0.0)
+    return min(max(remaining, 0.0),
+               (window.end - start).total_seconds() / 60.0)
+
+
+def _bench_operator(mid, ms, order, state, window, start, setup_min, pool,
+                    booked):
+    """Staff a manual / inspection station, by INTERVAL EXCLUSION.
+
+    Returns ``(operator_name, None)`` and books them, or ``(None, retry_at)`` when
+    every qualified helper is occupied across the run.
 
     roster.py rosters only CNC/VMC, on the grounds that a helper physically walks
-    between deburring and packing. The brief took that to mean each station may
-    take "any floating qualified person", which hands the SAME person to every
-    bench they are qualified for — measured on a 60-job synthetic book that is 11
-    windows in which one helper is bolted to two benches at the same instant.
-    Walking between benches means being at one of them at a time, so a station
-    gets a person of its own for the shift, decided by the same exact assignment
-    the CNC roster uses (assign.max_weight_matching) with the same two rules: a
-    machine with no work is left dark, and a bench with a part on it keeps its
-    person (CARRY_BONUS) whatever else is waiting.
+    between deburring and packing — and the shop rule is exactly the brief's
+    prose: any qualified operator who is on that shift, present, and *not already
+    occupied at that moment*. The brief's sketch dropped the last clause and
+    handed the SAME person to every bench they are qualified for (49 same-instant
+    double-bookings on a 50-job book). Locking a helper to one bench for the shift
+    fixes that too, but it is a strictly stronger rule than the shop's and costs
+    real capacity: 3 benches / 1 helper / an hour each took 3 days with the helper
+    idle 600 of 660 minutes a shift, and 50 jobs / 6 stations / 2 helpers went to
+    41 late-days against 27 (2026-08-12 review, finding 1).
+
+    The person is booked for the WHOLE projected run, not per minute: an operation
+    is never interrupted, so a helper who starts a bench stays on it until the
+    operation finishes or the shift ends. Between operations they are free to
+    walk. Ties resolve by name (``pool`` is name-sorted), so the caller's operator
+    order cannot move a bench.
     """
-    machines = sorted(mid for mid in shop.machines
-                      if mid not in shop.machining_ids
-                      and machine_runs_shift(shop.machines[mid], window.shift))
-    if not machines or not floating:
-        return {}
-    values = {}
-    for r, operator in enumerate(floating):
-        qualified = getattr(operator, "machines", None) or ()
-        for c, mid in enumerate(machines):
-            if mid not in qualified:
-                continue
-            pending = float(demand.get(mid, 0.0))
-            if pending <= 0.0 and mid not in in_progress:
-                continue                      # never man a bench with no work
-            value = min(window.minutes, pending)
-            if mid in in_progress:
-                value += crew.CARRY_BONUS
-            values[(r, c)] = value
-    matched = max_weight_matching(values, len(floating), len(machines))
-    return {machines[c]: floating[r].name for r, c in matched.items()}
+    minutes = _bench_run_minutes(mid, ms, order, state, window, start, setup_min)
+    if minutes is None:
+        return None, window.end                   # nothing here to staff
+    finish = start + timedelta(minutes=minutes)
+    retry_at = None
+    for name in pool:
+        clash = None
+        for busy_start, busy_end in booked[name]:
+            if busy_start < finish and start < busy_end:
+                clash = busy_end if clash is None else max(clash, busy_end)
+        if clash is None:
+            booked[name].append((start, finish))
+            return name, None
+        if retry_at is None or clash < retry_at:
+            retry_at = clash
+    return None, (retry_at if retry_at is not None else window.end)
 
 
 def _next_job(mid, order, state, now):
@@ -549,6 +615,7 @@ def _work(mid, ms, order, state, window, start, operator, overlap, setup_min,
                  and ms.last_key != (js.job.item_code, op.seq) else 0.0)
         ms.job_key, ms.op_seq = js.job.key, op.seq
         ms.remaining = setup + js.job.qty_for(op.seq) * float(op.cycle_min or 0.0)
+        ms.setup_charged = setup
         ms.segments, ms.started = [], None
         # This step may not END before the steps feeding it did: it cannot finish
         # pieces its predecessor has not delivered. Captured at claim time, when
@@ -586,9 +653,9 @@ def _work(mid, ms, order, state, window, start, operator, overlap, setup_min,
                                 work, tuple(ms.segments)))
     ms.last_key = (js.job.item_code, op.seq)
     ms.busy_until = end
-    _release_successor(js, op, ms.segments, overlap, setup_min)
+    _release_successor(js, op, ms.segments, overlap, ms.setup_charged)
     ms.job_key = ms.op_seq = ms.pace_floor = None
-    ms.segments, ms.started = [], None
+    ms.segments, ms.started, ms.setup_charged = [], None, 0.0
     _advance(js, end, completion)
     placements.extend(_settle_milestones(state, window.end, completion))
     return end
