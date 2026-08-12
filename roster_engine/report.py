@@ -32,18 +32,33 @@ banner, because it teaches the directors to ignore the one row that is real.
     unless nothing can explain the delay;
   * a single-shift bench that is dark at night, or any machine on the weekly off.
 
+KNOWN LIMITATION — ``OVERLAP_FRACTIONAL_PIECE`` IS MOSTLY MUTED, AND A BARE 0
+ROWS MUST NOT BE READ AS "THIS ENGINE RELEASES ON WHOLE PIECES". Measured on
+plans built by the app's own pipeline, EVERY fractional detection was withheld,
+all by one clause: the successor's machine had freed within a minute of its
+start (``EXPLAIN_MACHINE_BUSY``). That is the normal case in any contended shop —
+a machine claims its next job the instant it frees — and the mute is logically
+right (a start pinned to the machine's free moment says nothing about the
+release), but it leaves the check with almost no measuring power on a busy book.
+Only the "before a single whole piece exists" branch fires unconditionally. Use
+``overlap_rounding_scan`` and publish ``detected / muted / reported``, never the
+bare row count.
+
 The shift clock is read from ``roster_engine.worktime`` — the one definition the
-scheduler itself plans by — never re-derived here. A reporting feature that
-modelled the shop differently from the engine that built the plan hid 9,470
-minutes of real planned work (2026-08-07).
+scheduler itself plans by — never re-derived here. It is reached through the
+MODULE (``worktime._shift_bounds``), not bound at import, so a test can move the
+clock and prove this file follows rather than keeping a copy that merely agrees
+today. A reporting feature that modelled the shop differently from the engine
+that built the plan hid 9,470 minutes of real planned work (2026-08-07).
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
 
+from roster_engine import worktime
 from roster_engine.domain import is_machining_machine
-from roster_engine.worktime import (FIRST, SECOND, _shift_bounds, iter_shifts,
+from roster_engine.worktime import (FIRST, SECOND, iter_shifts,
                                     machine_runs_shift, operator_shift)
 
 # A minute of float/clock slop is not a violation. Expressed in minutes and
@@ -61,6 +76,14 @@ _KIND_SPLIT = "OPERATOR_SPLIT_SHIFT"
 _KIND_SEGMENTED = "OPERATION_SEGMENTED"
 _KIND_IDLE = "IDLE_CAPACITY"
 _KIND_ROUNDING = "OVERLAP_FRACTIONAL_PIECE"
+
+# Why a fractional release was withheld. Reported as a count, not swallowed:
+# a check whose every detection is muted looks identical to a check that found
+# nothing, and the two mean opposite things.
+EXPLAIN_SHOP_OPENED = "shop had just opened"
+EXPLAIN_FEEDER_IDLE = "predecessor was not cutting then"
+EXPLAIN_MACHINE_BUSY = "successor machine just freed"
+EXPLAIN_OPERATOR_BUSY = "successor operator just freed"
 
 
 class _AlwaysOpen:
@@ -132,22 +155,28 @@ def shift_key(when, config):
     today = when.date()
     for day in (today, today - timedelta(days=1)):
         for shift in (FIRST, SECOND):
-            start, end = _shift_bounds(day, shift, config)
+            start, end = worktime._shift_bounds(day, shift, config)
             if start <= when < end:
                 return day, shift
     return None
 
 
 def _shift_keys(start, end, config) -> list:
-    """Every shift an interval touches. Keying on the START alone would put a
-    segment that crosses 19:00 in the first shift only; keying on overlap keeps a
-    person who really did work both shifts visible in both."""
+    """Every shift an interval touches.
+
+    BELT-AND-BRACES, not load-bearing, and measured to be so: no engine in this
+    repo emits a segment that crosses 19:00 or 05:00 today — they all cut at the
+    boundary — so reducing this to "the shift the segment started in" kills no
+    test. It is kept because the alternative fails in the dangerous direction: a
+    crossing segment would make a person who really worked both shifts visible in
+    only one, and Rule 1 is a per-shift rule.
+    """
     keys = []
     day = (start - timedelta(days=1)).date()
     last = end.date()
     while day <= last:
         for shift in (FIRST, SECOND):
-            bounds = _shift_bounds(day, shift, config)
+            bounds = worktime._shift_bounds(day, shift, config)
             if _touches(start, end, bounds[0], bounds[1]):
                 keys.append((day, shift))
         day += timedelta(days=1)
@@ -397,6 +426,24 @@ def _is_absent(absent, name, window) -> bool:
 def overlap_rounding_violations(entries, masters, config=None) -> list:
     """A successor is never released on a fraction of a piece.
 
+    ⚠ THE ROW COUNT ALONE IS NOT A MEASUREMENT — see the module docstring and
+    ``overlap_rounding_scan``. On a contended plan practically every detection is
+    withheld because the successor's machine had just freed, so 0 rows means "no
+    UNEXPLAINED fraction", not "no fraction".
+    """
+    return overlap_rounding_scan(entries, masters, config)["rows"]
+
+
+def overlap_rounding_scan(entries, masters, config=None) -> dict:
+    """The fractional-release check WITH its own muting made countable.
+
+    Returns ``{"detected", "muted", "reported", "rows", "muted_rows"}`` —
+    ``rows`` is exactly what ``overlap_rounding_violations`` publishes, and each
+    entry of ``muted_rows`` is the row that WOULD have been published plus an
+    ``explained`` key naming the clause that withheld it. Publish all three
+    counts: a check whose every detection is muted is indistinguishable, from
+    the outside, from a check that found nothing — and they mean opposite things.
+
     The implied setup is derived from what the entry was ACTUALLY charged
     (``occupancy_min`` less its cutting), never from ``config.setup_time_min``:
     this engine legitimately skips the 90 minutes when the same (item, process)
@@ -409,9 +456,11 @@ def overlap_rounding_violations(entries, masters, config=None) -> list:
     only when nothing explains the delay — and unconditionally when the successor
     started before a single whole piece could exist, which no delay can explain.
     """
+    empty = {"detected": 0, "muted": 0, "reported": 0,
+             "rows": [], "muted_rows": []}
     entries = list(entries or ())
     if not entries:
-        return []
+        return empty
     if config is None:                      # Task 11 calls the two-argument form
         from engine.config import Config
         config = Config()
@@ -422,7 +471,7 @@ def overlap_rounding_violations(entries, masters, config=None) -> list:
         by_batch.setdefault(str(entry.batch_id), {}) \
                 .setdefault(int(entry.process_seq), []).append(entry)
 
-    rows = []
+    rows, muted = [], []
     for batch in sorted(by_batch):
         seqs = sorted(by_batch[batch])
         for prev_seq, next_seq in zip(seqs, seqs[1:]):
@@ -447,10 +496,15 @@ def overlap_rounding_violations(entries, masters, config=None) -> list:
                 rows.append(_rounding_row(
                     batch, prev, nxt, pieces,
                     "before a single whole piece of"))
-            elif (abs(pieces - round(pieces)) > tol
-                  and not _explained(prev, nxt, entries, config)):
-                rows.append(_rounding_row(batch, prev, nxt, pieces, "into"))
-    return rows
+            elif abs(pieces - round(pieces)) > tol:
+                reason = _explained(prev, nxt, entries, config)
+                row = _rounding_row(batch, prev, nxt, pieces, "into")
+                if reason:
+                    muted.append(dict(row, explained=reason))
+                else:
+                    rows.append(row)
+    return {"detected": len(rows) + len(muted), "muted": len(muted),
+            "reported": len(rows), "rows": rows, "muted_rows": muted}
 
 
 def _rounding_row(batch, prev, nxt, pieces, phrasing) -> dict:
@@ -483,16 +537,20 @@ def _worked_before(entry, moment) -> float:
     return total
 
 
-def _explained(prev, nxt, entries, config) -> bool:
-    """Something other than the release decides when ``nxt`` starts."""
+def _explained(prev, nxt, entries, config) -> str:
+    """Which clause, if any, decides when ``nxt`` starts instead of the release.
+
+    Returns the reason (falsy when nothing explains it) so the caller can COUNT
+    the mutes by cause rather than merely obeying them.
+    """
     slack = timedelta(minutes=_TOL_MIN)
     key = shift_key(nxt.start, config)
     if key is not None:
-        opened = _shift_bounds(key[0], key[1], config)[0]
+        opened = worktime._shift_bounds(key[0], key[1], config)[0]
         if abs(nxt.start - opened) <= slack:
-            return True                     # the shop had just opened
+            return EXPLAIN_SHOP_OPENED
     if not any(start <= nxt.start < end for start, end in _covered(prev)):
-        return True                         # its feeder was not even cutting then
+        return EXPLAIN_FEEDER_IDLE          # dark shift / weekly off
     who = next((w for _s, _e, w in _segments(nxt) if w), "")
     for other in entries:
         if other is nxt:
@@ -500,9 +558,11 @@ def _explained(prev, nxt, entries, config) -> bool:
         for _s, end, worker in _segments(other):
             if abs(nxt.start - end) > slack:
                 continue
-            if other.machine == nxt.machine or (who and worker == who):
-                return True                 # its machine / its operator was busy
-    return False
+            if other.machine == nxt.machine:
+                return EXPLAIN_MACHINE_BUSY
+            if who and worker == who:
+                return EXPLAIN_OPERATOR_BUSY
+    return ""
 
 
 # --------------------------------------------------------------------------- #

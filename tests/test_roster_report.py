@@ -34,13 +34,14 @@ Fixture notes — the brief's sketch could not run as written:
 """
 
 from datetime import date, datetime, timedelta
+from datetime import time as _time
 
 import pytest
 
 from engine.config import Config
 from engine.models import (Machine, Masters, Operator, Process, Routing,
                            ScheduleEntry, WorkCalendar)
-from roster_engine import report
+from roster_engine import report, worktime
 
 PLAN_START = date(2026, 8, 12)          # a Wednesday; the 13th is the weekly off
 
@@ -231,6 +232,19 @@ def test_a_job_that_fully_spans_the_gap_is_still_segmentation():
         "OPERATION_SEGMENTED"]
 
 
+def test_a_second_entry_of_the_same_step_on_one_machine_is_not_an_intruder():
+    """The classic engine publishes a parallel-split step as SEVERAL entries of
+    the same (batch, seq). The other half of an operation is that operation, not
+    another job taking the machine away — without the skip the split reports
+    itself as its own interruption."""
+    half = _entry("CNC1", 1, _dt(8), _dt(18), "N", occupancy=240.0,
+                  segments=[(_dt(8), _dt(10), "N"), (_dt(16), _dt(18), "N")])
+    other_half = _entry("CNC1", 1, _dt(11), _dt(15), "N")
+    assert half.batch_id == other_half.batch_id
+    assert half.process_seq == other_half.process_seq
+    assert report.segmentation_violations([half, other_half]) == []
+
+
 # --------------------------------------------------------------------------- #
 # The owner's original complaint, as a number
 # --------------------------------------------------------------------------- #
@@ -326,6 +340,10 @@ def test_a_fractional_piece_release_is_flagged():
                                               _masters(routings=_ROUTING))
     assert _kinds(rows) == ["OVERLAP_FRACTIONAL_PIECE"]
     assert "B1" in rows[0]["ref"]
+    # The two branches say DIFFERENT things and must stay distinguishable: this
+    # one is a mid-release fraction, not a release before any piece exists.
+    assert "4.70 pieces into" in rows[0]["message"]
+    assert "whole piece of" not in rows[0]["message"]
 
 
 def test_a_whole_piece_release_is_clean():
@@ -387,11 +405,68 @@ def test_a_successor_released_before_a_single_piece_exists_is_flagged():
     rows = report.overlap_rounding_violations([_PREV, nxt],
                                               _masters(None, _ROUTING))
     assert _kinds(rows) == ["OVERLAP_FRACTIONAL_PIECE"]
+    # This is the UNCONDITIONAL branch — the only one that can fire on a
+    # contended plan, since the other is muted whenever anything explains the
+    # start. Asserting the kind alone lets the branch be deleted silently: the
+    # pair falls through to the muted branch and emits the other phrasing.
+    assert "0.40 pieces before a single whole piece of" in rows[0]["message"]
 
 
 def test_an_item_with_no_routing_is_skipped_not_crashed():
     nxt = _entry("CNC4", 2, _dt(11, 27), _dt(18), "S", qty=8)
     assert report.overlap_rounding_violations([_PREV, nxt], _masters()) == []
+
+
+# --------------------------------------------------------------------------- #
+# How much of this check is muted, as a number
+# --------------------------------------------------------------------------- #
+
+def test_the_scan_counts_a_detection_that_is_muted():
+    """Measured on real plans, EVERY fractional detection was muted by this one
+    clause. A bare 0 rows must never be read as "the engine releases on whole
+    pieces"; the counts are what makes the difference visible."""
+    nxt = _entry("CNC4", 2, _dt(11, 30), _dt(18), "S", qty=8)
+    busy = _entry("CNC4", 1, _dt(8), _dt(11, 30), "S", batch="B9", item="OTHER")
+    scan = report.overlap_rounding_scan([_PREV, nxt, busy],
+                                        _masters(None, _ROUTING))
+    assert (scan["detected"], scan["muted"], scan["reported"]) == (1, 1, 0)
+    assert scan["rows"] == []
+    assert len(scan["muted_rows"]) == 1
+    assert scan["muted_rows"][0]["kind"] == "OVERLAP_FRACTIONAL_PIECE"
+    assert scan["muted_rows"][0]["explained"] == report.EXPLAIN_MACHINE_BUSY
+    assert "4.80 pieces into" in scan["muted_rows"][0]["message"]
+
+
+def test_the_scan_counts_a_detection_that_is_reported():
+    nxt = _entry("CNC4", 2, _dt(11, 27) + timedelta(seconds=30), _dt(18), "S",
+                 qty=8)
+    masters = _masters(None, _ROUTING)
+    scan = report.overlap_rounding_scan([_PREV, nxt], masters)
+    assert (scan["detected"], scan["muted"], scan["reported"]) == (1, 0, 1)
+    assert scan["muted_rows"] == []
+    assert scan["rows"] == report.overlap_rounding_violations([_PREV, nxt],
+                                                              masters)
+
+
+def test_the_scan_counts_nothing_on_a_whole_piece_release():
+    nxt = _entry("CNC4", 2, _dt(11, 10), _dt(18), "S", qty=8)   # 90 + 4 x 25
+    scan = report.overlap_rounding_scan([_PREV, nxt], _masters(None, _ROUTING))
+    assert (scan["detected"], scan["muted"], scan["reported"]) == (0, 0, 0)
+
+
+def test_the_dark_hours_of_an_overnight_hold_are_not_counted_as_cutting():
+    """Worked minutes, not elapsed. The predecessor is held from 19:00 on the
+    12th to 08:00 on the 14th; by the wall clock its successor starts 41 hours
+    in, by the machine's own work it starts on exactly 6 whole pieces. And this
+    fixture is NOT muted — it reaches the arithmetic, which the two overnight
+    tests above do not."""
+    prev = _entry("CNC1", 1, _dt(16), _dt(9, 50, 14), "N", qty=8,
+                  occupancy=290.0,
+                  segments=[(_dt(16), _dt(19), "N"),
+                            (_dt(8, 0, 14), _dt(9, 50, 14), "N")])
+    nxt = _entry("CNC4", 2, _dt(9, 0, 14), _dt(18, 0, 14), "S", qty=8)
+    scan = report.overlap_rounding_scan([prev, nxt], _masters(None, _ROUTING))
+    assert (scan["detected"], scan["muted"], scan["reported"]) == (0, 0, 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -435,6 +510,39 @@ def test_identical_inputs_give_identical_row_order():
     second = report.all_violations(list(reversed(entries)), masters, _cfg())
     assert len(first) >= 2
     assert first == second
+
+
+def test_the_report_follows_worktimes_shift_clock_rather_than_a_copy():
+    """The shift clock is READ from ``roster_engine.worktime`` — the one
+    definition the scheduler plans by — never re-derived here. A local copy that
+    agrees today is precisely the 2026-08-07 incident (four reporting features
+    each rebuilt the working window and hid 9,470 minutes of planned work), so
+    move worktime's clock and the report must move with it.
+    """
+    entries, masters = _split_plan()        # 08:00-12:00 CNC1, 13:00-17:00 CNC4
+    assert _kinds(report.operator_split_violations(entries, _cfg(), masters)) \
+        == ["OPERATOR_SPLIT_SHIFT"]         # one shift on the real 08:00-19:00
+
+    def _moved_clock(day, shift, config):
+        """First 08:00-13:00, second 13:00-22:00 — the two bookings above now
+        fall in DIFFERENT shifts, so the same plan is a legal handover."""
+        if shift == report.FIRST:
+            return (datetime.combine(day, _time(8)),
+                    datetime.combine(day, _time(13)))
+        return (datetime.combine(day, _time(13)),
+                datetime.combine(day, _time(22)))
+
+    original = worktime._shift_bounds
+    worktime._shift_bounds = _moved_clock
+    try:
+        assert report.operator_split_violations(entries, _cfg(), masters) == []
+        assert report.shift_key(_dt(9), _cfg()) == (PLAN_START, report.FIRST)
+        assert report.shift_key(_dt(14), _cfg()) == (PLAN_START, report.SECOND)
+    finally:
+        worktime._shift_bounds = original
+
+    assert _kinds(report.operator_split_violations(entries, _cfg(), masters)) \
+        == ["OPERATOR_SPLIT_SHIFT"]
 
 
 def test_the_lane_strings_match_the_adapters():
