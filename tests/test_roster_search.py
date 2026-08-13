@@ -110,14 +110,43 @@ def test_metrics_are_measured_for_every_job_in_the_plan():
     assert objective.score(m, cfg) >= 0
 
 
-def test_early_and_late_are_penalised_equally():
-    """The owner's symmetric on-time rule (2026-08-06)."""
+def test_finishing_early_is_free_and_finishing_late_is_not():
+    """The owner's LATE-ONLY on-time rule (2026-08-13, reversing 2026-08-06).
+
+    An order 20 days early must cost exactly what an order dead on time costs —
+    nothing beyond the makespan tie-break — while 20 days LATE still costs
+    (20-4)^2. Held at the same makespan so the tie-break cannot mask either side.
+    """
     cfg = _cfg()
     early = objective.Metrics({"A": -20.0}, 1.0, 0.0, 0.0)
+    on_time = objective.Metrics({"A": 0.0}, 1.0, 0.0, 0.0)
     late = objective.Metrics({"A": 20.0}, 1.0, 20.0, 20.0)
-    assert objective.score(early, cfg) == objective.score(late, cfg)
-    assert objective.score(early, cfg) > objective.score(
-        objective.Metrics({"A": 0.0}, 1.0, 0.0, 0.0), cfg)
+    assert objective.score(early, cfg) == objective.score(on_time, cfg)
+    assert objective.score(early, cfg) < objective.score(late, cfg)
+    assert objective.score(late, cfg) - objective.score(early, cfg) == (20.0 - 4.0) ** 2
+
+
+def test_earliness_is_free_at_every_magnitude_and_in_bulk():
+    """Not one lucky value: nothing early ever costs, alone or piled up — and the
+    cap is not what is hiding it (-64 and -900 are both past the 60-day cap)."""
+    cfg = _cfg()
+    baseline = objective.score(objective.Metrics({}, 1.0, 0.0, 0.0), cfg)
+    for d in (-4.5, -5.0, -20.0, -60.0, -64.0, -900.0):
+        m = objective.Metrics({"A": d}, 1.0, 0.0, 0.0)
+        assert objective.score(m, cfg) == baseline, f"{d} days early must be free"
+    bulk = objective.Metrics({f"O{i}": -30.0 for i in range(25)}, 1.0, 0.0, 0.0)
+    assert objective.score(bulk, cfg) == baseline
+
+
+def test_the_late_side_of_the_term_is_untouched_by_the_reversal():
+    """Band 4, cap 60, squared, weight 1.0 — the numbers the 2026-08-06 term had.
+    Only the earliness half was removed."""
+    cfg = _cfg()
+    tie = 0.1 * 1.0                                   # the makespan tie-break at 1 day
+    for days, expected in ((4.0, 0.0), (5.0, 1.0), (20.0, 256.0),
+                           (30.0, 676.0), (64.0, 3600.0), (900.0, 3600.0)):
+        m = objective.Metrics({"A": days}, 1.0, days, days)
+        assert objective.score(m, cfg) - tie == expected, days
 
 
 def test_misses_spread_across_orders_beat_one_hopeless_order():
@@ -142,6 +171,9 @@ def test_a_miss_inside_the_band_is_free():
     cfg = _cfg()
     inside = objective.Metrics({"O0": 4.0, "O1": -4.0}, 0.0, 4.0, 4.0)
     assert objective.score(inside, cfg) == 0.0
+    # The band is 4 days wide, not "everything is free": one more day LATE costs.
+    # Without this the test would pass on an objective that scored nothing at all.
+    assert objective.score(objective.Metrics({"O0": 5.0}, 0.0, 5.0, 5.0), cfg) == 1.0
 
 
 def test_makespan_is_only_a_tie_break():
@@ -158,10 +190,20 @@ def test_the_score_matches_the_incumbent_engines_formula():
 
     roster_engine may not import ppc_engine, so the formula is written fresh — and
     that is exactly the kind of duplication that drifts. This pins them together
-    numerically instead: the same lateness map, scored by both, over signed,
-    zero, inside-band, beyond-band and beyond-CAP values — and at every worst-order
+    numerically instead: the same lateness map, scored by both, over zero,
+    inside-band, beyond-band and beyond-CAP values — and at every worst-order
     CEILING the live path actually sets, which is not only None (see
     `test_the_worst_order_ceiling_is_reproduced_not_assumed_dormant`).
+
+    **Restricted to NON-EARLY books on 2026-08-13, deliberately.** The owner made
+    earliness free in `roster_engine/objective.py` and in `engine/optimizer.py`,
+    the two scorers that pick and report the live contest winner. `ppc_engine/` is
+    a vendored package carrying its own SYMMETRIC mirror, and it was left alone —
+    it is reachable only from the retired `new` engine's internal search, not from
+    the roster path this engine is measured on. So the two formulas now genuinely
+    diverge on early orders, and pinning them equal there would pin a bug. The
+    divergence is asserted explicitly rather than merely dodged, in
+    `test_earliness_diverges_from_the_vendored_ppc_mirror_on_purpose`.
     """
     import random
 
@@ -170,10 +212,10 @@ def test_the_score_matches_the_incumbent_engines_formula():
     from ppc_engine.objective.metrics import PlanMetrics
 
     rng = random.Random(11)
-    cases = [{"A": 0.0}, {"A": 4.0}, {"A": -4.0}, {"A": 4.5}, {"A": -4.5},
-             {"A": 64.0}, {"A": 64.1}, {"A": 900.0}, {"A": -900.0}, {}]
+    cases = [{"A": 0.0}, {"A": 4.0}, {"A": 4.5}, {"A": 5.0},
+             {"A": 64.0}, {"A": 64.1}, {"A": 900.0}, {}]
     for _ in range(40):
-        cases.append({f"O{i}": float(rng.randint(-90, 90)) for i in range(8)})
+        cases.append({f"O{i}": float(rng.randint(0, 90)) for i in range(8)})
     for ceiling in (None, 0.0, 10.0, 46.0):
         cfg = _cfg(worst_ceiling_days=ceiling)
         ppc_cfg = PlanConfig(plan_start=datetime(2026, 8, 12, 8, 0),
@@ -187,6 +229,37 @@ def test_the_score_matches_the_incumbent_engines_formula():
                     lateness_by_order=dict(lateness))
                 assert objective.score(mine, cfg) == ppc_objective.score(
                     theirs, ppc_cfg), (ceiling, lateness, makespan)
+    # The fixture must really exercise the on-time term, or "they agree" would be
+    # the trivial truth that both scored 0.
+    assert ppc_objective.score(
+        PlanMetrics(total_tardiness_days=0.0, max_tardiness_days=0.0,
+                    late_order_count=0, makespan_days=0.0,
+                    lateness_by_order={"A": 30.0}),
+        PlanConfig(plan_start=datetime(2026, 8, 12, 8, 0))) == 676.0
+
+
+def test_earliness_diverges_from_the_vendored_ppc_mirror_on_purpose():
+    """The one place the two formulas are now KNOWN to disagree, pinned so nobody
+    "fixes" it back by re-symmetrising this engine.
+
+    `ppc_engine/` was deliberately left symmetric on 2026-08-13: it is vendored,
+    and its copy of this term drives only the retired `new` engine's internal
+    search. The roster engine — the one under test — is late-only.
+    """
+    from ppc_engine.config import PlanConfig
+    from ppc_engine.objective import objective as ppc_objective
+    from ppc_engine.objective.metrics import PlanMetrics
+
+    cfg = _cfg()
+    ppc_cfg = PlanConfig(plan_start=datetime(2026, 8, 12, 8, 0))
+    early = {"A": -30.0}
+    mine = objective.score(objective.Metrics(dict(early), 0.0, 0.0, 0.0), cfg)
+    theirs = ppc_objective.score(
+        PlanMetrics(total_tardiness_days=0.0, max_tardiness_days=0.0,
+                    late_order_count=0, makespan_days=0.0,
+                    lateness_by_order=dict(early)), ppc_cfg)
+    assert mine == 0.0, "roster_engine must charge nothing for an early order"
+    assert theirs == 676.0, "ppc_engine's vendored mirror stays symmetric"
 
 
 def test_the_worst_order_ceiling_is_reproduced_not_assumed_dormant():

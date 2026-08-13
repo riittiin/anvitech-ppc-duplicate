@@ -986,9 +986,16 @@ Rule 7 actual ─▶ recorded vs (SO#, item code) (+ optional complete)┘
   (SPT, ATC, then fresh random permutations), each hill-climbed (insertion/swap/block) until
   it stalls (`_RESTART_AFTER`), keeping the **global best** — a single trajectory got stuck
   in a worse local optimum (39.75/778 on Test5; multi-start → 39.7/713). Scores each plan
-  by ONE symmetric on-time penalty — how far each order misses its delivery date in either
-  direction, ignoring the first 4 days, capped at 60 and squared so misses spread across
-  orders rather than concentrating — plus a 0.1 makespan tie-break, and the dormant
+  by ONE **late-only** on-time penalty — how far each order finishes PAST its delivery date,
+  ignoring the first 4 days, capped at 60 and squared so misses spread across
+  orders rather than concentrating; **earliness is free** (2026-08-13, owner, reversing the
+  symmetric `abs(gap)` rule of 2026-08-06 — the band, cap, squaring, weights and makespan
+  tie-break are all unchanged; only the earliness half was removed. Both live scorers moved
+  together — `engine/optimizer.plan_metrics` and `roster_engine/objective.score` — while
+  **`ppc_engine/`'s vendored mirror was deliberately left SYMMETRIC**, since it drives only
+  the retired `new` engine's internal search; the divergence is pinned by
+  `tests/test_scorer_mirror.py::test_earliness_is_where_the_two_deliberately_diverge`)
+  — plus a 0.1 makespan tie-break, and the dormant
   worst-order-ceiling and committed-promise guards (delivery gaps dominant — owner priority:
   fewest late deliveries, since shortest-makespan plans push more orders late). Deterministic (eval-count
   budget + fixed seed). `should_cancel()` is polled between evals so a run can be stopped

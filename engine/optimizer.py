@@ -41,17 +41,27 @@ from .rules import rule1_consolidate, rule2_sort_by_date, rule3_tiebreak_process
 # matches ppc_engine/config.py makespan_weight, so the two scorers finally agree.
 MAKESPAN_WEIGHT = 0.1           # == ppc_engine makespan_weight
 
-# The on-time objective (2026-08-06 spec). ONE symmetric term replacing
-# total_late_days + slip_severity: for each order take how far it misses
-# its delivery date in EITHER direction, ignore the first ONTIME_BAND_DAYS, cap the
-# rest, and square it.
+# The on-time objective (2026-08-06 spec). ONE term replacing total_late_days +
+# slip_severity: for each order take how far it misses its delivery date, ignore
+# the first ONTIME_BAND_DAYS, cap the rest, and square it.
 #
 # Squaring is the mechanism the owner asked for by name: ten orders 6 days out
 # (10 x 2^2 = 40) must beat one order 30 days out ((30-4)^2 = 676). The cap stops a
 # single hopeless order swamping the plan. The band is FLAT by owner decision — no
-# pull toward the exact date; anywhere inside +/-4 days is equally on time.
+# pull toward the exact date; anywhere inside it is equally on time.
 #
-# Must stay numerically EQUAL to ppc_engine/config.py ontime_* .
+# 2026-08-13 — LATE ONLY. The term was SYMMETRIC from 2026-08-06 (`abs(gap)`): an
+# order 20 days early cost exactly what one 20 days late cost. The owner reversed
+# that at his explicit request — he wants total LATE-days minimised, and finishing
+# early is free. Only the earliness half was removed; the band, the cap, the
+# squaring, the weights and the makespan tie-break are all unchanged.
+#
+# The three constants below must stay numerically EQUAL to ppc_engine/config.py
+# ontime_* — but the SHAPE of the term no longer matches ppc_engine's mirror of it.
+# `ppc_engine/` is a vendored package and was left symmetric ON PURPOSE: its copy
+# drives only the retired `new` engine's internal search, not the roster path
+# production is being moved to. See tests/test_scorer_mirror.py::
+# test_earliness_is_where_the_two_deliberately_diverge.
 ONTIME_BAND_DAYS = 4.0          # == ppc_engine ontime_band_days
 ONTIME_CAP_DAYS = 60.0          # == ppc_engine ontime_cap_days
 ONTIME_WEIGHT = 1.0             # == ppc_engine ontime_weight
@@ -213,11 +223,14 @@ def plan_metrics(schedule, so_lines, plan_start, ceiling_days=None,
                 over = slip - promise_slack_days
                 if over > 0:
                     committed_promise_breach += float(over * over)
-    # The on-time objective (spec 2026-08-06). `gaps` is SIGNED — negative is early —
-    # and abs() is what makes early and late count the same, which is the owner's rule.
+    # The on-time objective (spec 2026-08-06, made LATE-ONLY 2026-08-13). `gaps` is
+    # SIGNED — negative is early — and reading it SIGNED, never through abs(), is
+    # what makes earliness free: a negative gap can never clear the band, so it
+    # contributes nothing. The owner's rule is now "minimise late days"; finishing
+    # early costs the plan nothing.
     ontime_breach = 0.0
     for g in gaps:
-        over = abs(g) - ONTIME_BAND_DAYS
+        over = g - ONTIME_BAND_DAYS
         if over > 0:
             if over > ONTIME_CAP_DAYS:
                 over = ONTIME_CAP_DAYS
@@ -279,8 +292,8 @@ def optimize(so_lines, config, masters, *, reserved=None, budget_evals=150,
     """Search for a better batch sequence for THIS book (rolling: call it on
     whatever the order book holds today; the result is disposable and re-computable).
 
-    "Better" = lower ``score`` (a symmetric on-time penalty for missing the delivery
-    date in either direction, plus a makespan tie-break) — every active line
+    "Better" = lower ``score`` (a LATE-ONLY on-time penalty for missing the delivery
+    date — earliness is free since 2026-08-13 — plus a makespan tie-break) — every active line
     competes in one pool (lanes are pure status labels, no scheduling effect).
 
     ``on_progress(evals_done, best_metrics)`` is called after every evaluation.

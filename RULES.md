@@ -618,9 +618,11 @@ the real book, better sequencing alone cut the plan from 42.5 to 39.7 days and t
 late-days from 1,026 to 792. Because one full plan evaluates in under a second, the
 **Optimize** button (admin) searches instead of trusting one pass: it tries many batch
 sequences on the *current* order book, replays the **unchanged Rule 6** for each, scores
-every plan by ONE symmetric on-time penalty — how far each order misses its delivery
-date in either direction, ignoring the first 4 days, capped at 60 and squared so misses
-spread across orders rather than concentrating — plus a 0.1 makespan tie-break, and the
+every plan by ONE **late-only** on-time penalty — how far each order finishes past its
+delivery date, ignoring the first 4 days, capped at 60 and squared so misses
+spread across orders rather than concentrating; **finishing EARLY is free**
+(2026-08-13, owner, reversing the symmetric `|miss|` rule of 2026-08-06) — plus a
+0.1 makespan tie-break, and the
 dormant worst-order-ceiling and committed-promise guards (**delivery gaps dominant**, the
 owner-chosen priority: favour fewest/smallest late deliveries over the very shortest
 finish, because on the real book the shortest-finish plans push *more* orders late), and
