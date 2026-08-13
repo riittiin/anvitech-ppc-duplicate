@@ -560,8 +560,7 @@ def test_an_unstaffable_book_raises_a_typed_rule_error_at_the_seam():
     assert "CNC1" in err.message and "CNC FIRST SIDE" in err.message
 
 
-def test_an_unstaffable_book_keeps_the_trace_through_run_forward(monkeypatch,
-                                                                 loaded):
+def test_an_unstaffable_book_keeps_the_trace_through_run_forward(loaded):
     """Through the REAL entry point, on the repo's canonical sample workbook,
     which carries the documented provisional machine ``CNC9``.
 
@@ -571,7 +570,7 @@ def test_an_unstaffable_book_keeps_the_trace_through_run_forward(monkeypatch,
     from engine import pipeline
     from engine.models import PlanRun
 
-    monkeypatch.setattr(Config, "validate", lambda self: None)   # Task 10's job
+    # No monkeypatch: Config.validate() accepts "roster" since Task 10a.
     so_lines, masters = loaded
     trace = pipeline.run_forward(
         PlanRun(so_lines=so_lines),

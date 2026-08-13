@@ -1082,7 +1082,10 @@ def _load_plan_config() -> Config:
     # never requires clearing an old MongoDB config (which pins the retired flow/classic).
     # Normalised for stray whitespace/case. Unset (e.g. in tests) -> the saved/Config value.
     env_sched = (os.environ.get("DEFAULT_SCHEDULER") or "").strip().lower()
-    if env_sched in ("new", "classic", "flow"):
+    # "roster" belongs here as much as the others: a value missing from this
+    # whitelist is not an error, it is silently IGNORED — the deploy keeps running
+    # the saved/default engine while the env var says otherwise.
+    if env_sched in ("new", "classic", "flow", "roster"):
         cfg.scheduler = env_sched
     return cfg
 

@@ -41,6 +41,11 @@ CLOUD_NEW_OVERLAP_CANDIDATES = (60, 65, 70, 74, 78, 80, 82, 84, 86, 88, 90, 93)
 # candidates needed a second round and timed out (live 2026-07-19), falling back
 # to the hours-long local path. Chunk 4 wins at depth, 6 is the close runner-up.
 CLOUD_FLOW_CHUNK_CANDIDATES = (4, 6)
+# Roster engine: a finer grid over the owner's 50-100 overlap band (see
+# optimizer.ROSTER_OVERLAP_CANDIDATES for what the number means). 5% steps, 11
+# shards — the same order as the new engine's 12-shard grid, which a measured
+# live run finished in ~6.5 min, so it fits the cloud window with headroom.
+CLOUD_ROSTER_OVERLAP_CANDIDATES = (50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100)
 
 
 def cloud_candidates(config) -> tuple:
@@ -58,6 +63,8 @@ def cloud_candidates(config) -> tuple:
         return CLOUD_FLOW_CHUNK_CANDIDATES
     if sched == "new":
         return CLOUD_NEW_OVERLAP_CANDIDATES
+    if sched == "roster":
+        return CLOUD_ROSTER_OVERLAP_CANDIDATES
     return CLOUD_OVERLAP_CANDIDATES
 
 
@@ -382,6 +389,10 @@ def run_candidate(payload: dict, overlap: int, flexible: bool = False, *, on_pro
         from engine import new_engine
         _raw = payload.get("masters_xlsx_b64")
         new_engine.set_masters_bytes(base64.b64decode(_raw) if _raw else None)
+    # "roster": nothing to do here, deliberately. engine/roster_adapter.py reads the
+    # Masters OBJECT that prepare_contest builds below (build_jobs/build_shop take
+    # masters), never the workbook bytes, so a cloud run needs no masters priming.
+    # Recorded explicitly because an omission and a forgotten branch look identical.
     setup = prepare_contest(orders, actuals, masters, config, absences=absences,
                             operator_table=operator_table, frozen=frozen)
     knob, _cands = optimizer.knob_for(setup.search_config)
@@ -454,6 +465,10 @@ def contest_jobs(payload: dict) -> list:
     # loop on scheduler so classic/flow cloud contests stay single-pass and byte-
     # identical to their local counterpart (Task 3 established this same gate in
     # engine/optimizer.sweep_optimize / engine/new_engine.sweep_optimize).
+    #
+    # "roster" deliberately stays single-pass too: it resolves an operation's machine
+    # options from the routing itself and never searches the Allotted/Suggested axis,
+    # so opening this gate would double every GitHub Actions run for nothing.
     machine_sets = (False, True) if getattr(config, "scheduler", "classic") == "new" else (False,)
     return [(ov, flex, sd) for sd in contest_seeds(payload)
             for flex in machine_sets for ov in contenders]

@@ -435,13 +435,31 @@ FLOW_CHUNK_CANDIDATES = (4, 6)
 # over classic, without hanging the free instance.
 FLOW_LOCAL_BUDGET = 100
 
+# The owner's overlap band for the roster engine (2026-08-12). Under this
+# engine's definition (roster_engine.release) the percentage is the fraction of
+# a step's pieces that must have CLEARED before its successor may start, so 50 =
+# "start once half are done" and 100 = fully sequential. Below 50 a successor
+# starts on a handful of pieces and the shop floor stops believing the plan, so
+# the owner's band is the whole physically sane range. Six coarse points here;
+# optimize_service.CLOUD_ROSTER_OVERLAP_CANDIDATES is the finer grid the parallel
+# cloud contest fans across Actions shards.
+ROSTER_OVERLAP_CANDIDATES = (50, 60, 70, 80, 90, 100)
+
 
 def knob_for(config):
     """The ONE setting the sweep contest tunes for this scheduler mode:
     ('flow_chunks', FLOW_CHUNK_CANDIDATES) under the flow scheduler,
-    ('overlap_percent', OVERLAP_CANDIDATES) under classic Rule 6."""
+    ('overlap_percent', ROSTER_OVERLAP_CANDIDATES) under the roster engine,
+    ('overlap_percent', OVERLAP_CANDIDATES) under classic Rule 6 / the new engine.
+
+    The roster branch is easy to miss because the KNOB NAME is the same as the
+    default's: forget it and the contest still runs, still tunes overlap, and
+    still looks right — it just searches classic's narrow (70, 80, 85, 88)
+    instead of the owner's 50-100 band."""
     if getattr(config, "scheduler", "classic") == "flow":
         return "flow_chunks", FLOW_CHUNK_CANDIDATES
+    if getattr(config, "scheduler", "classic") == "roster":
+        return "overlap_percent", ROSTER_OVERLAP_CANDIDATES
     return "overlap_percent", OVERLAP_CANDIDATES
 
 

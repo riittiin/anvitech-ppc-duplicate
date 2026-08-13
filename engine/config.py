@@ -185,8 +185,14 @@ class Config:
             errs.append("two_shift_threshold_hours must be >= 0")
         if not isinstance(self.apply_operator_logic, bool):
             errs.append("apply_operator_logic must be true or false")
-        if self.scheduler not in ("classic", "flow", "new"):
-            errs.append("scheduler must be 'classic', 'flow', or 'new'")
+        # "roster" = the roster-first engine (roster_engine/, 2026-08-12 spec),
+        # dispatched by pipeline.scheduler_for -> engine/roster_adapter.py. It must
+        # be listed here or NOTHING can plan on it: run_forward, optimizer.optimize
+        # and optimize_service all call validate(), and api._load_plan_config drops
+        # a config that fails validation back to a bare Config() — i.e. an admin's
+        # saved choice would be silently downgraded to classic.
+        if self.scheduler not in ("classic", "flow", "new", "roster"):
+            errs.append("scheduler must be 'classic', 'flow', 'new', or 'roster'")
         if not (1 <= int(self.flow_chunks) <= 50):
             errs.append("flow_chunks must be within 1..50")
         if not isinstance(self.split_parallel, bool):
