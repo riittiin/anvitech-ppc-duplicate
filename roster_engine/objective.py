@@ -5,20 +5,15 @@ plans is then the scheduling, not the yardstick. Written fresh rather than
 imported, because this package stands alone and never imports the engine it is
 being compared against.
 
-    score = w_ontime  x  sum( (late - band, capped)^2 )       # the whole objective
+    score = w_ontime  x  sum( (|miss| - band, capped)^2 )     # the whole objective
           + w_ceiling x  sum( (late - ceiling)^2 )            # a no-regression bar
           + w_makespan x  makespan_days                       # a strict tie-break
 
-The on-time term is LATE-ONLY (2026-08-13). From 2026-08-06 it was `|miss|` — the
-owner's rule then was that early and late are equally bad — and he reversed that
-at his explicit request: he wants total LATE-days minimised, and finishing early
-is free. Reading the SIGNED lateness is the whole mechanism; an early order's
-negative value can never clear the band. Nothing else about the term moved.
-
-Squaring is the owner's rule that misses must be SPREAD: ten orders 6 days out
-(10 x 2^2 = 40) beats one order 30 days out ((30-4)^2 = 676). The cap stops one
-hopeless order swamping the plan and the search chasing it instead of the orders
-it can still save.
+`abs()` is the owner's rule that early and late are equally bad. Squaring is the
+owner's rule that misses must be SPREAD: ten orders 6 days out (10 x 2^2 = 40)
+beats one order 30 days out ((30-4)^2 = 676). The cap stops one hopeless order
+swamping the plan and the search chasing it instead of the orders it can still
+save.
 
 The defaults below are the live engine's own (ontime_band_days 4.0,
 ontime_cap_days 60.0, ontime_weight 1.0, makespan_weight 0.1). They are read off
@@ -26,16 +21,7 @@ ontime_cap_days 60.0, ontime_weight 1.0, makespan_weight 0.1). They are read off
 `engine.config.Config` has none of these fields, so the defaults are what
 production uses. A numeric differential test scores the same lateness maps
 through both implementations and pins them equal
-(`tests/test_roster_search.py::test_the_score_matches_the_incumbent_engines_formula`)
-— over NON-EARLY books only, since 2026-08-13. The live scorer this engine mirrors
-(`engine/optimizer.py`) went late-only with it, so the pair still agree; the
-VENDORED copy of the same term was deliberately left symmetric, and that one known
-divergence is pinned head-on by
-`test_earliness_diverges_from_the_vendored_ppc_mirror_on_purpose`.
-
-(Nothing here spells the vendored package's module name, deliberately: the
-isolation invariant in `tests/test_roster_domain.py` scans this file for that
-literal string, so even a comment mentioning it would trip the tripwire.)
+(`tests/test_roster_search.py::test_the_score_matches_the_incumbent_engines_formula`).
 
 The worst-order CEILING is a live term, not a dormant one, and it is reproduced
 here. Its default IS None — but the path this engine is measured against never
@@ -47,10 +33,8 @@ without it can propose plans the live search is structurally forbidden to
 propose, and the A/B would be measuring two different questions. It is read off
 `config.worst_ceiling_days`, the field the live config carries.
 
-The ceiling is ONE-SIDED (`late - ceiling`, not `abs(late) - ceiling`): finishing
-early can never breach a lateness barrier. Since 2026-08-13 the on-time term is
-one-sided too, so the two now agree in shape — but they remain separate terms with
-separate knobs, and the ceiling's one-sidedness was never in question.
+Unlike the on-time term the ceiling is ONE-SIDED (`late - ceiling`, not
+`abs(late) - ceiling`): finishing early can never breach a lateness barrier.
 
 ONE term of the live score is deliberately not reproduced: the COMMITTED-PROMISE
 penalty. That one is genuinely dormant — it is driven by per-order promise dates,
@@ -84,9 +68,7 @@ class Metrics:
     """What the objective needs, plus the two numbers the owner reads directly.
 
     ``lateness_by_order`` is SIGNED days — negative means the order finished
-    early, which this objective does not penalise at all (2026-08-13). The sign is
-    load-bearing: ``score`` reads it directly, so an early order's negative value
-    is what keeps it free.
+    early, which this objective penalises exactly as hard as finishing late.
     ``total_late_days`` and ``max_late_days`` are TARDINESS only (early orders
     contribute nothing), matching the live engine's ``total_tardiness_days`` /
     ``max_tardiness_days``, because those two are reported to the floor as "late
@@ -125,18 +107,12 @@ def compute_metrics(plan, jobs, config) -> Metrics:
 
 
 def score(metrics: Metrics, config) -> float:
-    """Score a plan from its metrics. Lower is better.
-
-    The on-time term is LATE-ONLY (2026-08-13, reversing the 2026-08-06 symmetric
-    rule at the owner's explicit request). ``late`` is SIGNED and is read as-is,
-    never through ``abs()``: an early order is negative, can never clear the band,
-    and so contributes exactly nothing.
-    """
+    """Score a plan from its metrics. Lower is better."""
     band = _knob(config, "ontime_band_days", _BAND_DAYS)
     cap = _knob(config, "ontime_cap_days", _CAP_DAYS)
     breach = 0.0
     for late in metrics.lateness_by_order.values():
-        over = late - band
+        over = abs(late) - band
         if over > 0:
             if over > cap:
                 over = cap
