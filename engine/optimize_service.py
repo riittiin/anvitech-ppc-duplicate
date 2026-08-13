@@ -472,10 +472,18 @@ def contest_jobs(payload: dict) -> list:
     # identical to their local counterpart (Task 3 established this same gate in
     # engine/optimizer.sweep_optimize / engine/new_engine.sweep_optimize).
     #
-    # "roster" deliberately stays single-pass too: it resolves an operation's machine
-    # options from the routing itself and never searches the Allotted/Suggested axis,
-    # so opening this gate would double every GitHub Actions run for nothing.
-    machine_sets = (False, True) if getattr(config, "scheduler", "classic") == "new" else (False,)
+    # "roster" JOINED this dimension on 2026-08-13. It was single-pass on the
+    # reasoning that it resolves machine options from the routing and searching the
+    # Allotted/Suggested axis would double every run for nothing. The live book
+    # disproved that: all 86 (item, process) pairs on CNC/VMC were pinned to ONE
+    # machine, CNC3/CNC6/CNC7 carried 1,053 h across the three most loaded operators
+    # in the shop, and CNC4 (48 h) / CNC5 (17 h) sat nearly idle WITH qualified
+    # operators free. Those cells share no people, so widening the option set moves
+    # work to a different machine AND a different crew. Cost: the job count doubles
+    # (11 overlaps -> 22 jobs), which is two rounds of the workflow's 20 shards.
+    machine_sets = ((False, True)
+                    if getattr(config, "scheduler", "classic") in ("new", "roster")
+                    else (False,))
     return [(ov, flex, sd) for sd in contest_seeds(payload)
             for flex in machine_sets for ov in contenders]
 

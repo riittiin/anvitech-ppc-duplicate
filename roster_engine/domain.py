@@ -103,20 +103,37 @@ def _kind_for_machine_id(mid: str, masters) -> str:
     return MANUAL
 
 
-def _candidates(proc, masters) -> tuple:
-    """Machine ids this step may run on: the Allotted machine(s), falling back to
-    Suggested when Allotted is blank.
+def _candidates(proc, masters, flexible: bool = False) -> tuple:
+    """Machine ids this step may run on.
+
+    ``flexible=False`` — the Allotted machine(s), falling back to Suggested only
+    when Allotted is blank. One machine per step, which is what the routing
+    literally says.
+
+    ``flexible=True`` — the UNION of Allotted and Suggested, Allotted first so it
+    stays the preferred choice and so the operation's KIND (which reads the first
+    option) cannot change. This is the optimizer-owned dimension the `new` engine
+    has always searched; the roster engine got it on 2026-08-13 because the live
+    book showed why it matters: all 86 (item, process) pairs on CNC/VMC were
+    pinned to exactly one machine, CNC3/CNC6/CNC7 carried 1,053 h across the three
+    most loaded operators in the shop, and CNC4 (48 h) and CNC5 (17 h) sat nearly
+    idle WITH qualified operators free. Widening the option set moves work to a
+    different machine AND a different crew, because those cells share no people.
 
     Deliberately NOT filtered against ``masters.machines`` — a routing may point at
     a provisional machine the Machine master hasn't caught up with yet, and this
     engine must keep it schedulable (never silently drop the row), matching
-    RULES.md's provisional-machine rule. ``flexible_machines`` (the Allotted +
-    Suggested union) is not searched by this engine in v1."""
-    for raw in (proc.allotted_machine, proc.suggested_machine):
-        ids = tuple(parse_resource_candidates(raw or ""))
-        if ids:
-            return ids
-    return ()
+    RULES.md's provisional-machine rule."""
+    allotted = tuple(parse_resource_candidates(proc.allotted_machine or ""))
+    suggested = tuple(parse_resource_candidates(proc.suggested_machine or ""))
+    if not flexible:
+        return allotted or suggested
+    if not allotted:
+        return suggested
+    # Allotted first, then any Suggested it does not already contain. dict.fromkeys
+    # dedupes while preserving order, so the preference is stable and the result is
+    # deterministic.
+    return tuple(dict.fromkeys(allotted + suggested))
 
 
 def _is_os(proc) -> bool:
@@ -127,7 +144,7 @@ def _is_os(proc) -> bool:
     return named_os and not (proc.allotted_machine or proc.suggested_machine)
 
 
-def _ops_from_processes(processes, masters) -> tuple:
+def _ops_from_processes(processes, masters, flexible: bool = False) -> tuple:
     out = []
     for proc in sorted(processes, key=lambda p: p.seq):
         cycle = float(proc.cycle_time or 0.0)
@@ -136,7 +153,7 @@ def _ops_from_processes(processes, masters) -> tuple:
         elif _is_os(proc):
             kind, options = OUTSOURCED, ()
         else:
-            options = _candidates(proc, masters)
+            options = _candidates(proc, masters, flexible)
             if not options:
                 # No machine and no cycle time -> a visible zero-duration milestone
                 # on the Off-machine lane, never silently dropped.
@@ -182,7 +199,7 @@ def _remaining_by_seq(batch, routing) -> dict | None:
     return getattr(batch, "process_remaining", None)
 
 
-def build_jobs(batches, masters):
+def build_jobs(batches, masters, flexible: bool = False):
     """Batches (Rule 1's output, already clubbed) -> jobs. Never re-consolidates.
 
     Returns (jobs, batch_by_key, skipped_item_codes). An item with no routing is
@@ -192,6 +209,10 @@ def build_jobs(batches, masters):
     field names) with a fallback to ``delivery_date``/``so_refs`` for any lighter
     test double that names them differently — both resolve the same due date /
     SO list either way.
+
+    ``flexible`` widens every step's machine options to the Allotted+Suggested
+    union — the optimizer-owned dimension, never a hand-set option. See
+    ``_candidates``.
     """
     jobs, by_key, skipped = [], {}, []
     for batch in batches:
@@ -200,7 +221,7 @@ def build_jobs(batches, masters):
             if batch.item_code not in skipped:
                 skipped.append(batch.item_code)
             continue
-        ops = _ops_from_processes(routing.processes, masters)
+        ops = _ops_from_processes(routing.processes, masters, flexible)
         if not ops:
             if batch.item_code not in skipped:
                 skipped.append(batch.item_code)

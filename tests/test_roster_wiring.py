@@ -158,13 +158,16 @@ def _payload(scheduler):
     return {"config": _cfg(scheduler).to_dict(), "candidates": [70, 80], "seed": 1}
 
 
-def test_roster_contest_does_not_double_for_machine_sets():
-    """flexible_machines is a NEW-engine dimension: roster resolves its machine
-    options from the routing and never searches the Allotted/Suggested axis, so
-    opening the gate would cost every GitHub Actions run twice for nothing."""
+def test_roster_contest_searches_the_machine_set():
+    """REBASED 2026-08-13 — a deliberate behaviour change, not a fudge. This
+    asserted the gate stayed CLOSED for roster, on the reasoning that roster
+    resolves machine options from the routing so searching the Allotted/Suggested
+    axis would double every Actions run for nothing. The live book disproved it:
+    86 of 86 CNC/VMC operations were pinned to ONE machine while CNC4 and CNC5 sat
+    nearly idle with qualified operators free."""
     jobs = optimize_service.contest_jobs(_payload("roster"))
     assert jobs
-    assert {flex for _ov, flex, _sd in jobs} == {False}
+    assert {flex for _ov, flex, _sd in jobs} == {False, True}
 
 
 def test_contest_jobs_still_doubles_for_the_new_engine():
@@ -690,3 +693,78 @@ def test_a_settings_save_cannot_wipe_the_applied_crew_genome(monkeypatch):
     assert out["config"]["crew_rank"] == {"CNC1": 1, "CNC2": 0}
     saved = Config.from_dict(_json.loads(book_store.load_plan_config()))
     assert saved.crew_rank == {"CNC1": 1, "CNC2": 0} and saved.overlap_percent == 70
+
+
+# --------------------------------------------------------------------------- #
+# flexible_machines — the Allotted+Suggested union (2026-08-13)
+# --------------------------------------------------------------------------- #
+
+class _P:
+    """Minimal stand-in for engine.models.Process: only the two machine columns
+    and the fields _ops_from_processes reads."""
+    def __init__(self, allotted, suggested, seq=1, name="CNC FIRST SIDE", cycle=5.0):
+        self.seq, self.name, self.cycle_time = seq, name, cycle
+        self.allotted_machine, self.suggested_machine = allotted, suggested
+        self.total_time = None
+
+
+def test_allotted_only_by_default():
+    from engine.models import Masters
+    from roster_engine.domain import _candidates
+    assert _candidates(_P("CNC6", "CNC4"), Masters()) == ("CNC6",)
+
+
+def test_flexible_returns_the_union_with_allotted_first():
+    """Allotted must stay FIRST: the op's kind is read off options[0], so a
+    Suggested machine of a different kind could otherwise reclassify the step."""
+    from engine.models import Masters
+    from roster_engine.domain import _candidates
+    assert _candidates(_P("CNC6", "CNC4"), Masters(), flexible=True) == ("CNC6", "CNC4")
+
+
+def test_flexible_dedupes_and_never_loses_the_allotted_machine():
+    from engine.models import Masters
+    from roster_engine.domain import _candidates
+    assert _candidates(_P("CNC6", "CNC6"), Masters(), flexible=True) == ("CNC6",)
+    assert _candidates(_P("CNC6/CNC3", "CNC3/CNC4"), Masters(), flexible=True) \
+        == ("CNC6", "CNC3", "CNC4")
+
+
+def test_flexible_falls_back_to_suggested_when_allotted_is_blank():
+    from engine.models import Masters
+    from roster_engine.domain import _candidates
+    for flex in (False, True):
+        assert _candidates(_P("", "CNC4"), Masters(), flexible=flex) == ("CNC4",)
+
+
+def test_the_retired_engines_still_do_not_double():
+    for sched in ("classic", "flow"):
+        jobs = optimize_service.contest_jobs(_payload(sched))
+        assert {flex for _ov, flex, _sd in jobs} == {False}, sched
+
+
+def test_the_adapter_honours_the_flag_end_to_end():
+    """A plan built with flexible=True must be able to place an op on a machine
+    the Allotted column alone would never offer."""
+    from roster_engine.domain import build_jobs
+
+    class _B:
+        batch_id, item_code, qty = "B1", ITEM_A, 10
+        source_so_refs, so_delivery_date, process_qty = ["SO1"], WED, None
+
+    raw = build_sample_bytes()
+    _so, masters = load_all(io.BytesIO(raw))
+    rt = masters.routings[ITEM_A]
+    # Build the fixture explicitly. A step whose Allotted column is BLANK falls
+    # back to Suggested in both arms and would prove nothing, and the sample
+    # workbook happens to leave that column empty throughout.
+    proc = sorted(rt.processes, key=lambda p: p.seq)[0]
+    proc.allotted_machine, proc.suggested_machine = "CNC1", "CNC9"
+    narrow, _b, _s = build_jobs([_B()], masters, flexible=False)
+    wide, _b, _s = build_jobs([_B()], masters, flexible=True)
+    i = [p.seq for p in sorted(rt.processes, key=lambda p: p.seq)].index(proc.seq)
+    assert "CNC9" not in narrow[0].ops[i].machine_options
+    assert "CNC9" in wide[0].ops[i].machine_options
+    # Allotted stays first, so the op's KIND (read off options[0]) cannot change.
+    assert wide[0].ops[i].machine_options[0] == narrow[0].ops[i].machine_options[0]
+    assert wide[0].ops[i].kind == narrow[0].ops[i].kind

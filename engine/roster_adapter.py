@@ -68,7 +68,11 @@ def run(batches, config=None, notes=None, masters=None, machine_lost_min=None,
     if not batches or masters is None:
         return []
 
-    jobs, batch_by_key, skipped = build_jobs(batches, masters)
+    # flexible_machines is OPTIMIZER-OWNED (never hand-set in Settings, exactly
+    # like the tuned overlap): False = the Allotted machine only, True = the
+    # Allotted+Suggested union. See roster_engine.domain._candidates.
+    flexible = bool(getattr(config, "flexible_machines", False))
+    jobs, batch_by_key, skipped = build_jobs(batches, masters, flexible)
     if skipped:
         say.append("skipped %d item(s) with no routing: %s"
                    % (len(skipped), ", ".join(sorted(skipped)[:5])))
@@ -119,7 +123,8 @@ def optimize_sequence(so_lines, config, masters, *, reserved=None, budget_evals=
     if not batches:
         return OptimizeResult()
     say: list = []
-    jobs, batch_by_key, _skipped = build_jobs(batches, masters)
+    flexible = bool(getattr(config, "flexible_machines", False))
+    jobs, batch_by_key, _skipped = build_jobs(batches, masters, flexible)
     if not jobs:
         return OptimizeResult()
     shop = build_shop(masters, _absent_from_reserved(reserved, masters, say))
