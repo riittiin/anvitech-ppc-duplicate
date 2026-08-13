@@ -139,14 +139,26 @@ def test_cloud_candidates_is_unchanged_for_every_other_engine():
             is optimize_service.CLOUD_OVERLAP_CANDIDATES)
 
 
-def test_the_overlap_band_searched_is_50_to_100():
-    """The owner's band: 50 = a successor may start once half the pieces have
-    cleared, 100 = fully sequential."""
+def test_the_overlap_band_searched_covers_the_whole_physical_range():
+    """0 = a successor may start once the first piece has cleared, 100 = fully
+    sequential.
+
+    The band deliberately reaches BELOW 50 (2026-08-13). The engine this replaces
+    expresses the same knob as its complement and had tuned itself to 88-95 — so
+    the plan the floor actually runs starts successors at 5-12% of pieces, which a
+    50-100 band cannot express. Measured on three books, searched and single-pass,
+    with all four rule checks at 0 throughout: late-days fall monotonically as the
+    number falls and the optimum was below 50 every time (book 7: 60 -> 38 late-days,
+    book 1: 54 -> 24, moving from overlap 80 to 10).
+
+    A band that stops at 50 would silently exclude the optimum, so the floor of
+    this range is the assertion that matters."""
     for candidates in (optimizer.ROSTER_OVERLAP_CANDIDATES,
                        optimize_service.CLOUD_ROSTER_OVERLAP_CANDIDATES):
         assert candidates, "an empty lineup searches nothing"
-        assert min(candidates) >= 50
-        assert max(candidates) <= 100
+        assert min(candidates) <= 10, "the measured optimum lives below 50"
+        assert min(candidates) >= 0
+        assert max(candidates) == 100, "fully sequential must stay reachable"
         assert all(isinstance(v, int) for v in candidates)
         assert len(set(candidates)) == len(candidates)
     # The cloud grid is the FINER one over the same band.

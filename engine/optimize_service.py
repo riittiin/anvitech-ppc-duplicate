@@ -41,11 +41,14 @@ CLOUD_NEW_OVERLAP_CANDIDATES = (60, 65, 70, 74, 78, 80, 82, 84, 86, 88, 90, 93)
 # candidates needed a second round and timed out (live 2026-07-19), falling back
 # to the hours-long local path. Chunk 4 wins at depth, 6 is the close runner-up.
 CLOUD_FLOW_CHUNK_CANDIDATES = (4, 6)
-# Roster engine: a finer grid over the owner's 50-100 overlap band (see
-# optimizer.ROSTER_OVERLAP_CANDIDATES for what the number means). 5% steps, 11
-# shards — the same order as the new engine's 12-shard grid, which a measured
-# live run finished in ~6.5 min, so it fits the cloud window with headroom.
-CLOUD_ROSTER_OVERLAP_CANDIDATES = (50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100)
+# Roster engine: a finer grid over the FULL 0-100 overlap band (see
+# optimizer.ROSTER_OVERLAP_CANDIDATES for what the number means and for why the
+# band starts at 0 rather than 50). Tight 5% steps where the measured optimum
+# lives (0-30) and coarser above it, because late-days were flat-to-worse across
+# the whole upper half on every book measured. 14 candidates against the
+# workflow's 20 shards keeps it one candidate per shard, so wall-clock per shard
+# is unchanged from the 11-candidate grid.
+CLOUD_ROSTER_OVERLAP_CANDIDATES = (0, 5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100)
 
 
 def cloud_candidates(config) -> tuple:

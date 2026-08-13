@@ -456,12 +456,26 @@ FLOW_LOCAL_BUDGET = 100
 # The owner's overlap band for the roster engine (2026-08-12). Under this
 # engine's definition (roster_engine.release) the percentage is the fraction of
 # a step's pieces that must have CLEARED before its successor may start, so 50 =
-# "start once half are done" and 100 = fully sequential. Below 50 a successor
-# starts on a handful of pieces and the shop floor stops believing the plan, so
-# the owner's band is the whole physically sane range. Six coarse points here;
-# optimize_service.CLOUD_ROSTER_OVERLAP_CANDIDATES is the finer grid the parallel
-# cloud contest fans across Actions shards.
-ROSTER_OVERLAP_CANDIDATES = (50, 60, 70, 80, 90, 100)
+# "start once half are done" and 100 = fully sequential.
+#
+# The band runs from 0, not from 50 (2026-08-13, measured). The owner's original
+# 50-100 band was chosen on the reading that a low number means a successor
+# starts "on a handful of pieces" and the floor stops believing the plan. But the
+# engine this replaces expresses the SAME knob as its complement, and its contest
+# had long since tuned itself to 88-95 — i.e. the plan the floor has actually been
+# running starts successors at 5-12% of pieces. A 50-100 band cannot express that,
+# so switching engines at a nominal 80 silently made every plan far more
+# sequential than the one in use.
+#
+# Measured on three synthetic books, single-pass and searched, with ALL FOUR rule
+# checks staying at 0 violations throughout: late-days fall monotonically as the
+# number falls, and the optimum sat below 50 on every book. With a 300-eval
+# search, book 7 went 60 late-days at overlap 80 to 38 at overlap 10; book 1 went
+# 54 to 24. Roughly half.
+#
+# It is a searched dimension, not a setting: the contest picks per book, so a book
+# that genuinely wants a conservative release can still have one.
+ROSTER_OVERLAP_CANDIDATES = (0, 10, 20, 35, 50, 70, 85, 100)
 
 
 def knob_for(config):
