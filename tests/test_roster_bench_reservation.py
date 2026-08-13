@@ -191,11 +191,18 @@ _MONOTONE_CASES = [
 def test_adding_a_qualification_never_makes_a_book_unschedulable():
     """The property, over eight crews. A Settings assignment is the admin
     TELLING the planner something is possible; it may cost the plan nothing and
-    it may gain it something, but it can never take an option away."""
+    it may gain it something, but it can never take an option away.
+
+    2026-08-13 review finding: this used to be `assert True, label` after two
+    bare `_plan(...)` calls, non-vacuous only because `_plan` raises
+    `Unschedulable` when the fix is reverted — a future `try/except` or
+    refactor around either call would make it silently green. Bind the plans
+    and assert on them directly, so the assertion itself is what fails."""
     for label, base, name, extra in _MONOTONE_CASES:
-        _plan(base)                       # the narrower crew plans...
-        _plan(_add(base, name, extra))    # ...so the broader one must too
-        assert True, label
+        narrow_plan, _jobs = _plan(base)              # the narrower crew plans...
+        broad_plan, _jobs = _plan(_add(base, name, extra))
+        assert narrow_plan.placements, label
+        assert broad_plan.placements, label           # ...so the broader one must too
 
 
 def test_adding_a_qualification_never_worsens_the_score():
@@ -520,6 +527,46 @@ def test_a_projection_alone_never_takes_the_last_machining_operator():
         _win(), shop, {"CNC1": 100.0, "MD1": 900.0}, {}, {},
         ready={"CNC1": 100.0})
     assert got == {"CNC1": "Anturam"}
+
+
+def test_an_explicit_empty_ready_is_not_silently_treated_as_none():
+    """2026-08-13 review finding. ``ready=None`` means a caller supplied NO
+    information and gets the conservative fallback (everything demanded is
+    read as standing, so the guard above protects Anturam's only seat exactly
+    as ``ready={"CNC1": 100.0}`` does in the test above — both feed the guard
+    the same CNC1=100 figure). ``ready={}``, in contrast, is an INFORMED claim
+    that nothing anywhere is standing right now, not even CNC1 itself — the
+    same 900-minute-projected-bench setup, but now CNC1's own demand is also
+    only projected. Taken at its word, the seat is exactly as speculative as
+    the bench's promise, so the guard has nothing left to protect and the
+    reservation may take it.
+
+    ``(ready if ready else demand)`` could not tell ``None`` and ``{}`` apart —
+    both are falsy in Python — so an explicit "nothing is standing anywhere"
+    silently fell back to ``demand`` and inherited the conservative guard,
+    which is exactly mutation M3 (the reviewer measured it costs an
+    already-working book 51 -> 54 late-days). This is the same defect as the
+    reproduction above, only visible with the last operator on the last
+    machine, where the guard's own protection is the thing being bypassed.
+    """
+    machines = {
+        "CNC1": Machine("CNC1", "CNC 1", "CNC lathe", available_hrs_per_day=19.5),
+        "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5),
+    }
+    shop = _shop([_op("Anturam", ("CNC1", "MD1"))], machines=machines)
+    demand = {"CNC1": 100.0, "MD1": 900.0}
+
+    conservative = roster.roster_for_shift(_win(), shop, demand, {}, {},
+                                           ready=None)
+    assert conservative == {"CNC1": "Anturam"}, (
+        "ready=None must stay the CONSERVATIVE fallback (= demand), which "
+        f"protects the only operator's only seat: got {conservative}")
+
+    informed = roster.roster_for_shift(_win(), shop, demand, {}, {},
+                                       ready={})
+    assert informed != conservative, (
+        "an explicit empty ready was silently coerced to the same "
+        f"conservative fallback as ready=None: {informed}")
 
 
 def test_a_part_in_the_chuck_is_given_up_last():

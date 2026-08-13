@@ -96,12 +96,23 @@ def roster_for_shift(window, shop, demand: dict, in_progress: dict,
                      the shift. Manual and inspection benches are staffed from
                      whoever this matching does not take, so a bench with work in
                      this map must be left somebody who can do it — see
-                     ``_match_reserving_benches``'s guard. None/empty falls back
-                     to ``demand``, which is the CONSERVATIVE reading: a caller
-                     that says nothing about what is standing has every machining
-                     minute treated as standing, so the guard is at its strongest
-                     and a reservation fires only where it demonstrably cannot
-                     darken machining.
+                     ``_match_reserving_benches``'s guard. ``None`` — a caller
+                     that supplies no information at all — falls back to
+                     ``demand``, which is the CONSERVATIVE reading for the
+                     GUARD: every machining minute is treated as standing, so
+                     a reservation is blocked wherever it would darken a
+                     machine with real (demand-based) work. It is NOT
+                     conservative for the bench: the same ``demand`` fallback
+                     also makes every demanded bench read as standing, which
+                     is the STRONGEST (least selective) reservation — it
+                     hands out the cheapest assigned seat unconditionally,
+                     not only a speculative one. An explicit empty dict
+                     (``{}``) is a different statement from ``None`` — "I
+                     checked, and nothing anywhere is standing right now" —
+                     and is taken at its word rather than folded into
+                     ``demand``: every bench reads as merely projected and
+                     every machining seat, having nothing standing at it
+                     either, is exactly as tradeable as the bench's promise.
 
     Returns:
         {machine_id: operator_name}. A machine absent from the result is dark this
@@ -150,7 +161,7 @@ def roster_for_shift(window, shop, demand: dict, in_progress: dict,
                 value += PREFERRED_BONUS
             values[(r, c)] = value
 
-    standing = {mid: float((ready if ready else demand).get(mid, 0.0))
+    standing = {mid: float((ready if ready is not None else demand).get(mid, 0.0))
                 for mid in shop.machines}
     matched = _match_reserving_benches(
         values, operators, machines,
