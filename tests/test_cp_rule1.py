@@ -349,6 +349,62 @@ def test_a_step_that_lands_on_a_cnc_is_manned_whatever_its_kind(hold):
         f"{res.manned}")
 
 
+def test_a_step_on_a_cnc_may_be_held_across_a_dark_shift_whatever_its_kind():
+    """The span rule follows the MACHINE too, not the step's kind.
+
+    Same routing, same machine, same crew as the test above, just long enough to
+    outlast a shift: 2,000 minutes of work whose only available machine is a
+    rostered CNC. E2 must hold it across the dark second shift exactly as it does
+    for a machining-kind step, and E1 must refuse to span it exactly as it does
+    there. Judged by kind instead, this step is roster-covered but forbidden to
+    idle, so the encoding that exists to make a plan possible produces none."""
+    machines = {"CNC1": Machine("CNC1", "CNC 1", "CNC lathe",
+                                available_hrs_per_day=19.5),
+                "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5)}
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None,
+                      [_proc("MD1/CNC1", cycle=5.0, name="DEBURING")])},
+        [_op("Pravin", ["CNC1"])], machines=machines)   # nobody can run MD1
+    batches = [_B("B1", "A", 400)]
+
+    assert not _solve_tiny(masters, batches, hold=False).ok
+
+    res = _solve_tiny(masters, batches, hold=True)
+    assert res.ok
+    assert res.machine_of[("B1", 1)] == "CNC1"
+    assert res.span[("B1", 1)] == (0, 5780)     # no setup on a manual step
+    dark = [s for s in res.built.shifts
+            if _runs_in(res, ("B1", 1), s)
+            and ("CNC1", s.index) not in res.manned]
+    assert dark                                 # it really did span a dark shift
+
+
+@pytest.mark.parametrize("hold", [True, False])
+def test_only_a_step_that_can_reach_a_rostered_machine_may_idle(hold):
+    """The other direction of the same rule, and the reason it is an ``any()``
+    over the machine options rather than a kind test.
+
+    Holding a part costs occupancy: an interval stretched over a dark shift keeps
+    its machine for the whole span. A step that can never land on a rostered
+    machine is answerable to no roster, so it has nothing to wait for and must
+    not be allowed to sprawl — E2 relaxes exactly what E2 constrains, and nothing
+    else."""
+    machines = {"CNC1": Machine("CNC1", "CNC 1", "CNC lathe",
+                                available_hrs_per_day=19.5),
+                "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5)}
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None,
+                      [_proc("MD1", cycle=2.0, name="DEBURING", seq=1),
+                       _proc("CNC1", cycle=5.0, seq=2)])},
+        [_op("Anturam", ["MD1"]), _op("Pravin", ["CNC1"])], machines=machines)
+    res = _solve_tiny(masters, [_B("B1", "A", 10)], hold=hold)
+    assert res.ok
+    idle_ok = {key: res.built.data.tasks[idx].allow_idle
+               for key, idx in res.built.task_of.items()}
+    assert idle_ok[("B1", 1)] is False           # bench only: no roster to wait on
+    assert idle_ok[("B1", 2)] is hold            # can reach CNC1: E2's to hold
+
+
 def test_an_absent_operator_does_no_bench_work_either():
     """Rule 1's CNC/VMC scope is about ROSTERING. Absence is physical
     unavailability and binds everyone — a man away from the shop is not deburring

@@ -140,12 +140,20 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
             if op.kind != OUTSOURCED and (qty <= 0 or not op.machine_options):
                 continue
 
-            # allow_idle, on a machining task, is EXACTLY Rule 2's "the part
-            # stays in the chuck across an unmanned shift": the machine is held,
-            # the clock runs, and nothing is cut. Off under E1, where an
-            # operation may not span a dark shift at all, and off always for
-            # manual/inspection tasks, which Rule 1 does not bind (spec §5.2).
-            hold = hold_across_unmanned_shift and op.kind == MACHINING
+            # allow_idle is EXACTLY Rule 2's "the part stays in the chuck across
+            # an unmanned shift": the machine is held, the clock runs, and
+            # nothing is cut. Off under E1, where an operation may not span a
+            # dark shift at all (spec §5.2).
+            #
+            # Keyed on the MACHINE, like the modes below and like the roster
+            # itself — on whether this step can land somewhere Rule 1 rosters,
+            # never on the step's own kind. A routing written MD1/CNC1 is a
+            # manual-KIND step (the kind is read off the first option) that can
+            # run on a rostered CNC: judged by kind it would be roster-covered
+            # and yet forbidden to idle, so E2 — the encoding whose whole purpose
+            # is to make such a plan possible — would return no plan at all.
+            hold = hold_across_unmanned_shift and any(
+                mid in shop.machining_ids for mid in op.machine_options)
             task = m.add_task(job=cp_job, allow_breaks=True, allow_idle=hold,
                               name=f"{job.key}/{op.seq}")
             idx = len(task_of)
