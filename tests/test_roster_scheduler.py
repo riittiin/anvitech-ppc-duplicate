@@ -400,10 +400,14 @@ def test_a_carried_over_machine_always_reports_positive_demand():
     state["B1"].on_machine = "CNC1"
     ms = scheduler._MachineState()
     ms.job_key, ms.op_seq, ms.remaining = "B1", 1, 240.0
-    demand, in_progress = scheduler._shift_demand(
+    demand, ready, in_progress = scheduler._shift_demand(
         ["B1"], state, {"CNC1": ms}, window, 1.0, 90.0)
     assert in_progress == {"CNC1": "B1"}
     assert demand.get("CNC1", 0.0) >= 240.0
+    # A part in the chuck is standing at that machine, not merely projected to
+    # arrive there — the bench reservation reads `ready`, so the two maps must
+    # agree about a carry-over exactly as `demand` and `in_progress` do.
+    assert ready.get("CNC1", 0.0) >= 240.0
 
 
 def test_frozen_none_empty_and_absent_behave_identically():

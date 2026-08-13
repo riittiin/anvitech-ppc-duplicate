@@ -423,11 +423,11 @@ def _release_moment(segments, need: float):
 
 def _run_shift(window, cursor, order, state, machines, shop, crew_rank, overlap,
                setup_min, placements, completion):
-    demand, in_progress = _shift_demand(order, state, machines, window, overlap,
-                                        setup_min)
+    demand, ready, in_progress = _shift_demand(order, state, machines, window,
+                                               overlap, setup_min)
     prefer = _preferred_operators(state, machines)
     rostered = crew.roster_for_shift(window, shop, demand, in_progress, crew_rank,
-                                     prefer=prefer)
+                                     prefer=prefer, ready=ready)
     floating = _floating_operators(shop, window, set(rostered.values()))
 
     # A CNC/VMC has ONE person for the whole shift; a bench has a POOL, and who
@@ -494,21 +494,40 @@ def _run_shift(window, cursor, order, state, machines, shop, crew_rank, overlap,
 
 
 def _shift_demand(order, state, machines, window, overlap, setup_min):
-    """(machine -> minutes of work it could run this shift, machine -> job in it).
+    """(machine -> minutes it could run this shift, machine -> minutes STANDING at
+    it now, machine -> job in it).
 
-    This is what the roster maximises coverage of, so it must see work that
-    ARRIVES during the window, not only work that is ready at its start: a
+    The first map is what the roster maximises coverage of, so it must see work
+    that ARRIVES during the window, not only work that is ready at its start: a
     successor released by overlap at 10:50 needs its machine manned from 08:00.
     Each job is therefore walked FORWARD along its routing, carrying the moment
     each step could open, until that moment leaves the window.
 
-    Every machine holding a part reports at least the minutes still left on it.
-    The roster hands an ``in_progress`` machine a dominating CARRY_BONUS, so the
-    two must agree — reporting zero demand for a machine that is nevertheless
+    The second map is the SAME walk restricted to each job's CURRENT step — work
+    whose predecessors are already done, so it is physically waiting at that
+    machine rather than merely projected to arrive. It is not a second
+    derivation: it is this walk, tapped one step earlier, so the two can never
+    disagree.
+
+    The roster needs BOTH, and reads them for different purposes
+    (``roster._match_reserving_benches``). It reserves bench capacity against the
+    projection, because benches are staffed reactively during a shift while the
+    roster is fixed at its start. But what it is willing to GIVE UP for that
+    reservation is judged on this map alone — a machining seat may never be
+    surrendered on a promise. Reserving a helper for a bench whose feeder has not
+    run is how the deadlock is created in the OTHER direction: one operator, one
+    CNC, one bench — the projected bench work takes the operator, the CNC goes
+    dark, and the bench work he was reserved for never arrives.
+
+    Every machine holding a part reports at least the minutes still left on it,
+    in BOTH maps — a part in the chuck is as standing-there as work gets. The
+    roster hands an ``in_progress`` machine a dominating CARRY_BONUS, so the two
+    must agree — reporting zero demand for a machine that is nevertheless
     rostered on carry-over would spend a scarce operator on an empty chuck while a
     machine with real work went dark (Task 4 review, carried forward).
     """
     demand: dict = {}
+    ready: dict = {}
     for key in order:
         js = state[key]
         ops = js.job.ops
@@ -533,6 +552,8 @@ def _shift_demand(order, state, machines, window, overlap, setup_min):
                     targets = op.machine_options
                 for mid in targets:
                     demand[mid] = demand.get(mid, 0.0) + left
+                    if idx == js.idx:
+                        ready[mid] = ready.get(mid, 0.0) + left
             if idx + 1 >= len(ops):
                 break
             if rel.overlaps(op, ops[idx + 1]):
@@ -549,7 +570,8 @@ def _shift_demand(order, state, machines, window, overlap, setup_min):
         if ms.job_key is not None and ms.remaining > _EPS:
             in_progress[mid] = ms.job_key
             demand[mid] = max(demand.get(mid, 0.0), float(ms.remaining))
-    return demand, in_progress
+            ready[mid] = max(ready.get(mid, 0.0), float(ms.remaining))
+    return demand, ready, in_progress
 
 
 def _floating_operators(shop, window, rostered_names) -> list:
