@@ -412,6 +412,20 @@ def _inputs_signature(config: Config) -> str:
     d["flow_fingerprint"] = _flow.FLOW_FINGERPRINT
     from engine import new_engine as _new
     d["new_engine_fingerprint"] = _new.SCHEDULER_FINGERPRINT
+    # The roster engine's own semantics version, folded in ONLY when roster is the
+    # selected scheduler. Adding it unconditionally (as the three above are) would
+    # move every classic/flow/new signature the moment this line shipped, and
+    # instantly flag the owner's applied optimization stale with a "re-run the deep
+    # search" banner on a site nobody has switched engines on.
+    if getattr(config, "scheduler", "classic") == "roster":
+        from roster_engine import SCHEDULER_FINGERPRINT as _roster_fp
+        d["roster_engine_fingerprint"] = _roster_fp
+    # The crew genome is a real plan input when it is set (replay the same ranks
+    # against a different roster and the plan moves), but it must be INVISIBLE when
+    # it is not: leaving `None` in the blob would change the signature for every
+    # engine simply because the field now exists.
+    if not d.get("crew_rank"):
+        d.pop("crew_rank", None)
     # Operators live in the store now, so the masters sha no longer covers them.
     # Fold ONLY the table's sorted row CONTENT (name/machines/shift/pin) into
     # the blob so a rotation or an operator edit correctly flags the applied
@@ -1704,7 +1718,8 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
                                winner_overlap=sw.overlap_percent,
                                winner_flexible=sw.flexible_machines, ranks=res.ranks,
                                best=res.best, evals=sw.evals, table=sw.table,
-                               cancelled=sw.cancelled)
+                               cancelled=sw.cancelled,
+                               crew_rank=getattr(sw, "crew_rank", None))
         except Exception as e:  # noqa: BLE001 — a failed search must report, not hang
             with _OPTIMIZE_LOCK:
                 _OPTIMIZE.update(state="failed", error=str(e), cancel=False)
@@ -1915,7 +1930,7 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
 
 def _finalize_optimize(job_id, base_config, real_baseline, label, *,
                        winner_overlap, winner_flexible=False, ranks, best, evals,
-                       table, cancelled):
+                       table, cancelled, crew_rank=None):
     """Store a finished contest (local sweep OR cloud worker result) as the
     Optimize outcome — one place computes improved/inputs_sig for both paths."""
     # THE PLAN CLOCK STARTS HERE — only while PLAN_START_NEXT_HOUR is on (2026-08-07
@@ -1937,8 +1952,10 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
     # 52.5-vs-55.6 gap). Recomputing here makes "shown" == "applied" by construction.
     # Both `best` and `real_baseline` (already local) are then on the same footing, so
     # `improved` is judged honestly. Keep the contest's number only if the replay fails.
+    crew_rank = dict(crew_rank or {})
     if ranks:
-        _local_best = _metrics_for_ranks(ranks, winner_overlap, winner_flexible)
+        _local_best = _metrics_for_ranks(ranks, winner_overlap, winner_flexible,
+                                         crew_rank=crew_rank)
         if _local_best is not None:
             best = _local_best
     # `real_baseline` was measured when the contest STARTED, on the previous plan clock.
@@ -1957,9 +1974,13 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
     # overlap into the saved plan config, so the staleness check must
     # compare future plans against exactly that config.
     _knob, _ = optimizer.knob_for(base_config)
-    inputs_sig = _inputs_signature(replace(base_config,
-                                           flexible_machines=bool(winner_flexible),
-                                           **{_knob: winner_overlap}))
+    _won_config = replace(base_config, flexible_machines=bool(winner_flexible),
+                          **{_knob: winner_overlap})
+    if crew_rank:
+        # Apply persists the crew genome into the saved config too, so it belongs in
+        # the fingerprint for the same reason the overlap does.
+        _won_config = replace(_won_config, crew_rank=dict(crew_rank))
+    inputs_sig = _inputs_signature(_won_config)
     with _OPTIMIZE_LOCK:
         if _OPTIMIZE["job_id"] != job_id:
             return False
@@ -1977,6 +1998,9 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
                     "knob": _knob,
                     "flexible_machines": bool(winner_flexible),
                     "current_flexible": bool(getattr(base_config, "flexible_machines", False)),
+                    # The roster engine's winning crew genome ({} for every other
+                    # engine). Persisted by _optimize_apply beside the ranks.
+                    "crew_rank": crew_rank,
                     "sweep_table": table})
         # Record a "last searched" marker for EVERY completed contest — not
         # just an applied one — so a redundant Done click (no improvement
@@ -2171,7 +2195,8 @@ def _movement_note(new_ranks):
     return _format_movers(movers)
 
 
-def _metrics_for_ranks(ranks, overlap=None, flexible=None, *, with_distribution=True):
+def _metrics_for_ranks(ranks, overlap=None, flexible=None, *, with_distribution=True,
+                       crew_rank=None):
     """Metrics of the plan that replays ``ranks`` through the SAME local path ``_plan``
     uses (optionally at a given overlap). This is the ONE source of truth for "what
     this optimized plan achieves": the contest (cloud worker OR local sweep) can report
@@ -2186,6 +2211,11 @@ def _metrics_for_ranks(ranks, overlap=None, flexible=None, *, with_distribution=
             config = replace(config, **{knob: overlap})
         if flexible is not None:
             config = replace(config, flexible_machines=bool(flexible))
+        if crew_rank:
+            # The roster engine's second genome. Apply has not persisted it yet at
+            # this point, so replaying without it would measure the winning ranks
+            # against the OLD roster and report a plan the apply does not reproduce.
+            config = replace(config, crew_rank=dict(crew_rank))
         masters = _current_masters()
         actuals = book_store.load_actuals()
         orders = book_store.load_active_orders()
@@ -2309,6 +2339,8 @@ def _optimize_apply():
                 "covered": len(res["ranks"]),
                 "inputs_sig": res.get("inputs_sig"),
                 "best_overlap": res.get("best_overlap"),
+                # The roster engine's winning crew genome ({} for every other engine).
+                "crew_rank": dict(res.get("crew_rank") or {}),
                 "book_sig": _current_book_sig(),
                 # The date this optimization's clock started from. A later day must
                 # re-search rather than replay a sequence built for another start.
@@ -2343,6 +2375,14 @@ def _optimize_apply():
             target = replace(target, **{knob: best_ov})
         if best_flex is not None:
             target = replace(target, flexible_machines=bool(best_flex))
+        # The roster engine's crew genome is a plan input exactly like the overlap:
+        # replay the same ranks against a different roster and the plan moves. Persist
+        # it so every later plan rebuilds the SAME roster — a stable crew for the
+        # floor, not a fresh one on every refresh. An EMPTY genome is never written:
+        # every other engine returns one, and it must not wipe what is on file.
+        best_crew = res.get("crew_rank")
+        if best_crew:
+            target = replace(target, crew_rank=dict(best_crew))
         if target.to_dict() != cfg.to_dict():
             book_store.save_plan_config(json.dumps(target.to_dict()))
         # Clear the in-memory job so a later page refresh doesn't re-show the
@@ -3024,6 +3064,9 @@ class WorkerResult(BaseModel):
     rows: list = Field(default_factory=list)
     evals: int = 0
     cancelled: bool = False
+    # Forward-compatible: today's worker never sends this (scripts/ is deliberately
+    # untouched), so the roster's crew genome is recovered from `rows` instead.
+    crew_rank: dict = Field(default_factory=dict)
     error: Optional[str] = None
 
 
@@ -3092,7 +3135,15 @@ def optimize_result_ep(req: WorkerResult, request: Request):
                                 winner_overlap=req.winner_overlap,
                                 winner_flexible=bool(req.winner_flexible),
                                 ranks=req.ranks, best=req.best, evals=req.evals,
-                                table=req.rows, cancelled=req.cancelled)
+                                table=req.rows, cancelled=req.cancelled,
+                                # A worker posts the MERGED table, which carries no
+                                # top-level crew field (scripts/ is untouched, and an
+                                # in-flight old worker could not send one anyway), so
+                                # the winner's roster is read back out of its row.
+                                crew_rank=(req.crew_rank or
+                                           optimize_service.crew_rank_of_winner(
+                                               req.rows, req.winner_overlap,
+                                               bool(req.winner_flexible), req.best)))
     if not stored:
         raise HTTPException(status_code=409, detail="job superseded")
     return {"ok": True}
@@ -3154,7 +3205,8 @@ def _finalize_from_shards(job_id):
                        winner_flexible=bool(merged["winner_flexible"]),
                        ranks=merged["ranks"], best=merged["best"],
                        evals=merged["evals"], table=merged["rows"],
-                       cancelled=merged["cancelled"])
+                       cancelled=merged["cancelled"],
+                       crew_rank=merged.get("winner_crew_rank"))
 
 
 @app.post("/optimize/shard-result")

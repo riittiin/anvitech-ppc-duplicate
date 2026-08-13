@@ -84,6 +84,132 @@ def run(batches, config=None, notes=None, masters=None, machine_lost_min=None,
     return _entries(plan, batch_by_key)
 
 
+# --------------------------------------------------------------------------- #
+# The Optimize feature's entry points
+# --------------------------------------------------------------------------- #
+
+def optimize_sequence(so_lines, config, masters, *, reserved=None, budget_evals=150,
+                      seed=42, on_progress=None, should_cancel=None, frozen=None):
+    """Sequence + CREW search at this config's overlap, as an ``OptimizeResult``.
+
+    The cloud contest sweeps the overlap EXTERNALLY (one Actions shard per
+    candidate) and calls this once per candidate, so across candidates it becomes
+    the full overlap x sequence x crew contest — distributed. The app's own result
+    type is returned so the contest, the panel and the apply path are unchanged;
+    the winning crew genome rides on ``OptimizeResult.crew_rank``.
+
+    ``frozen`` is not optional decoration here. Unlike the retired classic/flow
+    engines, ``run()`` HONOURS it (it pins in-progress work to the machine it is
+    physically on), so a search that ignored it would score every candidate on a
+    plan the app will never build, and the ranks it picked would be answers to the
+    wrong question.
+    """
+    from engine.optimizer import OptimizeResult, plan_metrics, ranks_for
+    from engine.rules import rule1_consolidate
+    from roster_engine import search as roster_search
+
+    config.validate()
+    batches = rule1_consolidate.run(list(so_lines), config=config, masters=masters)
+    if not batches:
+        return OptimizeResult()
+    say: list = []
+    jobs, batch_by_key, _skipped = build_jobs(batches, masters)
+    if not jobs:
+        return OptimizeResult()
+    shop = build_shop(masters, _absent_from_reserved(reserved, masters, say))
+    pins = _pins(frozen, batch_by_key, masters, say)
+
+    # The progress hook is called with metrics=None for a candidate that could not
+    # be scheduled at all — a NORMAL event in this search (an infeasible crew
+    # genome), not an error. The app only wants the running count, and its own
+    # ``best`` is recomputed at finalize, so the metrics object is deliberately not
+    # forwarded: it is roster_engine's type, not the dict every caller expects.
+    prog = (lambda evals, _metrics: on_progress(evals, None)) if on_progress else None
+
+    res = roster_search.optimize(jobs, shop, config, overlap=_overlap(config),
+                                 budget_evals=int(budget_evals), seed=int(seed),
+                                 on_eval=prog, should_cancel=should_cancel,
+                                 frozen=pins)
+    ordered = [batch_by_key[k] for k in res.sequence if k in batch_by_key]
+    if not ordered:
+        return OptimizeResult(evals=res.evaluations, cancelled=res.cancelled)
+    crew = dict(res.crew_rank or {})
+    # Measure the winner by REPLAYING it exactly as the app will: same sequence,
+    # same crew, same frozen pins, same reservations. Anything else re-opens the
+    # 2026-07-25 "the panel promised a plan the apply did not reproduce" gap.
+    from dataclasses import replace as _replace
+    winner = run(ordered, config=_replace(config, crew_rank=crew), masters=masters,
+                 reserved=reserved, frozen=frozen)
+    plan_start = getattr(config, "plan_start_date", None)
+    metrics = plan_metrics(
+        winner, so_lines, plan_start,
+        ceiling_days=getattr(config, "worst_ceiling_days", None),
+        with_distribution=True,
+        promise_slack_days=getattr(config, "committed_promise_slack_days", 3))
+    return OptimizeResult(ranks=ranks_for(ordered), best=metrics,
+                          evals=res.evaluations, improved=True,
+                          cancelled=res.cancelled, crew_rank=crew)
+
+
+def sweep_optimize(so_lines, config, masters, *, budget_evals=150, seed=42,
+                   on_progress=None, should_cancel=None, base_reserved=None,
+                   frozen=None, **kw):
+    """Local fallback for "Start deep search": run the sequence+crew search once
+    per overlap contender and keep the best plan. The cloud path fans the SAME
+    contenders across Actions shards, so the two agree by construction.
+
+    Fair-contest contract, unchanged from the classic sweep: every contender gets
+    the same depth, the current setting runs first (an early Stop leaves it fully
+    searched) and wins exact ties.
+    """
+    from dataclasses import replace as _replace
+
+    from engine.optimizer import (ROSTER_OVERLAP_CANDIDATES, OptimizeResult,
+                                  SweepResult, score, sweep_contenders)
+
+    current = getattr(config, "overlap_percent", None)
+    lineup = sweep_contenders(current, ROSTER_OVERLAP_CANDIDATES)
+    each = max(1, int(budget_evals) // max(1, len(lineup)))
+
+    spent = {"n": 0}
+    table, cancelled = [], False
+    best = None                      # (score, overlap, OptimizeResult)
+
+    def _offset(cb):
+        if cb is None:
+            return None
+        return lambda evals, metrics: cb(spent["n"] + evals, metrics)
+
+    for overlap in lineup:
+        if should_cancel and should_cancel():
+            cancelled = True
+            break
+        res = optimize_sequence(so_lines, _replace(config, overlap_percent=int(overlap)),
+                                masters, reserved=base_reserved, budget_evals=each,
+                                seed=seed, on_progress=_offset(on_progress),
+                                should_cancel=should_cancel, frozen=frozen)
+        spent["n"] += res.evals
+        cancelled = cancelled or res.cancelled
+        table.append({"overlap": int(overlap), "eligible": True,
+                      "best": res.best, "evals": res.evals})
+        if res.best is None:
+            continue
+        row = (score(res.best), int(overlap), res)
+        if best is None or row[0] < best[0]:     # strict: an exact tie keeps first
+            best = row
+
+    if best is None:
+        return SweepResult(overlap_percent=int(current or 0), knob="overlap_percent",
+                           result=OptimizeResult(evals=spent["n"], cancelled=cancelled,
+                                                 best=None),
+                           table=table, evals=spent["n"], cancelled=cancelled)
+    _sc, overlap, res = best
+    return SweepResult(overlap_percent=overlap, knob="overlap_percent",
+                       flexible_machines=False, result=res, table=table,
+                       evals=spent["n"], cancelled=cancelled,
+                       crew_rank=dict(res.crew_rank or {}))
+
+
 def _rule_error(err) -> RuleError:
     """``roster_engine`` fails loud with its own ``Unschedulable`` — it knows
     nothing about this app and must not, so it cannot raise ``RuleError`` itself.

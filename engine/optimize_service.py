@@ -405,7 +405,13 @@ def run_candidate(payload: dict, overlap: int, flexible: bool = False, *, on_pro
                              on_progress=on_progress, should_cancel=should_cancel)
     return {"overlap": int(overlap), "flexible": bool(flexible),
             "seed": int(payload["seed"] if seed is None else seed), "eligible": True,
-            "best": res.best, "evals": res.evals, "ranks": res.ranks, "cancelled": res.cancelled}
+            "best": res.best, "evals": res.evals, "ranks": res.ranks,
+            # The roster engine's second genome. A row is ALL the app ever sees of a
+            # cloud candidate, so without it here the winning ranks would be applied
+            # and then replayed against a different roster — a plan nobody searched.
+            # {} for every other engine (they have no crew dimension).
+            "crew_rank": dict(getattr(res, "crew_rank", None) or {}),
+            "cancelled": res.cancelled}
 
 
 # Subprocess plumbing: a plain module-level initializer + runner so the pool
@@ -526,18 +532,49 @@ def merge_shard_rows(payload: dict, rows: list, evals: int, cancelled: bool) -> 
     cur_value = getattr(config, knob)
     cur_flex = bool(getattr(config, "flexible_machines", False))
     winner = pick_winner(cur_value, cur_flex, rows, base_seed=int(payload["seed"]))
-    table = [{k: r[k] for k in ("overlap", "flexible", "seed", "eligible", "best", "evals")
+    # ``crew_rank`` is kept in the STRIPPED table on purpose. The non-sharded cloud
+    # worker posts this table back as its ``rows`` (scripts/cloud_optimize_worker.py,
+    # untouched here) and no top-level crew field survives that hop, so the table is
+    # the only place the app can recover the winner's roster from — see
+    # ``crew_rank_of_winner``. ``ranks`` stays stripped: it is posted separately and
+    # is far larger.
+    table = [{k: r[k] for k in ("overlap", "flexible", "seed", "eligible", "best",
+                                "evals", "crew_rank")
               if k in r} for r in rows]
     if winner is None:
         return {"winner_overlap": cur_value, "winner_flexible": cur_flex, "rows": table,
-                "knob": knob, "best": None, "ranks": {}, "evals": evals,
-                "cancelled": cancelled}
+                "knob": knob, "best": None, "ranks": {}, "winner_crew_rank": {},
+                "evals": evals, "cancelled": cancelled}
     return {"winner_overlap": winner["overlap"], "winner_flexible": bool(winner["flexible"]),
+            "winner_crew_rank": dict(winner.get("crew_rank") or {}),
             # Informational only: the seed is a SEARCH artifact, not a plan input.
             # The ranks are what gets applied, and they already encode the answer.
             "winner_seed": winner.get("seed"),
             "rows": table, "knob": knob, "best": winner["best"],
             "ranks": winner.get("ranks", {}), "evals": evals, "cancelled": cancelled}
+
+
+def crew_rank_of_winner(rows, overlap, flexible=False, best=None) -> dict:
+    """The winning candidate's crew genome, recovered from a contest's rows.
+
+    Why this exists: the non-sharded cloud worker posts ``winner_overlap`` /
+    ``ranks`` / ``best`` / ``rows`` and nothing else (scripts/ is untouchable, and
+    an old worker on a running job could not be updated anyway), so the crew genome
+    has to be read back out of the rows it already carries. Matching is
+    (overlap, flexible) first and the winning ``best`` second, because a
+    multi-seed contest can run the same overlap several times. Returns {} when
+    nothing matches — a plan with no crew genome simply replays the saved one.
+    """
+    hits = [r for r in (rows or [])
+            if r.get("overlap") == overlap and bool(r.get("flexible")) == bool(flexible)]
+    if best is not None and len(hits) > 1:
+        exact = [r for r in hits if r.get("best") == best]
+        if exact:
+            hits = exact
+    for r in hits:
+        if r.get("crew_rank"):
+            return dict(r["crew_rank"])
+    return {}
 
 
 def run_contest(payload: dict, *, processes=1, on_progress=None,

@@ -154,6 +154,15 @@ class Config:
     # + existing rule tests stable); the web UI defaults it ON.
     apply_operator_logic: bool = False
 
+    # The roster engine's CREW GENOME: {machine id -> priority rank}, the order the
+    # roster fills machines in when it mans a shift (roster_engine.roster). It is a
+    # second search dimension alongside the job sequence, so — exactly like
+    # ``overlap_percent`` — it is OPTIMIZER-OWNED: never typed into Settings, written
+    # only when an optimize result is applied, and replayed by every later plan so the
+    # floor keeps ONE roster instead of a fresh one on every refresh.
+    # None (and {}) mean "not set"; every other engine ignores it entirely.
+    crew_rank: Optional[dict] = None
+
     def validate(self) -> None:
         """Fail loud on a bad config (Design spec §8 — config validation)."""
         errs = []
@@ -209,6 +218,8 @@ class Config:
             errs.append("worst_ceiling_days must be >= 0 or None")
         if self.committed_promise_slack_days < 0:
             errs.append("committed_promise_slack_days must be >= 0")
+        if self.crew_rank is not None and not isinstance(self.crew_rank, dict):
+            errs.append("crew_rank must be a {machine id: rank} mapping or null")
         if errs:
             raise ValueError("Invalid config: " + "; ".join(errs))
 
@@ -236,6 +247,11 @@ class Config:
                     value = None
                 elif isinstance(value, str):
                     value = date.fromisoformat(value)
+            if key == "crew_rank":
+                # "" / null / {} from the wire all mean "no crew genome on file",
+                # and they must land as the SAME value or _inputs_signature would
+                # see a settings change where there is none.
+                value = dict(value) if value else None
             if key == "priority_window_days":
                 # "" / "none" / null from the UI means "no limit".
                 if value in (None, "", "none", "null"):

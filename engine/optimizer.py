@@ -98,6 +98,12 @@ class OptimizeResult:
     evals: int = 0
     improved: bool = False
     cancelled: bool = False   # True when stopped early via should_cancel (best-so-far kept)
+    # The roster engine searches a SECOND genome beside the sequence: {machine id ->
+    # priority rank}, the order the roster fills machines in. It is as much a part of
+    # the answer as ``ranks`` — replay the ranks with a different crew and you get a
+    # different plan — so it is persisted by Apply alongside them. Empty for every
+    # other engine, which has no such dimension.
+    crew_rank: dict = field(default_factory=dict)
 
 
 def score(metrics: dict) -> float:
@@ -289,6 +295,18 @@ def optimize(so_lines, config, masters, *, reserved=None, budget_evals=150,
         return new_engine.optimize_sequence(
             so_lines, config, masters, reserved=reserved, budget_evals=budget_evals,
             seed=seed, on_progress=on_progress, should_cancel=should_cancel, frozen=frozen)
+    # The roster engine likewise owns its own search — over TWO genomes, the job
+    # sequence and the crew. ``frozen`` MUST be forwarded: the fall-through body
+    # below evaluates without it, which was safe only because classic and flow
+    # ignore frozen by design. The roster adapter honours it, so an unforwarded
+    # frozen set means the contest scores plans with in-progress work floating free
+    # while the applied plan pins it — the ranks would answer the wrong question.
+    if getattr(config, "scheduler", "classic") == "roster":
+        from engine import roster_adapter
+        return roster_adapter.optimize_sequence(
+            so_lines, config, masters, reserved=reserved, budget_evals=budget_evals,
+            seed=seed, on_progress=on_progress, should_cancel=should_cancel,
+            frozen=frozen)
     config.validate()
 
     batches = rule1_consolidate.run(list(so_lines), config=config, masters=masters)
@@ -494,6 +512,7 @@ class SweepResult:
     table: list = field(default_factory=list)   # per-candidate probe outcomes
     evals: int = 0
     cancelled: bool = False
+    crew_rank: dict = field(default_factory=dict)   # the winning crew genome (roster)
 
 
 def sweep_optimize(so_lines, config, masters, *, budget_evals=150, seed=42,
@@ -508,6 +527,16 @@ def sweep_optimize(so_lines, config, masters, *, budget_evals=150, seed=42,
         return new_engine.sweep_optimize(
             so_lines, config, masters, budget_evals=budget_evals, seed=seed,
             on_progress=on_progress, should_cancel=should_cancel, base_reserved=base_reserved, frozen=frozen)
+    # Same for roster — and note ``frozen=`` below is NOT forwarded to
+    # _sweep_optimize_classic, which has no such parameter. That is deliberate and
+    # safe for classic/flow (they ignore frozen) and would be a silent, unnoticeable
+    # defect for roster, which does not.
+    if getattr(config, "scheduler", "classic") == "roster":
+        from engine import roster_adapter
+        return roster_adapter.sweep_optimize(
+            so_lines, config, masters, budget_evals=budget_evals, seed=seed,
+            on_progress=on_progress, should_cancel=should_cancel,
+            base_reserved=base_reserved, frozen=frozen)
     return _sweep_optimize_classic(
         so_lines, config, masters, budget_evals=budget_evals, seed=seed,
         on_progress=on_progress, should_cancel=should_cancel,
