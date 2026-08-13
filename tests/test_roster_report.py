@@ -566,11 +566,24 @@ def _split_plan():
     return entries, masters
 
 
+class _GhostBatch:
+    """An order Rule 1 handed the scheduler that came back in no plan at all —
+    its only step runs on MI1, which nobody in Settings can man."""
+
+    batch_id, item_code, qty = "B9", "GHOST", 5
+    source_so_refs = ["SO-9"]
+    so_delivery_date = date(2026, 9, 1)
+    process_qty = None
+
+
 def _report_kinds(scheduler):
     from api import main as api_main
     entries, masters = _split_plan()
+    masters.routings["GHOST"] = Routing("GHOST", "d", "", "", None, [
+        Process(1, "INSP", 5.0, None, None, "MI1")])
     table = api_main._report_for_book(masters, [], absences=[],
-                                      config=_cfg(scheduler), schedule=entries)
+                                      config=_cfg(scheduler), schedule=entries,
+                                      batches=[_GhostBatch()])
     if "Kind" not in table["columns"]:
         return set()
     kind = table["columns"].index("Kind")
@@ -578,11 +591,16 @@ def _report_kinds(scheduler):
 
 
 _ROSTER_KINDS = {"OPERATOR_SPLIT_SHIFT", "OPERATION_SEGMENTED", "IDLE_CAPACITY",
-                 "OVERLAP_FRACTIONAL_PIECE", "MACHINE_DOUBLE_BOOKED"}
+                 "OVERLAP_FRACTIONAL_PIECE", "MACHINE_DOUBLE_BOOKED",
+                 "ORDER_NOT_PLANNED"}
 
 
 def test_a_roster_plan_report_is_wired_to_the_checks():
-    assert "OPERATOR_SPLIT_SHIFT" in _report_kinds("roster")
+    kinds = _report_kinds("roster")
+    assert "OPERATOR_SPLIT_SHIFT" in kinds
+    # ...including the one that names an order the plan LOST. Without it the only
+    # trace of a dropped order is a note at the bottom of the Rule 6 tab.
+    assert "ORDER_NOT_PLANNED" in kinds, kinds
 
 
 @pytest.mark.parametrize("scheduler", ["new", "classic", "flow"])

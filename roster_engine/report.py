@@ -56,8 +56,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from roster_engine import worktime
-from roster_engine.domain import is_machining_machine
+from roster_engine import scheduler, worktime
+from roster_engine.domain import build_jobs, build_shop, is_machining_machine
 from roster_engine.worktime import (FIRST, SECOND, iter_shifts,
                                     machine_runs_shift, operator_shift)
 
@@ -77,6 +77,7 @@ _KIND_SEGMENTED = "OPERATION_SEGMENTED"
 _KIND_DOUBLE = "MACHINE_DOUBLE_BOOKED"
 _KIND_IDLE = "IDLE_CAPACITY"
 _KIND_ROUNDING = "OVERLAP_FRACTIONAL_PIECE"
+_KIND_UNPLANNED = "ORDER_NOT_PLANNED"
 
 # Why a fractional release was withheld. Reported as a count, not swallowed:
 # a check whose every detection is muted looks identical to a check that found
@@ -626,13 +627,96 @@ def _explained(prev, nxt, entries, config) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# An order in no plan at all
+# --------------------------------------------------------------------------- #
+
+def unplanned_order_violations(entries, batches, masters) -> list:
+    """Every order the plan does not contain AT ALL — the CONSEQUENCE, named.
+
+    ``scheduler.schedule`` degrades rather than refusing: a step no shift could
+    place costs its own order its plan and the rest of the book is scheduled. The
+    engine says so on ``Plan.dropped`` and the seam turns that into a rule6 note —
+    but a rule6 note renders at the bottom of the Rule 6 tab, which no director
+    opens. On the Orders tab the order's expected completion is simply BLANK.
+
+    "An order in no plan at all, invisible" is this repo's named recurring
+    incident class (2026-08-11: 281 pieces of a clubbed batch were in no plan, a
+    director found it before the engine did). So it is stated where the data-gaps
+    banner will read it.
+
+    The existing ``MACHINE_NO_OPERATOR`` row is NOT this row. That one names a
+    CAUSE — a machine Settings cannot staff — and it fires whether or not any
+    order needed that machine; it says nothing about which orders were lost. And
+    for the other drop reason, "the machines ARE staffable but the horizon ran
+    out", it does not fire at all.
+
+    Derived from the PUBLISHED plan (which batches have no entry), never from the
+    engine's internals, so it is a genuine check on what shipped rather than a
+    second copy of the engine's own bookkeeping. The reason is CHECKED against
+    Settings through the scheduler's OWN ``_blocked_reason`` — the same sentence
+    the engine writes, not a paraphrase that can drift from it — and when nothing
+    in the routing is unstaffable it says the cause is unexplained rather than
+    inventing one (the 2026-08-09 rule).
+
+    An item with no routing is deliberately NOT reported here: it is dropped
+    before it ever reaches this engine and already has its own ``NO_ROUTING`` row,
+    and a second row for one condition is a banner nobody trusts.
+    """
+    batches = list(batches or ())
+    if not batches:
+        return []
+    planned = {str(getattr(e, "batch_id", "")) for e in (entries or ())}
+    missing = [b for b in batches
+               if str(getattr(b, "batch_id", "")) not in planned]
+    if not missing:
+        return []
+    jobs, _by_key, _no_routing = build_jobs(missing, masters)
+    shop = build_shop(masters)
+    rows = []
+    for job in jobs:
+        op = _first_unstaffable(job, shop)
+        if op is not None:
+            because = ("step %s '%s' on %s could not be placed — %s"
+                       % (op.seq, op.name, "/".join(op.machine_options),
+                          scheduler._blocked_reason(op.machine_options, shop)))
+        else:
+            because = ("every machine in its routing IS staffable in Settings, "
+                       "so the cause is not a missing qualification and this "
+                       "report cannot say what it was")
+        rows.append({
+            "kind": _KIND_UNPLANNED,
+            "ref": ", ".join(str(so) for so in job.so_refs) or job.item_code,
+            "message": ("order %s (item %s, %d piece(s)) is in NO plan — no bar "
+                        "on the Gantt and no expected completion date: %s"
+                        % (", ".join(str(so) for so in job.so_refs) or job.key,
+                           job.item_code, int(job.qty), because))})
+    return rows
+
+
+def _first_unstaffable(job, shop):
+    """The first step in this job's routing that NOBODY in Settings can man, or
+    None when every step is staffable. The scheduler stalls at the first such
+    step, so this names the same one it would have."""
+    for op in job.ops:
+        options = tuple(op.machine_options or ())
+        if options and not any(scheduler._staffable(mid, shop) for mid in options):
+            return op
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # All four
 # --------------------------------------------------------------------------- #
 
-def all_violations(entries, masters, config, absent=None) -> list:
+def all_violations(entries, masters, config, absent=None, batches=None) -> list:
     """Every violation in one list, in a fixed order: identical inputs give an
     identical list, because the optimizer builds thousands of plans and a report
-    that reshuffles is a report nobody can diff."""
+    that reshuffles is a report nobody can diff.
+
+    ``batches`` (optional) is Rule 1's output — the orders this plan was ASKED to
+    build. Without it the "an order is in no plan" check has nothing to compare
+    the plan against and is skipped, so a caller that does not pass it gets
+    exactly the rows it got before."""
     entries = list(entries or ())
     if not entries:
         return []
@@ -642,4 +726,5 @@ def all_violations(entries, masters, config, absent=None) -> list:
     rows.extend(machine_conflict_violations(entries))
     rows.extend(idle_capacity_violations(entries, masters, config, absent=absent))
     rows.extend(overlap_rounding_violations(entries, masters, config))
+    rows.extend(unplanned_order_violations(entries, batches, masters))
     return rows

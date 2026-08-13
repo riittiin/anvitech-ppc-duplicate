@@ -145,6 +145,85 @@ def test_the_engine_reports_the_dropped_jobs_on_the_plan_object():
 
 
 # --------------------------------------------------------------------------- #
+# ...and it reaches a surface a DIRECTOR reads
+# --------------------------------------------------------------------------- #
+#
+# The rule6 note above renders at the bottom of the Rule 6 tab (web/app.js:926).
+# `_report_for_book` never read rule6 notes, so the `#data-gaps-card` banner —
+# the one the directors actually see — said nothing, and on the Orders tab the
+# dropped order's expected completion was simply blank. For the unstaffed-machine
+# case the pre-existing MACHINE_NO_OPERATOR row does reach the banner, but it
+# names the CAUSE, not the consequence; for the "machines ARE staffable, horizon
+# ran out" case the banner showed nothing at all.
+
+
+def _banner(so_lines, masters, **kw):
+    """The validation report as `_report_for_book` builds it for /run, as
+    {kind: [message, ...]}."""
+    from api import main as api_main
+    run, _trace = _plan(so_lines, masters, **kw)
+    table = api_main._report_for_book(
+        masters, list(so_lines), absences=[], config=_cfg(),
+        schedule=run.schedule, batches=run.batches_prioritized)
+    kind = table["columns"].index("Kind")
+    message = table["columns"].index("Message")
+    out: dict = {}
+    for row in table["rows"]:
+        out.setdefault(row[kind], []).append(row[message])
+    return out
+
+
+def test_the_banner_names_the_order_that_is_in_no_plan():
+    so_lines, masters = _book(["MW1", "CNC9"])          # MI1 has nobody
+    rows = _banner(so_lines, masters)
+    said = " ".join(rows.get("ORDER_NOT_PLANNED", []))
+    assert said, sorted(rows)
+    assert ITEM_A in said, said
+    assert "in NO plan" in said, said
+    assert "INSP" in said and "MI1" in said, said
+    assert "no operator in Settings is qualified" in said, said
+
+
+def test_the_banner_names_it_for_the_reason_that_has_no_other_row_either():
+    """MI1 IS staffed — its only operator is away for the whole horizon — so
+    MACHINE_NO_OPERATOR does not fire and, before this row, a re-reviewer found
+    four banner rows and not one of them named the machine or the order."""
+    so_lines, masters = _book(["MW1", "CNC9"])
+    masters = dataclasses.replace(masters, operators=list(masters.operators) + [
+        Operator(name="Operator Five", preferred_machines_raw="MI1",
+                 machines=["MI1"], shift="First shift")])
+    away = {"Operator Five": [(datetime(2026, 1, 1), datetime(2028, 1, 1))]}
+    rows = _banner(so_lines, masters, reserved=away)
+    # Non-vacuity: every OTHER row in this banner is about something else. The
+    # MACHINE_NO_OPERATOR row that does fire names VMC1, a machine no order uses.
+    others = [m for k, v in rows.items() if k != "ORDER_NOT_PLANNED" for m in v]
+    assert others, rows                                  # there ARE other rows
+    assert not [m for m in others if "MI1" in m or ITEM_A in m], others
+    said = " ".join(rows.get("ORDER_NOT_PLANNED", []))
+    assert ITEM_A in said and "in NO plan" in said, said
+    # ...and it does not invent a cause it did not check (the 2026-08-09 rule).
+    assert "IS staffable in Settings" in said, said
+    assert "no operator in Settings is qualified" not in said, said
+
+
+def test_the_banner_says_nothing_about_dropped_orders_on_a_clean_book():
+    so_lines, masters = _book(["MI1", "MW1", "CNC9"])
+    assert "ORDER_NOT_PLANNED" not in _banner(so_lines, masters)
+
+
+def test_an_item_with_no_routing_is_not_reported_twice():
+    """It already has a NO_ROUTING row of its own, and two rows for one condition
+    is a banner nobody trusts."""
+    so_lines, masters = _book(["MI1", "MW1", "CNC9"])
+    masters = dataclasses.replace(
+        masters, routings={k: v for k, v in masters.routings.items()
+                           if k != ITEM_B})
+    rows = _banner(so_lines, masters)
+    assert "NO_ROUTING" in rows, sorted(rows)
+    assert "ORDER_NOT_PLANNED" not in rows, rows.get("ORDER_NOT_PLANNED")
+
+
+# --------------------------------------------------------------------------- #
 # ...and the reason is CHECKED, not assumed (2026-08-09)
 # --------------------------------------------------------------------------- #
 
@@ -180,6 +259,98 @@ def test_a_clean_book_reports_nothing_dropped():
     run, trace = _plan(so_lines, masters)
     assert _items(run.schedule) == {ITEM_A, ITEM_B}
     assert "could NOT be scheduled" not in _notes(trace)
+
+
+# =========================================================================== #
+# I2 — the SEARCH must never prefer a plan that loses an order
+# =========================================================================== #
+#
+# THE DEFECT (final review, 2026-08-13). Degrading made a dropped order CHEAP to
+# the objective: ``objective.compute_metrics`` skips a job with no completion
+# entry, so a plan that loses an order is scored only on the orders it kept.
+# Measured on the book below, same config:
+#
+#   MI1 STAFFED   (item A planned)  dropped=0 jobs_scored=2 total_late=1034 SCORE=7200.20
+#   MI1 UNSTAFFED (item A DROPPED)  dropped=1 jobs_scored=1 total_late= 512  SCORE=3600.20
+#
+# A plan that loses work scored STRICTLY BETTER. Before the degrade change that
+# candidate raised and was scored `+inf`, so the search could never choose it.
+# It was latent (0 of 600 evaluated candidates dropped anything across 4
+# shop-sized books) and harmless while a drop is candidate-INDEPENDENT, but it
+# goes live the moment a drop becomes candidate-DEPENDENT — which is exactly the
+# "the horizon ran out but the machines ARE staffable" reason above.
+#
+# The fix is in the search's evaluator, not in what ``schedule`` returns: it
+# ranks candidates on (dropped orders, score), so fewer drops always wins and the
+# ordinary objective still drives the climb among candidates that drop the same.
+# BOTH halves are pinned here — the second because scoring a dropping candidate
+# `+inf` (the obvious fix) would leave a book that can only ever be planned with
+# a drop with no incumbent at all, undoing the degrade fix one level up.
+
+
+def _drop_fixture():
+    """Two jobs, and a fake scheduler that DROPS one of them unless the sequence
+    puts it first. Fake on purpose: a candidate-dependent drop is what the defect
+    needs and no small real book produces one reliably. The dropping plan is
+    deliberately the one that SCORES better — job A is 20 days late when it is
+    planned and contributes nothing at all when it is dropped."""
+    from roster_engine.domain import Job, Op, Shop
+
+    a = Job(key="A", item_code="IA", qty=10, due=date(2026, 8, 20),
+            so_refs=("SO1",), ops=(Op(1, "CNC", "machining", 10.0, ("CNC1",)),),
+            remaining=None)
+    b = Job(key="B", item_code="IB", qty=1, due=date(2026, 9, 30),
+            so_refs=("SO2",), ops=(Op(1, "CNC", "machining", 1.0, ("CNC1",)),),
+            remaining=None)
+    shop = Shop(machines={}, operators=(), calendar=WorkCalendar(),
+                machining_ids=frozenset({"CNC1"}), absent={})
+    late = datetime(2026, 9, 9, 12, 0)          # 20 days past A's date
+    on_time = datetime(2026, 9, 30, 12, 0)      # exactly B's date
+
+    def fake_schedule(jobs, sequence, _shop, _config, **kw):
+        if list(sequence)[:1] == ["A"]:
+            return scheduler.Plan((), {"A": late, "B": on_time}, (), ())
+        return scheduler.Plan((), {"B": on_time}, (), (
+            ("A", 1, "CNC", ("CNC1",), "no operator in Settings is qualified"),))
+
+    return [a, b], shop, fake_schedule
+
+
+def test_a_candidate_that_drops_an_order_never_beats_one_that_keeps_it(monkeypatch):
+    """The headline. The dropping candidate scores 0.x against the keeping
+    candidate's 256.x, and the search must still return the one that plans both
+    orders. Mutation-checked: score the plans on the objective alone and this
+    fails."""
+    from roster_engine import search as roster_search
+
+    jobs, shop, fake = _drop_fixture()
+    monkeypatch.setattr(scheduler, "schedule", fake)
+    res = roster_search.optimize(jobs, shop, _cfg(), overlap=0.8,
+                                 budget_evals=40, seed=1)
+    assert res.sequence[:1] == ["A"], res.sequence
+    assert res.dropped_jobs == 0, res.dropped_jobs
+    # ...and it really did see the cheaper, order-losing plan and refuse it.
+    assert res.score > 100.0, res.score
+
+
+def test_the_search_still_climbs_among_candidates_that_drop_the_same_order():
+    """The interaction the obvious fix gets wrong. With MI1 unstaffed EVERY
+    candidate loses item A — the drop is candidate-INDEPENDENT — so scoring a
+    dropping candidate `+inf` would leave the search with no incumbent, no
+    metrics and nothing to climb, and the book would be back to having no plan.
+    It must still return a real, scored plan."""
+    from engine.rules import rule1_consolidate
+    from roster_engine import search as roster_search
+
+    so_lines, masters = _book(["MW1", "CNC9"])          # MI1 has nobody
+    batches = rule1_consolidate.run(list(so_lines), config=_cfg(), masters=masters)
+    jobs, _by, _sk = build_jobs(batches, masters)
+    res = roster_search.optimize(jobs, build_shop(masters), _cfg(), overlap=0.8,
+                                 budget_evals=30, seed=1)
+    assert res.sequence, res
+    assert res.score < float("inf"), res.score
+    assert res.metrics is not None, "no plan to hand back — the degrade is undone"
+    assert res.dropped_jobs >= 1, res.dropped_jobs
 
 
 # --------------------------------------------------------------------------- #

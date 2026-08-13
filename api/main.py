@@ -557,7 +557,14 @@ def _report_for_book(masters, so_lines, absences=None, config=None, schedule=Non
         # no machine dark while a qualified operator is unassigned, and no
         # successor released on a fraction of a piece — plus the whole-plan
         # backstop under them, that no machine is ever occupied by two
-        # operations at once (MACHINE_DOUBLE_BOOKED).
+        # operations at once (MACHINE_DOUBLE_BOOKED) — and ORDER_NOT_PLANNED,
+        # which names every order the engine had to DROP. That engine degrades
+        # rather than refusing, so a dropped order is otherwise visible only as a
+        # note at the bottom of the Rule 6 tab and a blank completion date on the
+        # Orders tab. "An order in no plan at all, invisible" is this repo's
+        # named recurring incident class (2026-08-11), so it is stated here.
+        # `batches` is what the plan was ASKED to build — the check compares that
+        # against what it published; without it that one check is skipped.
         #
         # GATED TO THE ROSTER ENGINE ON PURPOSE. The live engine genuinely
         # breaks the first two on every plan — hundreds of rows — and this
@@ -576,7 +583,8 @@ def _report_for_book(masters, so_lines, absences=None, config=None, schedule=Non
                     config if config is not None else _load_plan_config(),
                     absent=optimize_service.absence_reservations(
                         absences if absences is not None
-                        else book_store.load_absences())))
+                        else book_store.load_absences()),
+                    batches=batches))
             except Exception:  # noqa: BLE001 — a self-check must never break the report
                 pass
     return to_table([

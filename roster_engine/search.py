@@ -40,6 +40,23 @@ chuck every shift while the upstream machine stays dark — the plan never place
 anything and `scheduler.schedule` fails loud, exactly as it should. A candidate
 like that is scored `+inf` and dropped, never crashed on.
 
+A candidate can also come back HAVING LOST AN ORDER. `scheduler.schedule` degrades
+rather than refusing — a step no shift could place costs its own order its plan,
+not the whole book's — and that makes a lost order CHEAP to the objective, which
+scores only the orders a plan contains. Measured, same book and config: keeping a
+badly late order scored 7200.20, dropping it scored 3600.20. A plan that loses
+work scored strictly better, and before the degrade change that same candidate
+raised and was `+inf`, so the search could never have chosen it.
+
+So a candidate is ranked on **(orders dropped, score)**, not on the score alone.
+Fewer dropped orders always wins, whatever the late days say; among candidates
+that drop the same number the ordinary objective decides, so the climb keeps all
+its power. It is deliberately NOT "a dropping candidate is `+inf`": an
+unstaffable machine drops the same order in EVERY candidate (the documented
+provisional-machine case), and `+inf` everywhere would leave the search with no
+incumbent, nothing to climb and no plan to hand back — the degrade fix undone one
+level up. `+inf` still means what it always meant: nothing could be built at all.
+
 Feasibility lives in the CREW genome, so when the incumbent is infeasible the
 sequence phase is skipped entirely: re-ordering jobs cannot man a dark machine,
 and every neighbour it drew was a real evaluation spent on a `+inf` plan (measured
@@ -81,9 +98,27 @@ _JOB_SHARE = 0.6
 # budget, so without this bound the loop would never terminate.
 _SATURATED = 24
 
+# What "better" means, in one place: FEWER DROPPED ORDERS FIRST, then the score.
+# A plain tuple, so every `<` in this module is already the right comparison and
+# there is no weight to tune and no constant big enough to hope no arrangement of
+# late days can outweigh it. `_INFEASIBLE` is the candidate that could not be
+# built at all — the drop count is infinite, so it loses to every real plan
+# including one that dropped half the book, which is exactly right.
+_INFEASIBLE = (float("inf"), float("inf"))
+
+
+def _is_plan(key) -> bool:
+    """True when this candidate produced a schedule — even a degraded one."""
+    return key[0] < float("inf")
+
 
 @dataclass
 class Result:
+    """``score`` is the OBJECTIVE score of the winning plan and ``dropped_jobs``
+    the number of orders it could not place; the search ranks on the pair, so
+    ``score`` alone is not comparable across results with different
+    ``dropped_jobs``. ``dropped_jobs`` is ``inf`` when nothing could be built."""
+
     sequence: list = field(default_factory=list)
     crew_rank: dict = field(default_factory=dict)
     score: float = float("inf")
@@ -91,6 +126,7 @@ class Result:
     evaluations: int = 0
     baseline_score: float = float("inf")
     cancelled: bool = False
+    dropped_jobs: float = 0
 
 
 class _Evaluator:
@@ -113,8 +149,11 @@ class _Evaluator:
         return self.cancelled or self.count >= self._budget
 
     def __call__(self, sequence, crew):
-        """Returns (score, metrics, was_free). ``was_free`` is True when the answer
-        came out of the memo or the search is over — the caller needs to tell a
+        """Returns (rank_key, metrics, was_free), where ``rank_key`` is the
+        ``(orders dropped, score)`` pair the search compares — never the bare
+        score, or a candidate that lost an order would win on the orders it kept
+        (see the module docstring). ``was_free`` is True when the answer came out
+        of the memo or the search is over — the caller needs to tell a
         genuinely-explored neighbour from one that cost nothing, or a saturated
         neighbourhood looks like an endless supply of new plans."""
         key = (tuple(sequence), tuple(crew))
@@ -122,10 +161,10 @@ class _Evaluator:
         if hit is not None:
             return hit[0], hit[1], True
         if self.exhausted:
-            return float("inf"), None, True
+            return _INFEASIBLE, None, True
         if self._should_cancel is not None and self._should_cancel():
             self.cancelled = True
-            return float("inf"), None, True
+            return _INFEASIBLE, None, True
         try:
             plan = scheduler.schedule(self._jobs, list(sequence), self._shop,
                                       self._config, overlap=self._overlap,
@@ -138,12 +177,16 @@ class _Evaluator:
             self.infeasible += 1
             if self.first_error is None:
                 self.first_error = exc
-            self._cache[key] = (float("inf"), None)
+            self._cache[key] = (_INFEASIBLE, None)
             if self._on_eval is not None:
                 self._on_eval(self.count, None)
-            return float("inf"), None, False
+            return _INFEASIBLE, None, False
         metrics = objective.compute_metrics(plan, self._jobs, self._config)
-        value = objective.score(metrics, self._config)
+        # The plan is measured on the orders it CONTAINS, so the orders it lost
+        # have to be counted separately or losing one would look like an
+        # improvement. Read off the engine's own report of them.
+        value = (len(getattr(plan, "dropped", ()) or ()),
+                 objective.score(metrics, self._config))
         self.count += 1
         self._cache[key] = (value, metrics)
         if self._on_eval is not None:
@@ -173,20 +216,20 @@ def optimize(jobs, shop, config, *, overlap, budget_evals=150, seed=42,
 
     seeds = _seed_sequences(jobs)
     seq, crew = seeds[0], list(machines)
-    value, metrics = float("inf"), None
+    key, metrics = _INFEASIBLE, None
     for candidate in seeds:
-        cand_value, cand_metrics, _free = ev(candidate, crew)
-        if cand_value < value:
-            seq, value, metrics = candidate, cand_value, cand_metrics
+        cand_key, cand_metrics, _free = ev(candidate, crew)
+        if cand_key < key:
+            seq, key, metrics = candidate, cand_key, cand_metrics
         if ev.exhausted:
             break
-    baseline = value
+    baseline_key = key
 
     # The result, held apart from the genome the descent is currently working on:
     # a restart may explore a worse region, and only a STRICT improvement is ever
     # allowed to replace what will be returned.
     best_seq, best_crew = list(seq), list(crew)
-    best_score, best_metrics = value, metrics
+    best_key, best_metrics = key, metrics
     crew_searched = False
 
     job_ceiling = int(budget * _JOB_SHARE)
@@ -194,20 +237,24 @@ def optimize(jobs, shop, config, *, overlap, budget_evals=150, seed=42,
         spent = ev.count
         # An infeasible incumbent is a CREW problem — no job order can man a dark
         # machine — so the sequence phase is skipped until there is a plan to
-        # improve. Without this it draws its whole share against `+inf`.
-        climbed = value < float("inf")
+        # improve. Without this it draws its whole share against `+inf`. A plan
+        # that merely LOST an order is still a plan and is climbed normally: its
+        # drop may well be candidate-independent (an unstaffable machine drops the
+        # same order whatever the genome), and skipping the sequence phase there
+        # would throw the search away on the exact case degrading exists for.
+        climbed = _is_plan(key)
         if climbed:
-            seq, value, metrics = _climb(seq, value, metrics, ev, rng,
-                                         lambda s: (s, crew), job_ceiling)
-        crew, value, metrics = _climb(crew, value, metrics, ev, rng,
-                                      lambda c: (seq, c), None)
+            seq, key, metrics = _climb(seq, key, metrics, ev, rng,
+                                       lambda s: (s, crew), job_ceiling)
+        crew, key, metrics = _climb(crew, key, metrics, ev, rng,
+                                    lambda c: (seq, c), None)
         crew_searched = True
         capped = climbed and job_ceiling is not None
         if climbed:
             job_ceiling = None                # the share applies to round 1 only
-        if value < best_score:
+        if key < best_key:
             best_seq, best_crew = list(seq), list(crew)
-            best_score, best_metrics = value, metrics
+            best_key, best_metrics = key, metrics
         if ev.count == spent and not capped:
             # Both neighbourhoods saturated. Checked only on an UNCAPPED round, or
             # a round in which the share had already stopped the sequence phase
@@ -217,7 +264,7 @@ def optimize(jobs, shop, config, *, overlap, budget_evals=150, seed=42,
                 break
             seq = rng.sample(best_seq, len(best_seq))
             crew = rng.sample(machines, len(machines))
-            value, metrics, free = ev(seq, crew)
+            key, metrics, free = ev(seq, crew)
             if free:
                 # Even a fresh draw costs nothing: every genome this search can
                 # reach is already in the memo, so there is genuinely nothing left
@@ -225,7 +272,7 @@ def optimize(jobs, shop, config, *, overlap, budget_evals=150, seed=42,
                 # spends at least one evaluation.)
                 break
 
-    if (best_score == float("inf") and ev.first_error is not None
+    if (not _is_plan(best_key) and ev.first_error is not None
             and not ev.cancelled and crew_searched):
         # Nothing this search tried could be built, and it was not stopped and did
         # reach the dimension that decides feasibility. Fail loud rather than hand
@@ -246,17 +293,19 @@ def optimize(jobs, shop, config, *, overlap, budget_evals=150, seed=42,
             getattr(ev.first_error, "blocked", ()))
 
     return Result(sequence=list(best_seq), crew_rank=_rank(best_crew),
-                  score=best_score, metrics=best_metrics, evaluations=ev.count,
-                  baseline_score=baseline, cancelled=ev.cancelled)
+                  score=best_key[1], dropped_jobs=best_key[0],
+                  metrics=best_metrics, evaluations=ev.count,
+                  baseline_score=baseline_key[1], cancelled=ev.cancelled)
 
 
-def _climb(genome, value, metrics, ev, rng, genomes, ceiling):
+def _climb(genome, key, metrics, ev, rng, genomes, ceiling):
     """First-improvement hill climb on one genome, the other held fixed.
 
     ``genomes(candidate)`` returns the (sequence, crew) pair to evaluate, so this
-    one climber serves both dimensions. Only a strictly better score is accepted:
-    that, and nothing else, is what makes the returned plan never worse than the
-    seed it started from.
+    one climber serves both dimensions. Only a strictly better RANK is accepted —
+    the ``(orders dropped, score)`` pair, so a move that buys late days by losing
+    an order is never one. That, and nothing else, is what makes the returned plan
+    never worse than the seed it started from.
 
     ``ceiling`` is an absolute ceiling on ``ev.count`` for this phase — the
     sequence/crew budget SHARE — or None for "no phase cap". The eval budget
@@ -272,15 +321,15 @@ def _climb(genome, value, metrics, ev, rng, genomes, ceiling):
             idle += 1
             continue
         sequence, crew = genomes(candidate)
-        cand_value, cand_metrics, free = ev(sequence, crew)
+        cand_key, cand_metrics, free = ev(sequence, crew)
         # "Did this draw cost a plan?" is a fact about the evaluator, and the
         # saturation guard must not depend on whether the move was ACCEPTED —
         # otherwise a rule that accepts everything (including memo hits, which
         # spend no budget) never lets `idle` grow and the phase spins forever.
         idle = idle + 1 if free else 0
-        if cand_value < value:
-            genome, value, metrics = candidate, cand_value, cand_metrics
-    return genome, value, metrics
+        if cand_key < key:
+            genome, key, metrics = candidate, cand_key, cand_metrics
+    return genome, key, metrics
 
 
 def _neighbour(genome, rng):

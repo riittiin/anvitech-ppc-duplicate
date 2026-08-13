@@ -671,7 +671,10 @@ def test_pace_is_a_standing_guard_over_whatever_produced_the_plan():
     assert completion["B1"] == at.replace(hour=17)
 
 
-def test_an_unstaffable_machine_fails_loud_rather_than_dropping_the_work():
+def test_a_book_whose_ONLY_order_cannot_be_placed_fails_loud():
+    # A single-job book, so this is the TOTAL-failure case: an unstaffable machine
+    # no longer costs the whole book its plan — the orders that can be placed are
+    # planned and the rest are dropped and reported (tests/test_roster_degrade.py).
     masters = _masters(
         [Process(1, "CNC FIRST SIDE", 10.0, None, None, "CNC1")],
         [Operator("Anturam", "MD1", ["MD1"], "First shift")])
