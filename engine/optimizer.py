@@ -41,17 +41,29 @@ from .rules import rule1_consolidate, rule2_sort_by_date, rule3_tiebreak_process
 # matches ppc_engine/config.py makespan_weight, so the two scorers finally agree.
 MAKESPAN_WEIGHT = 0.1           # == ppc_engine makespan_weight
 
-# The on-time objective (2026-08-06 spec). ONE symmetric term replacing
-# total_late_days + slip_severity: for each order take how far it misses
+# The on-time objective (2026-08-06 spec, reshaped 2026-08-13). ONE symmetric term
+# replacing total_late_days + slip_severity: for each order take how far it misses
 # its delivery date in EITHER direction, ignore the first ONTIME_BAND_DAYS, cap the
-# rest, and square it.
+# rest, and SUM it.
 #
-# Squaring is the mechanism the owner asked for by name: ten orders 6 days out
-# (10 x 2^2 = 40) must beat one order 30 days out ((30-4)^2 = 676). The cap stops a
-# single hopeless order swamping the plan. The band is FLAT by owner decision — no
-# pull toward the exact date; anywhere inside +/-4 days is equally on time.
+# It is LINEAR since 2026-08-13, at the owner's explicit request. It was SQUARED
+# from 2026-08-06 — the mechanism he asked for by name, so that ten orders 6 days
+# out (10 x 2^2 = 40) beat one order 30 days out ((30-4)^2 = 676). The measured
+# consequence was that the search REFUSED plans which cut TOTAL late-days by
+# concentrating them: a CP solver found one 86 late-days better than the live plan
+# and the optimizer correctly rejected it. Correlation between this term and total
+# late-days, on a loaded book: squared -0.61, linear +0.49. See
+# `scripts/measure_linear_ontime.py` and roster_engine/objective.py for the A/B.
 #
-# Must stay numerically EQUAL to ppc_engine/config.py ontime_* .
+# The cap stops a single hopeless order swamping the plan. The band is FLAT by
+# owner decision — no pull toward the exact date; anywhere inside +/-4 days is
+# equally on time. The ceiling and committed-promise guards below keep THEIR
+# squaring: they are no-regression barriers, not the objective.
+#
+# The three CONSTANTS must stay numerically EQUAL to ppc_engine/config.py ontime_*;
+# the SHAPE deliberately differs from it now (ppc_engine is vendored, drives only
+# the retired `new` engine, and still squares). tests/test_scorer_mirror.py pins
+# both halves of that statement.
 ONTIME_BAND_DAYS = 4.0          # == ppc_engine ontime_band_days
 ONTIME_CAP_DAYS = 60.0          # == ppc_engine ontime_cap_days
 ONTIME_WEIGHT = 1.0             # == ppc_engine ontime_weight
@@ -221,7 +233,11 @@ def plan_metrics(schedule, so_lines, plan_start, ceiling_days=None,
         if over > 0:
             if over > ONTIME_CAP_DAYS:
                 over = ONTIME_CAP_DAYS
-            ontime_breach += float(over * over)
+            # LINEAR since 2026-08-13 (was `over * over`) — see
+            # roster_engine/objective.py for the measurement. The two scorers must
+            # keep the same SHAPE or the contest picks winners on one yardstick and
+            # reports on another.
+            ontime_breach += float(over)
     result = {
         "makespan_days": makespan_days(schedule, plan_start),
         "late_orders": len(late),

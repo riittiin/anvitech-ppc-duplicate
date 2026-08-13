@@ -5,15 +5,32 @@ plans is then the scheduling, not the yardstick. Written fresh rather than
 imported, because this package stands alone and never imports the engine it is
 being compared against.
 
-    score = w_ontime  x  sum( (|miss| - band, capped)^2 )     # the whole objective
+    score = w_ontime  x  sum( |miss| - band, capped )         # the whole objective
           + w_ceiling x  sum( (late - ceiling)^2 )            # a no-regression bar
           + w_makespan x  makespan_days                       # a strict tie-break
 
-`abs()` is the owner's rule that early and late are equally bad. Squaring is the
-owner's rule that misses must be SPREAD: ten orders 6 days out (10 x 2^2 = 40)
-beats one order 30 days out ((30-4)^2 = 676). The cap stops one hopeless order
-swamping the plan and the search chasing it instead of the orders it can still
-save.
+`abs()` is the owner's rule that early and late are equally bad. The cap stops one
+hopeless order swamping the plan and the search chasing it instead of the orders
+it can still save.
+
+THE ON-TIME TERM IS LINEAR (2026-08-13, owner's explicit request). It was SQUARED
+from 2026-08-06, which encoded his rule that misses must be SPREAD: ten orders 6
+days out (10 x 2^2 = 40) beat one order 30 days out ((30-4)^2 = 676). The measured
+consequence was that the search REFUSED plans which cut TOTAL late-days by
+concentrating them — a CP solver found one 86 late-days better than the live plan
+and the optimizer correctly rejected it, because it had 51-53 late orders with a
+worst of 29-31 days while the squared search prefers 55-60 late orders with a
+worst of 21-24. Correlation between this term and total late-days, on a properly
+loaded book: squared -0.61, linear +0.49.
+
+The trade this buys, measured on three loaded 68-order books
+(`scripts/measure_linear_ontime.py`): total late-days FELL on all three
+(580/810/521 -> 557/756/515) and orders inside the +/-4 band ROSE on all three
+(15/9/16 -> 24/17/20), while the WORST single order got worse on all three
+(29/36/32 -> 31/38/35). Fewer late days, bought by letting one order run later.
+
+Note the ceiling below keeps ITS squaring, deliberately — it is a no-regression
+barrier, not the objective, and a convex barrier is what makes it bite.
 
 The defaults below are the live engine's own (ontime_band_days 4.0,
 ontime_cap_days 60.0, ontime_weight 1.0, makespan_weight 0.1). They are read off
@@ -116,7 +133,13 @@ def score(metrics: Metrics, config) -> float:
         if over > 0:
             if over > cap:
                 over = cap
-            breach += over * over
+            # LINEAR since 2026-08-13, was `over * over`. Squaring SPREAD misses
+            # across orders — ten orders 6 days out beat one order 30 days out —
+            # which is why the search rejected schedules that cut TOTAL late-days
+            # by concentrating them. Measured on a loaded book, correlation between
+            # this term and total late-days: squared -0.61, linear +0.49. Linear
+            # makes the score track the number the owner is judged on.
+            breach += over
     # Term order matches the live score's, deliberately: float addition is not
     # associative, and the differential test asserts EXACT equality.
     return (_knob(config, "ontime_weight", _ONTIME_WEIGHT) * breach

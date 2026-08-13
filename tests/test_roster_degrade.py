@@ -31,6 +31,7 @@ from engine.config import Config
 from engine.loaders import load_all
 from engine.models import (Machine, Masters, Operator, PlanRun, Process, Routing,
                            ScheduleEntry, WorkCalendar)
+from roster_engine import objective
 from roster_engine import report as rreport
 from roster_engine import scheduler
 from roster_engine.domain import build_jobs, build_shop
@@ -317,10 +318,19 @@ def _drop_fixture():
 
 
 def test_a_candidate_that_drops_an_order_never_beats_one_that_keeps_it(monkeypatch):
-    """The headline. The dropping candidate scores 0.x against the keeping
-    candidate's 256.x, and the search must still return the one that plans both
-    orders. Mutation-checked: score the plans on the objective alone and this
-    fails."""
+    """The headline. The dropping candidate is CHEAPER on the objective, and the
+    search must still return the one that plans both orders. Mutation-checked:
+    score the plans on the objective alone and this fails.
+
+    REBASED 2026-08-13 for the linear on-time term — a deliberate behaviour
+    change, not a fudge, and the guarantee was verified INTACT before the test was
+    touched. The guarantee never depended on the score's shape: ``_Evaluator``
+    ranks candidates on the tuple ``(orders dropped, score)``, so fewer drops wins
+    lexicographically whatever the second element is. Only the magnitudes moved
+    (keeping: 256.9 squared -> 20.9 linear), so the old ``res.score > 100.0`` was
+    a magic number that happened to sit between them. It is replaced by the thing
+    it was standing in for: the dropping plan really is cheaper, and loses anyway.
+    """
     from roster_engine import search as roster_search
 
     jobs, shop, fake = _drop_fixture()
@@ -329,8 +339,18 @@ def test_a_candidate_that_drops_an_order_never_beats_one_that_keeps_it(monkeypat
                                  budget_evals=40, seed=1)
     assert res.sequence[:1] == ["A"], res.sequence
     assert res.dropped_jobs == 0, res.dropped_jobs
-    # ...and it really did see the cheaper, order-losing plan and refuse it.
-    assert res.score > 100.0, res.score
+
+    # ...and it really did see a CHEAPER, order-losing plan and refuse it. Scored
+    # directly off the two plans the fake scheduler returns, so this states the
+    # inversion instead of asserting a threshold that drifts with the objective.
+    keeping = fake(jobs, ["A", "B"], shop, _cfg())
+    dropping = fake(jobs, ["B", "A"], shop, _cfg())
+    assert not keeping.dropped and len(dropping.dropped) == 1
+    keep_score = objective.score(objective.compute_metrics(keeping, jobs, _cfg()), _cfg())
+    drop_score = objective.score(objective.compute_metrics(dropping, jobs, _cfg()), _cfg())
+    assert drop_score < keep_score, (drop_score, keep_score)
+    # The search returned the EXPENSIVE one, because it ranks drops first.
+    assert res.score == keep_score
 
 
 def test_the_search_still_climbs_among_candidates_that_drop_the_same_order():

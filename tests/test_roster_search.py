@@ -16,6 +16,8 @@ import sys
 import textwrap
 from datetime import date, datetime, timedelta
 
+import pytest
+
 from engine.config import Config
 from engine.models import Machine, Masters, Operator, Process, Routing, WorkCalendar
 from roster_engine import objective, scheduler, search
@@ -120,22 +122,42 @@ def test_early_and_late_are_penalised_equally():
         objective.Metrics({"A": 0.0}, 1.0, 0.0, 0.0), cfg)
 
 
-def test_misses_spread_across_orders_beat_one_hopeless_order():
+def test_only_the_total_overage_counts_not_how_it_is_spread():
+    """LINEAR since 2026-08-13 — a deliberate behaviour change, not a fudge.
+
+    This test used to be ``test_misses_spread_across_orders_beat_one_hopeless
+    _order`` and asserted that ten orders 6 days out (10 x 2^2 = 40) beat one
+    order 30 days out ((30-4)^2 = 676). That preference is exactly what made the
+    search reject plans which cut TOTAL late-days by concentrating them, so the
+    owner asked for it to go. Note the old assertion would still PASS under
+    linear (20 < 26) — for an unrelated reason, less total overage — which is
+    why it is replaced rather than left standing as a misleading green.
+    """
     cfg = _cfg()
-    spread = objective.Metrics({f"O{i}": 6.0 for i in range(10)}, 1.0, 60.0, 6.0)
+    # Same TOTAL overage, opposite distributions: now scored identically.
+    spread = objective.Metrics({f"O{i}": 6.0 for i in range(13)}, 1.0, 78.0, 6.0)
     concentrated = objective.Metrics({"O0": 30.0}, 1.0, 30.0, 30.0)
-    assert objective.score(spread, cfg) < objective.score(concentrated, cfg)
+    assert objective.score(spread, cfg) == objective.score(concentrated, cfg)
+    # ...and the term really is the sum of days beyond the band.
+    assert objective.score(concentrated, cfg) - 0.1 * 1.0 == 26.0
 
 
 def test_one_hopeless_order_is_capped():
     """Beyond the cap an order stops getting worse, so the search keeps working on
-    the orders it can still save instead of chasing a lost one."""
+    the orders it can still save instead of chasing a lost one. The cap is
+    untouched by the 2026-08-13 linear switch; only its SHAPE moved, so the pinned
+    value is 60.0 rather than 60.0^2."""
     cfg = _cfg()
     hopeless = objective.Metrics({"O0": 400.0}, 1.0, 400.0, 400.0)
     ruined = objective.Metrics({"O0": 4000.0}, 1.0, 4000.0, 4000.0)
     assert objective.score(hopeless, cfg) == objective.score(ruined, cfg)
     # And the cap is the incumbent's 60 free-of-band days, not something else.
-    assert objective.score(hopeless, cfg) - 0.1 * 1.0 == 60.0 ** 2
+    assert objective.score(hopeless, cfg) - 0.1 * 1.0 == 60.0
+    # Non-vacuity: the cap is genuinely BINDING here — one day inside it is cheaper,
+    # so this is not passing merely because both sides saturate some other term.
+    inside = objective.Metrics({"O0": 63.0}, 1.0, 63.0, 63.0)
+    assert objective.score(inside, cfg) - 0.1 * 1.0 == 59.0
+    assert objective.score(inside, cfg) < objective.score(hopeless, cfg)
 
 
 def test_a_miss_inside_the_band_is_free():
@@ -145,48 +167,141 @@ def test_a_miss_inside_the_band_is_free():
 
 
 def test_makespan_is_only_a_tie_break():
-    """A whole extra day of makespan must never outweigh one day of miss beyond
-    the band, or the objective would trade deliveries for a shorter plan."""
+    """A whole extra day of makespan must never outweigh one DAY of miss beyond
+    the band, or the objective would trade deliveries for a shorter plan.
+
+    REBASED 2026-08-13 (a deliberate behaviour change, not a fudge) — and the
+    weakening is real, so it is stated rather than hidden. The exchange rate at
+    the margin is UNCHANGED: one day of overage costs 1.0, which is 10 days of
+    makespan, under both the old squared shape and the new linear one (x and x^2
+    agree at x=1). What changed is that the margin no longer grows QUADRATICALLY,
+    so a large on-time gap is worth far less makespan than it used to be:
+
+        one order 6d off  = 40 makespan days (squared) -> 20 (linear)
+        one order 10d off = 360                        -> 60
+        one order 20d off = 2560                       -> 160
+
+    The old fixture here compared a 39-day makespan difference against a 2-day
+    overage and passed by 0.1 (4.0 vs 4.1) — it was already razor-thin under
+    squaring, and it flips under linear. It is replaced by the exchange rate
+    itself, which is the actual definition of "tie-break" and is shape-independent.
+
+    Measured, not assumed: re-running the identical search with the makespan
+    weight at 0.1 and at 0.0 on three loaded 68-order books changed the winning
+    plan in 0 of 3 linear runs (and 1 of 3 squared runs, by 2 late-days). The
+    term does not steer this search.
+    """
+    cfg = _cfg()
+    free = objective.Metrics({"O0": 0.0}, 0.0, 0.0, 0.0)
+    one_day_over = objective.Metrics({"O0": 5.0}, 0.0, 5.0, 5.0)
+    cost_of_one_day = objective.score(one_day_over, cfg) - objective.score(free, cfg)
+    assert cost_of_one_day == 1.0
+    # A day of makespan is worth a TENTH of that, so a day of delivery always wins.
+    a_day_of_makespan = (objective.score(objective.Metrics({"O0": 0.0}, 1.0, 0.0, 0.0), cfg)
+                         - objective.score(free, cfg))
+    assert a_day_of_makespan == 0.1
+    assert a_day_of_makespan < cost_of_one_day
+    # Concretely: a plan 9 days shorter still loses to one that is a day less late.
+    shorter = objective.Metrics({"O0": 5.0}, 0.0, 5.0, 5.0)
+    on_time = objective.Metrics({"O0": 4.0}, 9.0, 0.0, 0.0)
+    assert objective.score(on_time, cfg) < objective.score(shorter, cfg)
+
+
+def test_makespan_can_outrank_a_large_ontime_gap_under_the_linear_shape():
+    """The honest converse of the test above, pinned so nobody rediscovers it as
+    a surprise (2026-08-13).
+
+    Under squaring this fixture held: 4.0 vs 4.1. Under linear it inverts. The
+    guarantee the objective still makes is per-DAY (above); it does NOT make a
+    guarantee at every magnitude, because a linear term and a linear tie-break
+    scale together. Whether the 0.1 weight should fall to restore the old margin
+    is the OWNER'S call — it is deliberately left at 0.1 here because
+    `tests/test_scorer_mirror.py::test_makespan_weights_are_now_equal` pins it
+    equal to ppc_engine's, which this task may not modify, and because the
+    measurement above shows the term steers nothing in practice.
+    """
     cfg = _cfg()
     long_plan = objective.Metrics({"O0": 0.0}, 40.0, 0.0, 0.0)
     short_but_late = objective.Metrics({"O0": 6.0}, 1.0, 6.0, 6.0)
-    assert objective.score(long_plan, cfg) < objective.score(short_but_late, cfg)
+    assert objective.score(long_plan, cfg) > objective.score(short_but_late, cfg)
+    # It takes a 39-day makespan difference to buy a 2-day overage — an amount no
+    # measured run of this search has ever produced (spread: 16.4 - 17.5 days).
+    assert objective.score(long_plan, cfg) - objective.score(short_but_late, cfg) == 1.9
 
 
-def test_the_score_matches_the_incumbent_engines_formula():
-    """The A/B is only honest if both engines are measured with the same yardstick.
-
-    roster_engine may not import ppc_engine, so the formula is written fresh — and
-    that is exactly the kind of duplication that drifts. This pins them together
-    numerically instead: the same lateness map, scored by both, over signed,
-    zero, inside-band, beyond-band and beyond-CAP values — and at every worst-order
-    CEILING the live path actually sets, which is not only None (see
-    `test_the_worst_order_ceiling_is_reproduced_not_assumed_dormant`).
-    """
+def _mirror_cases():
+    """Signed, zero, inside-band, beyond-band and beyond-CAP lateness maps."""
     import random
-
-    from ppc_engine.config import PlanConfig
-    from ppc_engine.objective import objective as ppc_objective
-    from ppc_engine.objective.metrics import PlanMetrics
-
     rng = random.Random(11)
     cases = [{"A": 0.0}, {"A": 4.0}, {"A": -4.0}, {"A": 4.5}, {"A": -4.5},
              {"A": 64.0}, {"A": 64.1}, {"A": 900.0}, {"A": -900.0}, {}]
     for _ in range(40):
         cases.append({f"O{i}": float(rng.randint(-90, 90)) for i in range(8)})
+    return cases
+
+
+def test_the_score_matches_the_incumbent_engines_formula_except_the_ontime_shape():
+    """The A/B is only honest if both engines are measured with the same yardstick.
+
+    REBASED 2026-08-13 — a deliberate behaviour change, not a fudge. This engine's
+    on-time term went LINEAR at the owner's request; ``ppc_engine/`` is vendored,
+    drives only the retired ``new`` engine, and is out of scope for that change,
+    so the two now differ ON PURPOSE in exactly one place: the SHAPE of the
+    on-time overage. Everything else must still agree exactly, and the divergence
+    must be the ONLY one — so rather than deleting the mirror, this rescales it:
+    square this engine's breach back up and the two scores must match again, at
+    every ceiling the live path sets.
+
+    That is a strictly stronger statement than "they differ". It pins the band,
+    the cap, abs(), all three weights and the ceiling term as still-identical, and
+    it would fail if anyone diverged a SECOND thing.
+    """
+    from ppc_engine.config import PlanConfig
+    from ppc_engine.objective import objective as ppc_objective
+    from ppc_engine.objective.metrics import PlanMetrics
+
+    band, cap = 4.0, 60.0
     for ceiling in (None, 0.0, 10.0, 46.0):
         cfg = _cfg(worst_ceiling_days=ceiling)
         ppc_cfg = PlanConfig(plan_start=datetime(2026, 8, 12, 8, 0),
                              ceiling_days=ceiling)
-        for lateness in cases:
+        for lateness in _mirror_cases():
             for makespan in (0.0, 1.0, 37.5):
                 mine = objective.Metrics(dict(lateness), makespan, 0.0, 0.0)
                 theirs = PlanMetrics(
                     total_tardiness_days=0.0, max_tardiness_days=0.0,
                     late_order_count=0, makespan_days=makespan,
                     lateness_by_order=dict(lateness))
-                assert objective.score(mine, cfg) == ppc_objective.score(
-                    theirs, ppc_cfg), (ceiling, lateness, makespan)
+                # Re-square this engine's on-time term and everything else must
+                # line up to the cent: the ONLY divergence is the shape.
+                linear = sum(min(abs(v) - band, cap)
+                             for v in lateness.values() if abs(v) - band > 0)
+                squared = sum(min(abs(v) - band, cap) ** 2
+                              for v in lateness.values() if abs(v) - band > 0)
+                assert (objective.score(mine, cfg) - linear + squared ==
+                        pytest.approx(ppc_objective.score(theirs, ppc_cfg))), (
+                    ceiling, lateness, makespan)
+
+
+def test_the_ontime_shape_really_does_diverge_from_ppc_engine():
+    """Non-vacuity for the test above: the rescaling is doing real work, i.e. the
+    two implementations genuinely disagree before it is applied. Without this a
+    future revert to squaring would leave the mirror test passing and nothing
+    would record that the shapes were ever meant to differ."""
+    from ppc_engine.config import PlanConfig
+    from ppc_engine.objective import objective as ppc_objective
+    from ppc_engine.objective.metrics import PlanMetrics
+
+    cfg = _cfg()
+    ppc_cfg = PlanConfig(plan_start=datetime(2026, 8, 12, 8, 0))
+    lateness = {"A": 30.0, "B": -30.0, "C": 6.0}
+    mine = objective.Metrics(dict(lateness), 0.0, 0.0, 0.0)
+    theirs = PlanMetrics(total_tardiness_days=0.0, max_tardiness_days=0.0,
+                         late_order_count=0, makespan_days=0.0,
+                         lateness_by_order=dict(lateness))
+    # 26 + 26 + 2 linear, against 676 + 676 + 4 squared.
+    assert objective.score(mine, cfg) == 54.0
+    assert ppc_objective.score(theirs, ppc_cfg) == 1356.0
 
 
 def test_the_worst_order_ceiling_is_reproduced_not_assumed_dormant():
