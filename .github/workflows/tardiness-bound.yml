@@ -8,8 +8,12 @@
 # Manual only (workflow_dispatch). Nothing about the live app changes; this
 # workflow is additive and no existing file was touched to add it.
 #
-# Needs one repo secret: MONGODB_URI — the SAME store the duplicate app reads.
-# The script only ever reads from it.
+# Needs TWO repo secrets, both copied from the duplicate's Render service:
+#   MONGODB_URI           the duplicate's own cluster (masters, config, operators)
+#   UPSTREAM_MONGODB_URI  the live cluster, READ-ONLY — where the ORDERS come from
+# The duplicate mirrors the live book through an OverlayStore (engine/overlay_store.py),
+# so without the second one the book has masters but no orders and the run is useless.
+# The script only ever reads.
 name: Tardiness lower bound
 
 on:
@@ -49,6 +53,8 @@ jobs:
       - name: Compute the floor
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          UPSTREAM_MONGODB_URI: ${{ secrets.UPSTREAM_MONGODB_URI }}
+          UPSTREAM_CACHE_TTL: "3600"
         run: |
           python scripts/tardiness_bound.py \
             --level "${{ inputs.level }}" \

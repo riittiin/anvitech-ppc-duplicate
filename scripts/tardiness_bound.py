@@ -126,7 +126,17 @@ def load_book():
     actuals = book_store.load_actuals()
     so_lines = orderbook.active_so_lines(orders, actuals, masters)
     if not so_lines:
-        raise SystemExit("nothing to plan: no active orders with work remaining")
+        import os
+        have_up = bool(os.environ.get("UPSTREAM_MONGODB_URI"))
+        raise SystemExit(
+            "The store has a masters workbook but NO active orders.\n"
+            f"  MONGODB_URI set          : {bool(os.environ.get('MONGODB_URI'))}\n"
+            f"  UPSTREAM_MONGODB_URI set : {have_up}\n"
+            + ("" if have_up else
+               "\nThe duplicate mirrors the live book through an OverlayStore, so the\n"
+               "ORDERS live on the upstream (live) cluster, not the duplicate's own.\n"
+               "Add UPSTREAM_MONGODB_URI as a repo secret — the same read-only value\n"
+               "the duplicate's Render service uses — and run again."))
 
     raw_cfg = book_store.load_plan_config()
     config = Config.from_dict(json.loads(raw_cfg)) if raw_cfg else Config()
