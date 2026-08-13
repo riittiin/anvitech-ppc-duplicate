@@ -668,3 +668,25 @@ def test_apply_without_a_crew_genome_leaves_the_saved_config_alone(monkeypatch):
     m._optimize_apply()
     saved = Config.from_dict(_json.loads(book_store.load_plan_config()))
     assert saved.crew_rank is None
+
+
+def test_a_settings_save_cannot_wipe_the_applied_crew_genome(monkeypatch):
+    """The crew genome is optimizer-owned and the Settings form never sends it, so
+    it survives only because ``POST /run`` MERGES the submitted fields over the
+    saved config. Pinned because the same hazard already bit ``scheduler`` and the
+    consolidation window, and a bare ``from_dict(sent)`` would silently reset the
+    floor's roster on the next Save."""
+    from engine import book_store
+    m = _api()
+    book_store.save_masters_bytes(build_sample_bytes())
+    book_store.save_plan_config(_json.dumps(
+        _cfg("roster", crew_rank={"CNC1": 1, "CNC2": 0}).to_dict()))
+    monkeypatch.setattr(m, "_plan", lambda config: {"config": config.to_dict()})
+
+    class _Req:
+        state = type("s", (), {"role": "admin"})()
+
+    out = m.run(_Req(), m.RunRequest(config={"overlap_percent": 70}, persist=True))
+    assert out["config"]["crew_rank"] == {"CNC1": 1, "CNC2": 0}
+    saved = Config.from_dict(_json.loads(book_store.load_plan_config()))
+    assert saved.crew_rank == {"CNC1": 1, "CNC2": 0} and saved.overlap_percent == 70
