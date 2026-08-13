@@ -329,9 +329,14 @@ def build(batches, masters, config, plan_start, level, horizon_days):
               f"Settings — modelled machine-only (a relaxation): "
               f"{', '.join(sorted(unstaffed)[:4])}")
     m.set_objective(weight_total_tardiness=1)
+    # Index -> name, so the solved schedule can be decoded back into (machine,
+    # operator, start, end) rows and audited against the shop's OWN rule checks.
+    decode = {"machines": [mid for mid in sorted(masters.machines)],
+              "operators": [o for o in sorted(ops_res)],
+              "n_mach": len(mach)}
     print(f"  model: {len(jobs)} jobs, {len(mach)} machines, "
           f"{len(ops_res)} operators, {n_modes} modes, setups relaxed away")
-    return m
+    return m, decode
 
 
 def _release_delay(job, op, config, setup_min):
@@ -350,6 +355,65 @@ def _release_delay(job, op, config, setup_min):
 
 
 # --------------------------------------------------------------------------- #
+
+def _audit_rule1(res, decode, plan_start, config):
+    """How badly does the CP schedule break Rule 1?
+
+    The model cannot express "one operator mans one machine for a whole shift", so
+    its answer is a floor rather than a plan. But we can MEASURE how much it leaned
+    on that freedom: decode the solved schedule and run the shop's own
+    roster_engine.report.operator_split_violations over it — the identical check
+    the live plan is audited with.
+
+    Few splits  -> the better schedule barely needed to break Rule 1, so most of
+                   the gap to the live plan is genuinely reachable.
+    Many splits -> the CP answer is bought largely WITH the rule, and the live
+                   plan is closer to its real ceiling than the raw number suggests.
+    """
+    sol = getattr(res, "best", None) or getattr(res, "solution", None)
+    tasks = getattr(sol, "tasks", None)
+    if not tasks:
+        print("\n(no schedule to audit — the solver returned no solution)")
+        return
+
+    from engine.models import ScheduleEntry
+    from roster_engine import report as rr
+
+    mids, ops = decode["machines"], decode["operators"]
+    entries, machining_rows = [], 0
+    for i, t in enumerate(tasks):
+        if not getattr(t, "present", True) or t.end <= t.start:
+            continue
+        mid = op = None
+        for r in (t.resources or []):
+            if r < len(mids):
+                mid = mids[r]
+            elif ops and r - decode["n_mach"] - 1 < len(ops):
+                op = ops[r - decode["n_mach"] - 1]
+        if not mid or not op:
+            continue
+        st = plan_start + dt.timedelta(minutes=int(t.start))
+        en = plan_start + dt.timedelta(minutes=int(t.end))
+        entries.append(ScheduleEntry(
+            batch_id=f"T{i}", item_code=f"I{i}", process_seq=1, process_name="op",
+            machine=mid, qty=1, occupancy_min=float(t.end - t.start),
+            start=st, end=en, operator=op, op_segments=[(st, en, op)]))
+        machining_rows += 1
+
+    if not entries:
+        print("\n(schedule carried no operator assignments — run --level operators "
+              "to audit Rule 1)")
+        return
+
+    splits = rr.operator_split_violations(entries, config, None)
+    print(f"\nRULE 1 AUDIT of the schedule the solver actually found")
+    print(f"  operator-assigned operations : {machining_rows}")
+    print(f"  shifts where ONE operator is on 2+ machines : {len(splits)}")
+    if splits:
+        for row in splits[:4]:
+            print(f"    - {row['message'][:96]}")
+    print("  Your live plan has 0 of these, by construction.")
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -381,7 +445,8 @@ def main():
           f"overlap {getattr(config, 'overlap_percent', '?')}%")
 
     print(f"Building the CP model at level '{args.level}'...")
-    model = build(batches, masters, config, plan_start, args.level, args.horizon_days)
+    model, decode = build(batches, masters, config, plan_start, args.level,
+                          args.horizon_days)
 
     print(f"Solving (limit {args.time_limit:.0f}s)...")
     print("  exit code 143 here means the RUNNER killed it for memory — rerun with"
@@ -398,6 +463,7 @@ def main():
     if lb_min is not None:
         print(f"PROVEN FLOOR         : {lb_min / MINUTES_PER_DAY:>9.1f} late-days")
     print("=" * 68)
+    _audit_rule1(res, decode, plan_start, config)
     print("""
 HOW TO READ THIS
   Compare the floor against the late-days on your Schedule tab.
