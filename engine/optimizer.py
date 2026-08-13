@@ -98,6 +98,12 @@ class OptimizeResult:
     evals: int = 0
     improved: bool = False
     cancelled: bool = False   # True when stopped early via should_cancel (best-so-far kept)
+    # The roster engine searches a SECOND genome beside the sequence: {machine id ->
+    # priority rank}, the order the roster fills machines in. It is as much a part of
+    # the answer as ``ranks`` — replay the ranks with a different crew and you get a
+    # different plan — so it is persisted by Apply alongside them. Empty for every
+    # other engine, which has no such dimension.
+    crew_rank: dict = field(default_factory=dict)
 
 
 def score(metrics: dict) -> float:
@@ -289,6 +295,18 @@ def optimize(so_lines, config, masters, *, reserved=None, budget_evals=150,
         return new_engine.optimize_sequence(
             so_lines, config, masters, reserved=reserved, budget_evals=budget_evals,
             seed=seed, on_progress=on_progress, should_cancel=should_cancel, frozen=frozen)
+    # The roster engine likewise owns its own search — over TWO genomes, the job
+    # sequence and the crew. ``frozen`` MUST be forwarded: the fall-through body
+    # below evaluates without it, which was safe only because classic and flow
+    # ignore frozen by design. The roster adapter honours it, so an unforwarded
+    # frozen set means the contest scores plans with in-progress work floating free
+    # while the applied plan pins it — the ranks would answer the wrong question.
+    if getattr(config, "scheduler", "classic") == "roster":
+        from engine import roster_adapter
+        return roster_adapter.optimize_sequence(
+            so_lines, config, masters, reserved=reserved, budget_evals=budget_evals,
+            seed=seed, on_progress=on_progress, should_cancel=should_cancel,
+            frozen=frozen)
     config.validate()
 
     batches = rule1_consolidate.run(list(so_lines), config=config, masters=masters)
@@ -435,13 +453,31 @@ FLOW_CHUNK_CANDIDATES = (4, 6)
 # over classic, without hanging the free instance.
 FLOW_LOCAL_BUDGET = 100
 
+# The owner's overlap band for the roster engine (2026-08-12). Under this
+# engine's definition (roster_engine.release) the percentage is the fraction of
+# a step's pieces that must have CLEARED before its successor may start, so 50 =
+# "start once half are done" and 100 = fully sequential. Below 50 a successor
+# starts on a handful of pieces and the shop floor stops believing the plan, so
+# the owner's band is the whole physically sane range. Six coarse points here;
+# optimize_service.CLOUD_ROSTER_OVERLAP_CANDIDATES is the finer grid the parallel
+# cloud contest fans across Actions shards.
+ROSTER_OVERLAP_CANDIDATES = (50, 60, 70, 80, 90, 100)
+
 
 def knob_for(config):
     """The ONE setting the sweep contest tunes for this scheduler mode:
     ('flow_chunks', FLOW_CHUNK_CANDIDATES) under the flow scheduler,
-    ('overlap_percent', OVERLAP_CANDIDATES) under classic Rule 6."""
+    ('overlap_percent', ROSTER_OVERLAP_CANDIDATES) under the roster engine,
+    ('overlap_percent', OVERLAP_CANDIDATES) under classic Rule 6 / the new engine.
+
+    The roster branch is easy to miss because the KNOB NAME is the same as the
+    default's: forget it and the contest still runs, still tunes overlap, and
+    still looks right — it just searches classic's narrow (70, 80, 85, 88)
+    instead of the owner's 50-100 band."""
     if getattr(config, "scheduler", "classic") == "flow":
         return "flow_chunks", FLOW_CHUNK_CANDIDATES
+    if getattr(config, "scheduler", "classic") == "roster":
+        return "overlap_percent", ROSTER_OVERLAP_CANDIDATES
     return "overlap_percent", OVERLAP_CANDIDATES
 
 
@@ -476,6 +512,7 @@ class SweepResult:
     table: list = field(default_factory=list)   # per-candidate probe outcomes
     evals: int = 0
     cancelled: bool = False
+    crew_rank: dict = field(default_factory=dict)   # the winning crew genome (roster)
 
 
 def sweep_optimize(so_lines, config, masters, *, budget_evals=150, seed=42,
@@ -490,6 +527,16 @@ def sweep_optimize(so_lines, config, masters, *, budget_evals=150, seed=42,
         return new_engine.sweep_optimize(
             so_lines, config, masters, budget_evals=budget_evals, seed=seed,
             on_progress=on_progress, should_cancel=should_cancel, base_reserved=base_reserved, frozen=frozen)
+    # Same for roster — and note ``frozen=`` below is NOT forwarded to
+    # _sweep_optimize_classic, which has no such parameter. That is deliberate and
+    # safe for classic/flow (they ignore frozen) and would be a silent, unnoticeable
+    # defect for roster, which does not.
+    if getattr(config, "scheduler", "classic") == "roster":
+        from engine import roster_adapter
+        return roster_adapter.sweep_optimize(
+            so_lines, config, masters, budget_evals=budget_evals, seed=seed,
+            on_progress=on_progress, should_cancel=should_cancel,
+            base_reserved=base_reserved, frozen=frozen)
     return _sweep_optimize_classic(
         so_lines, config, masters, budget_evals=budget_evals, seed=seed,
         on_progress=on_progress, should_cancel=should_cancel,

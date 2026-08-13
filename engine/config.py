@@ -154,6 +154,15 @@ class Config:
     # + existing rule tests stable); the web UI defaults it ON.
     apply_operator_logic: bool = False
 
+    # The roster engine's CREW GENOME: {machine id -> priority rank}, the order the
+    # roster fills machines in when it mans a shift (roster_engine.roster). It is a
+    # second search dimension alongside the job sequence, so — exactly like
+    # ``overlap_percent`` — it is OPTIMIZER-OWNED: never typed into Settings, written
+    # only when an optimize result is applied, and replayed by every later plan so the
+    # floor keeps ONE roster instead of a fresh one on every refresh.
+    # None (and {}) mean "not set"; every other engine ignores it entirely.
+    crew_rank: Optional[dict] = None
+
     def validate(self) -> None:
         """Fail loud on a bad config (Design spec §8 — config validation)."""
         errs = []
@@ -185,8 +194,14 @@ class Config:
             errs.append("two_shift_threshold_hours must be >= 0")
         if not isinstance(self.apply_operator_logic, bool):
             errs.append("apply_operator_logic must be true or false")
-        if self.scheduler not in ("classic", "flow", "new"):
-            errs.append("scheduler must be 'classic', 'flow', or 'new'")
+        # "roster" = the roster-first engine (roster_engine/, 2026-08-12 spec),
+        # dispatched by pipeline.scheduler_for -> engine/roster_adapter.py. It must
+        # be listed here or NOTHING can plan on it: run_forward, optimizer.optimize
+        # and optimize_service all call validate(), and api._load_plan_config drops
+        # a config that fails validation back to a bare Config() — i.e. an admin's
+        # saved choice would be silently downgraded to classic.
+        if self.scheduler not in ("classic", "flow", "new", "roster"):
+            errs.append("scheduler must be 'classic', 'flow', 'new', or 'roster'")
         if not (1 <= int(self.flow_chunks) <= 50):
             errs.append("flow_chunks must be within 1..50")
         if not isinstance(self.split_parallel, bool):
@@ -203,6 +218,8 @@ class Config:
             errs.append("worst_ceiling_days must be >= 0 or None")
         if self.committed_promise_slack_days < 0:
             errs.append("committed_promise_slack_days must be >= 0")
+        if self.crew_rank is not None and not isinstance(self.crew_rank, dict):
+            errs.append("crew_rank must be a {machine id: rank} mapping or null")
         if errs:
             raise ValueError("Invalid config: " + "; ".join(errs))
 
@@ -230,6 +247,11 @@ class Config:
                     value = None
                 elif isinstance(value, str):
                     value = date.fromisoformat(value)
+            if key == "crew_rank":
+                # "" / null / {} from the wire all mean "no crew genome on file",
+                # and they must land as the SAME value or _inputs_signature would
+                # see a settings change where there is none.
+                value = dict(value) if value else None
             if key == "priority_window_days":
                 # "" / "none" / null from the UI means "no limit".
                 if value in (None, "", "none", "null"):
