@@ -54,11 +54,16 @@ _EPS = 1e-9
 _SECOND = timedelta(seconds=1)
 
 # How many consecutive shift windows may pass with nothing placed while work is
-# still outstanding before we call it impossible rather than merely slow. A single
-# outsourcing block is the longest legitimate quiet spell (the real book carries up
-# to 264 h ≈ 22 working shifts); 120 windows is ~60 days, comfortably clear of it
-# and still fast enough that an unstaffable machine fails in milliseconds instead
-# of walking the whole 400-day horizon.
+# still outstanding before we stop walking the horizon. A single outsourcing block
+# is the longest legitimate quiet spell (the real book carries up to 264 h ≈ 22
+# working shifts); 120 windows is ~60 days, comfortably clear of it and still fast
+# enough that an unstaffable machine is answered in milliseconds instead of after
+# the whole 400-day horizon.
+#
+# It is a SPEED bound, not a verdict. Whatever it stops short of is handled by the
+# same degrade path as a genuinely impossible step, and ``_blocked_reason`` checks
+# Settings before naming a cause — so a merely slow book is no longer reported as
+# a missing qualification.
 _STALL_WINDOWS = 120
 
 # Several clubbed SO lines can each be part-finished on the SAME batch operation,
@@ -66,24 +71,60 @@ _STALL_WINDOWS = 120
 # on one machine, so exactly one of those rows becomes the pin and the others are
 # reported under this reason — not an error, but it keeps the row accounting in
 # `Plan.unpinned` exact rather than approximately exact.
+#
+# It is the reason ONLY when the rows agree on the machine. Two rows naming
+# DIFFERENT machines for one operation is a data CONFLICT, not a duplicate, and
+# calling it "superseded" attributes a cause nobody checked (the 2026-08-09 rule).
+# The reviewer saw this message 8-11 times per book on a WIP run, i.e. on the
+# owner's screen, so the two are told apart by ``_supersede_reason``.
 _SUPERSEDED = "superseded by an earlier-started row for the same operation"
+_CONFLICT = ("two in-progress rows name DIFFERENT machines for one operation "
+             "(%s and %s); it runs once, so %s was kept — the older start wins")
+
+
+def _supersede_reason(kept_mid: str, dropped_mid: str) -> str:
+    """Why a second row for one (job, op) was not applied. CHECKED, not assumed:
+    same machine -> a duplicate; different machine -> a real conflict."""
+    if str(kept_mid) == str(dropped_mid):
+        return _SUPERSEDED
+    return _CONFLICT % (kept_mid, dropped_mid, kept_mid)
 
 
 class Unschedulable(RuntimeError):
-    """No shift inside the horizon could ever staff some operation.
+    """NOTHING in this book could be planned — not one job reached its last step.
+
+    Deliberately narrow. One machine losing its only qualified operator must cost
+    that machine's ORDERS their plan, never the whole book's (CLAUDE.md principle
+    5(a): a master-data gap is non-blocking and skips only the affected order, and
+    a routing naming a machine the Machine master has not caught up with is a
+    documented, ongoing condition). ``schedule`` therefore DROPS the jobs it could
+    not place and reports them in ``Plan.dropped``; this is raised only when that
+    would leave nothing at all, which really is a book the shop cannot run.
 
     A ``RuntimeError`` subclass, so a caller that only knows the base class is
-    unaffected and the message is unchanged. It additionally carries ``blocked``
-    — ``((job_key, op_seq, op_name, machine_options), ...)`` — because this package
-    deliberately knows nothing about the application embedding it and therefore
-    cannot raise that application's own localized error type. The embedder reads
-    ``blocked`` and re-raises in its own terms; without it, the only way to name
-    the offending job is to parse the message back apart.
+    unaffected. It additionally carries ``blocked`` — ``((job_key, op_seq,
+    op_name, machine_options, reason), ...)`` — because this package deliberately
+    knows nothing about the application embedding it and therefore cannot raise
+    that application's own localized error type. The embedder reads ``blocked``
+    and re-raises in its own terms; without it, the only way to name the offending
+    job is to parse the message back apart.
     """
 
     def __init__(self, message: str, blocked=()):
         super().__init__(message)
         self.blocked = tuple(blocked)
+
+
+class PlanStartMissing(ValueError):
+    """``config.plan_start_date`` was None when the engine was called.
+
+    A caller bug, not a shop condition — the API boundary resolves the nullable
+    "auto: start from today" to a real date and the pure engine must never see
+    None (CLAUDE.md, ``engine/config.py``). It is TYPED so the seam can contain it
+    as a localized ``RuleError`` instead of letting a bare ``ValueError`` unwind
+    ``run_forward`` and blank every per-rule tab: ``roster_adapter.run`` catches
+    only what it names, and it used to name ``Unschedulable`` alone.
+    """
 
 
 @dataclass(frozen=True)
@@ -113,11 +154,20 @@ class Plan:
     """``unpinned`` is the frozen rows this plan could NOT honour, as
     ``((row, reason), ...)`` — see ``_apply_frozen``. It defaults to empty, so a
     caller that does not care is unaffected; a caller that does can check the
-    accounting closes (every row in is either an applied pin or a row here)."""
+    accounting closes (every row in is either an applied pin or a row here).
+
+    ``dropped`` is the jobs no shift in the horizon could place, as
+    ``((job_key, op_seq, op_name, machine_options, reason), ...)``. They are in
+    NO plan — every placement they had made is removed, so an order is either
+    fully planned or absent, never half-drawn on the Gantt. A dropped job must
+    never be silent: the seam turns each of these into a note (see
+    ``roster_adapter.run``), which is how ``build_jobs`` already reports the
+    NO_ROUTING skips this is the sibling of."""
 
     placements: tuple
     completion: dict
     unpinned: tuple = ()
+    dropped: tuple = ()
 
 
 class _JobState:
@@ -191,27 +241,66 @@ def schedule(jobs, sequence, shop, config, *, overlap=1.0, crew_rank=None,
         if stalled > _STALL_WINDOWS:
             break
 
+    # DEGRADE AT THE PLACEMENT-FAILURE BOUNDARY. One unstaffable machine used to
+    # cost the ENTIRE book its plan — including every order that never touches it
+    # — which inverts CLAUDE.md principle 5(a) (a master-data gap is non-blocking
+    # and skips only the affected order) and would blank the owner's whole
+    # schedule the day a routing names a machine the Machine master has not caught
+    # up with. The jobs that could not be placed are dropped and REPORTED; the
+    # rest of the book is planned.
     unfinished = [key for key in order if state[key].idx < len(state[key].job.ops)]
-    if unfinished:
-        # Fail loud rather than silently under-schedule (RULES.md). Name the
-        # blocking step and the machines it wants: the overwhelmingly likely cause
-        # is a machine no operator in Settings is qualified for, or one a routing
-        # points at that is not in the Machine master at all.
-        blocked = []
-        for key in unfinished[:5]:
-            js = state[key]
-            op = js.job.ops[js.idx]
-            blocked.append((key, op.seq, op.name, tuple(op.machine_options)))
+    blocked = tuple(_blocked_row(state[key], shop) for key in unfinished)
+    if unfinished and len(unfinished) == len(order):
+        # Nothing at all could be planned. That is not one order's data gap, it is
+        # a book the shop cannot run — fail loud (RULES.md), never hand back an
+        # empty schedule that reads as "no work to do".
         raise Unschedulable(
-            "roster scheduler could not place every operation within the horizon "
-            "— no shift ever had a qualified, rostered operator for: "
-            + "; ".join(f"{key} step {seq} '{name}' on "
-                        f"{'/'.join(options) or '(no machine)'}"
-                        for key, seq, name, options in blocked),
-            blocked)
+            "roster scheduler could not place a single order within the horizon: "
+            + _blocked_text(blocked), blocked)
+    if unfinished:
+        # An order is either fully planned or absent — a half-laid routing on the
+        # Gantt would be a worse lie than an omission.
+        gone = set(unfinished)
+        placements = [p for p in placements if p.job_key not in gone]
+        for key in gone:
+            completion.pop(key, None)
 
     placements = _pace(placements, completion)
-    return Plan(tuple(placements), completion, tuple(unpinned))
+    return Plan(tuple(placements), completion, tuple(unpinned), blocked)
+
+
+def _blocked_row(js, shop):
+    op = js.job.ops[js.idx]
+    options = tuple(op.machine_options)
+    return (js.job.key, op.seq, op.name, options, _blocked_reason(options, shop))
+
+
+def _blocked_reason(options, shop) -> str:
+    """WHY this step could not be placed — CHECKED against Settings, never
+    assumed. The old text asserted "no shift ever had a qualified, rostered
+    operator" for every failure, including the ones ``_STALL_WINDOWS`` produces
+    out of a merely SLOW book, which is exactly the 2026-08-09 defect: a report
+    may not attribute a cause it did not check. When the machines really are
+    staffable the honest answer is that the cause is unexplained, and it says so.
+    """
+    if not options:
+        return "its routing names no machine"
+    unstaffed = [m for m in options if not _staffable(m, shop)]
+    if len(unstaffed) < len(options):
+        return ("the horizon ran out with this step still outstanding; its "
+                "machines ARE staffable in Settings, so the cause is not a "
+                "missing qualification")
+    missing = [m for m in options if m not in shop.machines]
+    if len(missing) == len(options):
+        return ("no operator in Settings is qualified for it, and it is not in "
+                "the Machine master yet")
+    return "no operator in Settings is qualified for it"
+
+
+def _blocked_text(blocked, limit=5) -> str:
+    return "; ".join(f"{key} step {seq} '{name}' on "
+                     f"{'/'.join(options) or '(no machine)'} ({why})"
+                     for key, seq, name, options, why in blocked[:limit])
 
 
 # --------------------------------------------------------------------------- #
@@ -227,10 +316,11 @@ def _plan_start(config) -> datetime:
     in this module), and Config has no ``first_shift_start`` time field — it stores
     plain hour ints. ``plan_start_date`` is nullable in Config but the pure engine
     must never see None (api resolves it at the boundary), so a None here is a
-    caller bug and says so."""
+    caller bug and says so — through a TYPED error the seam can contain, because a
+    bare ``ValueError`` escaping ``run_forward`` discards the whole trace."""
     day = getattr(config, "plan_start_date", None)
     if day is None:
-        raise ValueError(
+        raise PlanStartMissing(
             "plan_start_date is None — resolve it to a real date at the API "
             "boundary before calling the scheduler")
     base = datetime.combine(day, time(int(config.first_shift_start_hour), 0))
@@ -861,14 +951,26 @@ def _pace(placements, completion) -> list:
     return out
 
 
-def _field(row, *names):
+# --------------------------------------------------------------------------- #
+# Reading a frozen row — THE authoritative definitions
+#
+# ``engine.roster_adapter`` translates SO-LINE rows into BATCH pins before this
+# module ever sees them, and it needs the same three answers (which spelling
+# carries the value, how a previous-plan start sorts, which of two rows for one
+# operation wins). It IMPORTS these rather than keeping its own copies: they used
+# to be duplicated with different rank tuples, one edit away from the two halves
+# disagreeing about which pin survives.
+# --------------------------------------------------------------------------- #
+
+def row_value(row, *names):
     """One value out of a frozen row, whatever it is spelled and whatever type it
     is. ``engine.freeze.compute_frozen_set`` emits ``machine`` and an ISO STRING
     ``prev_start``; the app's adapter renames some of that to ``machine_id`` /
     ``order_key``. A pin that silently does nothing because of a key name is the
     worst failure available here — the plan looks fine and the part is on the
     wrong machine — so both spellings are read, and a row is only ever ignored on
-    its merits."""
+    its merits. Blank counts as absent, so an empty ``machine`` falls through to
+    the next spelling rather than pinning to ""."""
     for name in names:
         value = (row.get(name) if hasattr(row, "get")
                  else getattr(row, name, None))
@@ -877,15 +979,25 @@ def _field(row, *names):
     return None
 
 
-def _prev_start_key(row):
+def prev_start_key(row):
     """A sortable, type-stable previous-plan start. Datetimes and ISO strings both
     normalise to an ISO string, which sorts chronologically; a missing one sorts
     last rather than blowing up a comparison."""
-    value = _field(row, "prev_start", "start")
+    value = row_value(row, "prev_start", "start")
     if isinstance(value, datetime):
         return (0, value.isoformat())
     text = str(value).strip() if value is not None else ""
     return (0, text) if text else (1, "")
+
+
+def pin_rank(row, mid):
+    """Which of several rows for ONE (job, op) becomes the pin: the earliest
+    previous-plan start, then machine, operator and SO number so the answer can
+    never depend on the order the rows arrive in. ``mid`` is passed in because the
+    adapter has already normalised it and this module has not."""
+    return (prev_start_key(row), str(mid),
+            str(row_value(row, "operator") or ""),
+            str(row_value(row, "so_no") or ""))
 
 
 def _staffable(mid, shop) -> bool:
@@ -960,9 +1072,9 @@ def _apply_frozen(frozen, state, machines, shop):
     pins: dict = {}
     dropped: list = []
     for row in frozen or ():
-        key = _field(row, "order_key", "job_key", "batch_id")
-        seq = _field(row, "op_seq", "process_seq")
-        mid = _field(row, "machine_id", "machine")
+        key = row_value(row, "order_key", "job_key", "batch_id")
+        seq = row_value(row, "op_seq", "process_seq")
+        mid = row_value(row, "machine_id", "machine")
         if key is None or seq is None or mid is None:
             dropped.append((row, "the row names no job, step or machine"))
             continue
@@ -990,16 +1102,15 @@ def _apply_frozen(frozen, state, machines, shop):
             dropped.append(
                 (row, f"no operator in Settings is qualified for {mid}"))
             continue
-        rank = (_prev_start_key(row), mid,
-                str(_field(row, "operator") or ""))
+        rank = pin_rank(row, mid)
         current = pins.get((key, seq))
         if current is None:
             pins[(key, seq)] = (rank, mid, row)
         elif rank < current[0]:
-            dropped.append((current[2], _SUPERSEDED))
+            dropped.append((current[2], _supersede_reason(mid, current[1])))
             pins[(key, seq)] = (rank, mid, row)
         else:
-            dropped.append((row, _SUPERSEDED))
+            dropped.append((row, _supersede_reason(current[1], mid)))
 
     # ``state`` is built in the caller's sequence order, so a job's position in it
     # IS its priority — the tie-break when two parts were started at the same
@@ -1009,7 +1120,7 @@ def _apply_frozen(frozen, state, machines, shop):
         js = state[key]
         js.pinned[seq] = mid
         js.pin_rank[seq] = rank
-        who = str(_field(row, "operator") or "")
+        who = str(row_value(row, "operator") or "")
         if who:
             js.pin_operator[seq] = who
         machines[mid].pinned_jobs.append((rank, position[key], key))

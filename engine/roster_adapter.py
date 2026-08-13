@@ -33,13 +33,18 @@ not owe. See ``_pins`` for the five things that translation has to get right.
 
 from __future__ import annotations
 
-from datetime import datetime
+import dataclasses
+from datetime import date
 
 from engine.loaders import normalize_process_name, normalize_resource_id
 from engine.models import ScheduleEntry
 from engine.pipeline import RuleError
 from roster_engine import SCHEDULER_FINGERPRINT  # noqa: F401  (re-exported)
 from roster_engine import scheduler
+# ONE definition of how a frozen row is read and which of two rows for one
+# operation wins — see ``roster_engine.scheduler``'s "authoritative definitions"
+# block. This file used to keep its own copies with a DIFFERENT rank tuple.
+from roster_engine.scheduler import pin_rank, prev_start_key, row_value
 from roster_engine.domain import OUTSOURCED, build_jobs, build_shop
 
 # The exact strings every off-machine consumer matches on. Pinned by test against
@@ -74,13 +79,14 @@ def run(batches, config=None, notes=None, masters=None, machine_lost_min=None,
     pins = _pins(frozen, batch_by_key, masters, say)
     try:
         plan = scheduler.schedule(
-            jobs, [j.key for j in jobs], shop, config,
+            jobs, [j.key for j in jobs], shop, _resolved(config),
             overlap=_overlap(config),
             crew_rank=dict(getattr(config, "crew_rank", None) or {}),
             frozen=pins)
-    except scheduler.Unschedulable as err:
+    except (scheduler.Unschedulable, scheduler.PlanStartMissing) as err:
         raise _rule_error(err) from err
     _check_pins_landed(pins, plan, say)
+    _report_dropped(plan, batch_by_key, say)
     return _entries(plan, batch_by_key)
 
 
@@ -126,7 +132,8 @@ def optimize_sequence(so_lines, config, masters, *, reserved=None, budget_evals=
     # forwarded: it is roster_engine's type, not the dict every caller expects.
     prog = (lambda evals, _metrics: on_progress(evals, None)) if on_progress else None
 
-    res = roster_search.optimize(jobs, shop, config, overlap=_overlap(config),
+    res = roster_search.optimize(jobs, shop, _resolved(config),
+                                 overlap=_overlap(config),
                                  budget_evals=int(budget_evals), seed=int(seed),
                                  on_eval=prog, should_cancel=should_cancel,
                                  frozen=pins)
@@ -140,7 +147,10 @@ def optimize_sequence(so_lines, config, masters, *, reserved=None, budget_evals=
     from dataclasses import replace as _replace
     winner = run(ordered, config=_replace(config, crew_rank=crew), masters=masters,
                  reserved=reserved, frozen=frozen)
-    plan_start = getattr(config, "plan_start_date", None)
+    # ``or date.today()`` — the same fallback ``new_engine.optimize_sequence``
+    # carries. A None here silently measured every candidate's lateness against
+    # nothing.
+    plan_start = getattr(config, "plan_start_date", None) or date.today()
     metrics = plan_metrics(
         winner, so_lines, plan_start,
         ceiling_days=getattr(config, "worst_ceiling_days", None),
@@ -210,6 +220,50 @@ def sweep_optimize(so_lines, config, masters, *, budget_evals=150, seed=42,
                        crew_rank=dict(res.crew_rank or {}))
 
 
+def _resolved(config):
+    """``plan_start_date`` as a real date. ``None`` means "auto: start from today
+    (IST)" and the API boundary normally resolves it (``api._resolve_config``);
+    this is the same ``or date.today()`` fallback ``new_engine.optimize_sequence``
+    already carries, for the paths that reach an engine without going through it.
+    Returns ``config`` untouched when it is already resolved, so no plan moves."""
+    if getattr(config, "plan_start_date", None) is not None:
+        return config
+    try:
+        return dataclasses.replace(config, plan_start_date=date.today())
+    except TypeError:                      # not a dataclass (a test double)
+        return config
+
+
+def _report_dropped(plan, batch_by_key, say):
+    """Name every order the engine could not place. It is in NO plan — no bar on
+    the Gantt, no row in the delay report — and a silently dropped order is this
+    codebase's most expensive recurring defect class, so it is reported through
+    the same ``notes`` channel ``build_jobs`` reports its NO_ROUTING skips on.
+
+    The plan itself is still returned: one machine with nobody qualified for it in
+    Settings must not cost every OTHER order its schedule (CLAUDE.md principle
+    5(a)). ``roster_engine`` raises instead when NOTHING could be placed.
+    """
+    dropped = list(getattr(plan, "dropped", ()) or ())
+    if not dropped:
+        return
+    say.append(
+        "roster engine: %d order(s) could NOT be scheduled and are in no plan — %s%s"
+        % (len(dropped),
+           "; ".join("%s (%s) blocked at step %s '%s' on %s — %s"
+                     % (key, _order_label(batch_by_key.get(key)), seq, name,
+                        "/".join(options) or "(no machine)", why)
+                     for key, seq, name, options, why in dropped[:5]),
+           "" if len(dropped) <= 5 else "; …"))
+
+
+def _order_label(batch) -> str:
+    if batch is None:
+        return "?"
+    refs = ", ".join(str(so) for so in _so_refs(batch)[:3])
+    return "%s%s" % (getattr(batch, "item_code", "?"), " / " + refs if refs else "")
+
+
 def _rule_error(err) -> RuleError:
     """``roster_engine`` fails loud with its own ``Unschedulable`` — it knows
     nothing about this app and must not, so it cannot raise ``RuleError`` itself.
@@ -220,11 +274,14 @@ def _rule_error(err) -> RuleError:
     ``run_forward`` entirely — the trace Rules 1-3 filled in is discarded, every
     per-rule tab goes blank and ``POST /run`` returns a 500 with nothing to show
     the planner. CLAUDE.md principle 5(b): a rule-level contract violation is
-    typed and LOCALIZED, so the frontend can say exactly where it broke.
+    typed and LOCALIZED, so the frontend can say exactly where it broke. The same
+    argument is why ``PlanStartMissing`` (a ``ValueError``, so ``except
+    Unschedulable`` never saw it) is caught here too.
 
-    The commonest cause is a routing pointing at a machine nobody in Settings is
-    qualified for — including the documented PROVISIONAL machine, one a routing
-    names before the Machine master has caught up.
+    This now means what it says: the whole book is unschedulable. A single
+    unstaffable machine — including the documented PROVISIONAL one, named by a
+    routing before the Machine master has caught up — degrades instead, dropping
+    its own orders and reporting them (``_report_dropped``).
     """
     blocked = getattr(err, "blocked", ()) or ()
     record_id = str(blocked[0][0]) if blocked else "-"
@@ -274,29 +331,6 @@ def _absent_from_reserved(reserved, masters, say) -> dict:
 # Frozen rows: SO LINES in, BATCH operations out
 # --------------------------------------------------------------------------- #
 
-def _value(row, *names):
-    """One value out of a frozen row, whatever it is spelled. Blank counts as
-    absent, so an empty ``machine`` falls through to the next spelling rather than
-    pinning to ""."""
-    for name in names:
-        value = (row.get(name) if hasattr(row, "get")
-                 else getattr(row, name, None))
-        if value is not None and value != "":
-            return value
-    return None
-
-
-def _prev_start_key(row):
-    """A sortable, type-stable previous-plan start. ``compute_frozen_set`` emits an
-    ISO **string**; other callers hand a ``datetime``. Both normalise to an ISO
-    string, which sorts chronologically; a missing one sorts last."""
-    value = _value(row, "prev_start", "start")
-    if isinstance(value, datetime):
-        return (0, value.isoformat())
-    text = str(value).strip() if value is not None else ""
-    return (0, text) if text else (1, "")
-
-
 def _flatten(frozen) -> list:
     """``book_store.load_frozen_ops`` returns a flat list; ``run_forward``'s
     docstring types ``frozen`` as {machine id -> rows}. Accept both."""
@@ -316,23 +350,23 @@ def _so_refs(batch) -> list:
 
 
 def _describe(row) -> str:
-    who = _value(row, "so_no") or _value(row, "order_key") or "?"
-    item = _value(row, "item_code") or ""
-    seq = _value(row, "op_seq", "process_seq")
-    mid = _value(row, "machine_id", "machine") or "?"
+    who = row_value(row, "so_no") or row_value(row, "order_key") or "?"
+    item = row_value(row, "item_code") or ""
+    seq = row_value(row, "op_seq", "process_seq")
+    mid = row_value(row, "machine_id", "machine") or "?"
     return "%s%s step %s on %s" % (who, "/" + str(item) if item else "", seq, mid)
 
 
 def _seq_for(row, batch, masters):
     """The routing step this row pins. Trust ``op_seq``; fall back to matching the
     routing by normalised process name, the way ``new_engine._ppc_frozen`` does."""
-    raw = _value(row, "op_seq", "process_seq")
+    raw = row_value(row, "op_seq", "process_seq")
     if raw is not None:
         try:
             return int(raw), None
         except (TypeError, ValueError):
             return None, "step %r is not a number" % (raw,)
-    want = normalize_process_name(_value(row, "process", "process_name") or "")
+    want = normalize_process_name(row_value(row, "process", "process_name") or "")
     routing = masters.routings.get(batch.item_code) if want else None
     if routing is not None:
         for proc in routing.processes:
@@ -384,12 +418,13 @@ def _pins(frozen, batch_by_key, masters, say) -> list:
     best: dict = {}
     unmapped: list = []
     superseded = 0
+    conflicts: list = []
     for row in rows:
-        key = _value(row, "order_key", "job_key")
+        key = row_value(row, "order_key", "job_key")
         key = str(key) if key is not None and str(key) in batch_by_key else None
         if key is None:
-            key = so_to_key.get((str(_value(row, "so_no") or ""),
-                                 str(_value(row, "item_code") or "")))
+            key = so_to_key.get((str(row_value(row, "so_no") or ""),
+                                 str(row_value(row, "item_code") or "")))
         if key is None:
             unmapped.append((row, "no batch in this plan covers it"))
             continue
@@ -397,13 +432,11 @@ def _pins(frozen, batch_by_key, masters, say) -> list:
         if seq is None:
             unmapped.append((row, why))
             continue
-        mid = normalize_resource_id(_value(row, "machine_id", "machine") or "")
+        mid = normalize_resource_id(row_value(row, "machine_id", "machine") or "")
         if not mid:
             unmapped.append((row, "the row names no machine"))
             continue
-        rank = (_prev_start_key(row), mid,
-                str(_value(row, "operator") or ""),
-                str(_value(row, "so_no") or ""))
+        rank = pin_rank(row, mid)
         pin = dict(row) if isinstance(row, dict) else {
             k: getattr(row, k) for k in ("so_no", "item_code", "process",
                                          "op_seq", "machine", "operator",
@@ -415,11 +448,22 @@ def _pins(frozen, batch_by_key, masters, say) -> list:
         # read by accident further down.
         pin.pop("remaining_qty", None)
         current = best.get((key, seq))
-        if current is None or rank < current[0]:
-            superseded += 1 if current is not None else 0
+        if current is None:
             best[(key, seq)] = (rank, pin)
+            continue
+        # Two rows for ONE operation. Same machine -> a duplicate, the ordinary
+        # clubbed-SO-lines case. DIFFERENT machines -> a genuine data conflict:
+        # the last plan cannot have had one operation in two chucks, so something
+        # upstream disagrees with itself. Reporting that as merely "superseded"
+        # attributes a cause nobody checked (2026-08-09).
+        kept, loser = (rank, pin), current
+        if rank >= current[0]:
+            kept, loser = current, (rank, pin)
+        if kept[1]["machine_id"] != loser[1]["machine_id"]:
+            conflicts.append((loser[1], kept[1]["machine_id"]))
         else:
             superseded += 1
+        best[(key, seq)] = kept
 
     if unmapped:
         say.append("frozen work: %d in-progress row(s) could not be matched to "
@@ -429,8 +473,17 @@ def _pins(frozen, batch_by_key, masters, say) -> list:
                                 for r, why in unmapped[:5])))
     if superseded:
         say.append("frozen work: %d row(s) describe an operation another row "
-                   "already covers (clubbed SO lines on one batch step); one "
-                   "machine each, as an operation runs once." % superseded)
+                   "already covers ON THE SAME MACHINE (clubbed SO lines on one "
+                   "batch step); one machine each, as an operation runs once."
+                   % superseded)
+    if conflicts:
+        say.append("frozen work: %d in-progress row(s) CONFLICT — they name a "
+                   "different machine for an operation another row already "
+                   "covers, which one operation cannot be on. The "
+                   "earlier-started row was kept: %s"
+                   % (len(conflicts),
+                      "; ".join("%s (kept %s)" % (_describe(r), kept)
+                                for r, kept in conflicts[:5])))
     return [pin for _key, (_rank, pin) in sorted(best.items())]
 
 

@@ -99,11 +99,25 @@ def test_dispatch_as_predecessor_never_overlaps():
 def test_a_no_cutting_step_waits_for_full_completion_not_a_partial_release():
     """Direct test of work_min_before_release's full-completion-wait branch
     (RULES.md:127) — ``overlaps()`` above only covers the start GATE; this covers
-    the minutes-before-release CALCULATION for the same rule: a no-cycle-time step
-    must not use ``released_pieces`` at all."""
+    the minutes-before-release CALCULATION for the same rule: a step that does not
+    hand pieces over gradually must not use ``released_pieces`` at all.
+
+    THE FIXTURE IS THE WHOLE TEST (2026-08-13 review). It used to use a manual
+    step at ``cycle=0.0``, where BOTH branches evaluate to 0.0 — so it could not
+    discriminate, and deleting the branch it is named for kept it green. This
+    repo's rule is that a test passing under mutation tests nothing.
+
+    An OUTSOURCED block at a nonzero cycle is the discriminating case, and it is
+    the real one: a vendor delivers the whole lot at once, so its successor waits
+    for all 350 minutes. Under the deleted branch it would be released after
+    ``ceil(0.2 x 50) = 10`` pieces, i.e. 70 minutes — the successor starting on
+    parts still at the vendor. (The branch is unreachable through the scheduler,
+    which gates both call sites on ``overlaps()``; it is kept because it is the
+    rule, and this is what makes keeping it honest.)"""
+    job = _job([_op(1, "outsourced", cycle=7.0)], qty=50)
+    assert release.work_min_before_release(
+        job, job.ops[0], overlap=0.2, setup_min=90.0) == 350.0
+    # ...and the zero-cycle in-house case the old fixture covered, still pinned.
     job = _job([_op(1, "manual", cycle=0.0)], qty=50)
-    # Manual carries no setup, and a zero-cycle step contributes 0 minutes of
-    # work regardless of overlap -- the successor still waits for it to
-    # "complete" (immediately), never for a partial release.
     assert release.work_min_before_release(
         job, job.ops[0], overlap=0.2, setup_min=90.0) == 0.0

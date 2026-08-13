@@ -46,12 +46,14 @@ and every neighbour it drew was a real evaluation spent on a `+inf` plan (measur
 at a flat 60% of the budget — the sequence phase's whole share — at every budget
 tried).
 
-The scheduler's own typed error is re-raised ONLY when the search genuinely
-exhausted an uncancelled budget with the crew dimension having had its turn: then
-it is the book that cannot be built and the caller must hear about it. A stop
-press, or a budget too small to reach the crew phase, is neither — reporting a
-data problem there would send the owner hunting for a missing qualification that
-does not exist.
+The search fails loud ONLY when it genuinely exhausted an uncancelled budget with
+the crew dimension having had its turn: then not one candidate could be built and
+the caller must hear about it. A stop press, or a budget too small to reach the
+crew phase, is neither. And when it does fail it raises its OWN message rather
+than the scheduler's, because at this level the cause is genuinely ambiguous — a
+book on which few crew permutations are feasible is indistinguishable from one on
+which none are, and blaming a missing qualification would send the owner hunting
+for data that is fine.
 
 Because a plan costs ~35 ms at 50 jobs and the contest builds thousands of them,
 every decoded genome is memoised: revisiting one costs a dict lookup and does not
@@ -226,10 +228,22 @@ def optimize(jobs, shop, config, *, overlap, budget_evals=150, seed=42,
     if (best_score == float("inf") and ev.first_error is not None
             and not ev.cancelled and crew_searched):
         # Nothing this search tried could be built, and it was not stopped and did
-        # reach the dimension that decides feasibility. That is not a bad plan, it
-        # is a book the shop cannot run, and the scheduler's own typed error names
-        # the blocking step — fail loud rather than hand back an empty plan.
-        raise ev.first_error
+        # reach the dimension that decides feasibility. Fail loud rather than hand
+        # back an empty plan — but do NOT re-raise the scheduler's own error
+        # verbatim. It was written for a single pass, where "not one order could
+        # be placed" really is a shop/data fact; here it is one of TWO causes and
+        # this function cannot tell them apart, because a book on which few crew
+        # permutations are feasible looks identical to a book on which none are.
+        # Saying which without checking is the 2026-08-09 defect, and it sends the
+        # owner hunting for a missing qualification that may not exist.
+        raise scheduler.Unschedulable(
+            "the roster search built %d candidate plan(s) and could not schedule "
+            "any of them. Either the book cannot be staffed as it stands, or the "
+            "crew search needs a bigger budget than %d evaluations to find an "
+            "arrangement that works — this search cannot tell those apart. The "
+            "first candidate failed like this: %s"
+            % (ev.count, budget, ev.first_error),
+            getattr(ev.first_error, "blocked", ()))
 
     return Result(sequence=list(best_seq), crew_rank=_rank(best_crew),
                   score=best_score, metrics=best_metrics, evaluations=ev.count,

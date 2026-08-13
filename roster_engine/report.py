@@ -74,6 +74,7 @@ OFF_LANES = {"OS / Outsourced", "Off-machine"}
 
 _KIND_SPLIT = "OPERATOR_SPLIT_SHIFT"
 _KIND_SEGMENTED = "OPERATION_SEGMENTED"
+_KIND_DOUBLE = "MACHINE_DOUBLE_BOOKED"
 _KIND_IDLE = "IDLE_CAPACITY"
 _KIND_ROUNDING = "OVERLAP_FRACTIONAL_PIECE"
 
@@ -293,6 +294,65 @@ def segmentation_violations(entries) -> list:
                     f"up on {machine}: '{other.process_name}' (batch "
                     f"{other.batch_id}) runs inside its gap. An operation must "
                     f"run to completion.")})
+    return rows
+
+
+def machine_conflict_violations(entries) -> list:
+    """No machine is occupied by two operations at the same instant.
+
+    The strongest available guard on the no-segmentation guarantee, and the one
+    ``segmentation_violations`` structurally cannot give: that check only fires
+    when an intruder sits INSIDE a gap of another entry, so two entries that
+    overlap wholesale — same machine, same minutes, no gap anywhere — are
+    invisible to it. Measured 0 on eight shop-sized books, so nothing is hiding
+    today; it is written because ``_pace`` edits a published ``end`` without
+    touching machine occupancy, and the only thing standing between that and a
+    double-booking is ``_MachineState.busy_until``. An invariant that is CHECKED
+    beats one that is merely intended (2026-08-07).
+
+    Deliberately NOT flagged, for the same reason ``_intruder`` skips it: two
+    entries of the SAME (batch, step). The retired classic engine publishes a
+    parallel split as several entries, which is a different question from another
+    job taking the machine away.
+    """
+    by_machine: dict = {}
+    for entry in entries or ():
+        if _on_a_machine(entry):
+            by_machine.setdefault(entry.machine, []).append(entry)
+
+    rows = []
+    for machine in sorted(by_machine):
+        items = sorted(by_machine[machine], key=_order)
+        spans = []
+        for entry in items:
+            for start, end in _covered(entry):
+                spans.append((start, end, entry))
+        spans.sort(key=lambda s: (s[0], s[1], _order(s[2])))
+        seen = set()
+        for i, (start, end, entry) in enumerate(spans):
+            for other_start, other_end, other in spans[i + 1:]:
+                if other_start >= end:
+                    break                 # sorted by start: nothing later overlaps
+                if other is entry:
+                    continue
+                if (str(other.batch_id) == str(entry.batch_id)
+                        and int(other.process_seq) == int(entry.process_seq)):
+                    continue
+                if not _strictly_overlap(start, end, other_start, other_end):
+                    continue
+                pair = tuple(sorted((_order(entry), _order(other))))
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                rows.append({
+                    "kind": _KIND_DOUBLE,
+                    "ref": f"{entry.batch_id}/{entry.process_seq}",
+                    "message": (
+                        f"{machine} runs '{entry.process_name}' (batch "
+                        f"{entry.batch_id}) and '{other.process_name}' (batch "
+                        f"{other.batch_id}) at the same time, from "
+                        f"{max(start, other_start):%d-%m-%Y %H:%M}. A machine "
+                        f"holds one operation at a time.")})
     return rows
 
 
@@ -579,6 +639,7 @@ def all_violations(entries, masters, config, absent=None) -> list:
     rows = []
     rows.extend(operator_split_violations(entries, config, masters))
     rows.extend(segmentation_violations(entries))
+    rows.extend(machine_conflict_violations(entries))
     rows.extend(idle_capacity_violations(entries, masters, config, absent=absent))
     rows.extend(overlap_rounding_violations(entries, masters, config))
     return rows

@@ -555,7 +555,9 @@ def _report_for_book(masters, so_lines, absences=None, config=None, schedule=Non
         # The roster engine's four guarantees, checked on every plan it builds:
         # one operator per machine per shift, an operation never interrupted,
         # no machine dark while a qualified operator is unassigned, and no
-        # successor released on a fraction of a piece.
+        # successor released on a fraction of a piece — plus the whole-plan
+        # backstop under them, that no machine is ever occupied by two
+        # operations at once (MACHINE_DOUBLE_BOOKED).
         #
         # GATED TO THE ROSTER ENGINE ON PURPOSE. The live engine genuinely
         # breaks the first two on every plan — hundreds of rows — and this

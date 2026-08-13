@@ -374,3 +374,131 @@ def test_the_plan_is_reproducible(book):
     first = _signature(_plan(book)[2])
     second = _signature(_plan(book)[2])
     assert first and first == second
+
+
+# --------------------------------------------------------------------------- #
+# The shop-sized re-plan WITH WORK IN PROGRESS
+#
+# Nothing else in this repo plans a shop-sized book through `run_forward` with a
+# real frozen set and then checks it. This builds the whole live path — plan
+# clean -> `freeze.schedule_projection` -> punch part of the pieces -> `freeze.
+# compute_frozen_set` -> re-plan — because that is the shape of BOTH defects
+# that actually reached production, and neither was reachable without WIP:
+#
+#   * 2026-08-09, the routing inversion: the frozen pre-placement had no
+#     precedence gate at all, so CNC FIRST SIDE ran two days AFTER every step
+#     that eats its output. Clean book: 0 violations. With work in progress:
+#     67 of 68 orders.
+#   * 2026-08-11, the clubbed-batch quantity: a frozen row's per-SO-LINE
+#     remainder became the BATCH operation's quantity, and 281 pieces of a
+#     clubbed order landed in no plan at all. Needed WIP *and* a clubbed batch.
+#
+# The reviewer ran this path and it is clean, so this pins a passing result
+# rather than chasing a bug — the cheapest available insurance against the two
+# classes that have actually cost the owner a plan.
+# --------------------------------------------------------------------------- #
+
+from collections import defaultdict
+
+from engine import freeze, loaders, orderbook
+from engine.models import Actual, Order
+
+
+def _wip_book(seed, every=2, fractions=(0.6, 0.3)):
+    """(so_lines, masters, frozen rows) for a book part-way through production.
+
+    The punches go through the ORDER BOOK's own accounting — ``Actual`` rows ->
+    ``orderbook.active_so_lines`` -> ``freeze.compute_frozen_set`` — not a
+    hand-built frozen list, so this exercises the same translation the app does
+    (and the same one the 2026-08-11 bug hid in).
+
+    TWO steps are punched, not one, and that is the whole fixture. A book whose
+    only frozen steps are each routing's FIRST step cannot see the 2026-08-09
+    inversion at all: the routing gate it tests has nothing upstream to gate
+    against, and deleting that gate from the frozen path leaves this file green
+    (verified by mutation). Punching step 1 at 60% and step 2 at 30% leaves BOTH
+    frozen, with step 2 pinned to its machine while the step that feeds it still
+    owes 40% of the batch — which is exactly the live shape.
+    """
+    raw, so_lines, masters = scaled_book(seed)
+    _run, _config, entries = _plan((raw, so_lines, masters))
+    applied = freeze.schedule_projection(entries)
+
+    orders, actuals = {}, []
+    for i, line in enumerate(so_lines):
+        order = Order(so_no=line.so_no, item_code=line.item_code,
+                      item_name=line.item_name, ordered_qty=line.qty,
+                      delivery_date=line.delivery_date)
+        orders[order.key] = order
+        routing = masters.routings.get(line.item_code)
+        if routing is None or i % every:
+            continue
+        # PART of a step: good > 0 and remaining > 0 is exactly what
+        # `compute_frozen_set` freezes. A full punch would finish the step, and a
+        # zero punch would not start it — neither is in progress. The second
+        # step's punch is the smaller one, so downstream never exceeds upstream
+        # (the feedback precedence rule the app enforces at capture).
+        steps = sorted(routing.processes, key=lambda p: p.seq)[:len(fractions)]
+        made = [max(1, int(line.qty * f)) for f in fractions]
+        if len(steps) < len(fractions) or max(made) >= line.qty:
+            continue
+        for proc, qty in zip(steps, made):
+            actuals.append(Actual(so_no=line.so_no, item_code=line.item_code,
+                                  entry_date=PLAN_START, qty_produced=float(qty),
+                                  process=proc.name, shift="1st shift",
+                                  operator="Anturam"))
+
+    wip_lines = orderbook.active_so_lines(orders, actuals, masters)
+    good = defaultdict(float)
+    for a in actuals:
+        good[(a.so_no, a.item_code,
+              loaders.normalize_process_name(a.process))] += a.qty_produced
+    frozen = freeze.compute_frozen_set(applied, wip_lines, dict(good), masters)
+    return wip_lines, masters, frozen
+
+
+def test_a_shop_sized_book_re_plans_cleanly_with_work_in_progress():
+    """The whole live re-plan path, checks and all. Every assertion here is one
+    a production incident has already been lost to."""
+    for seed in SCALED_SEEDS[:3]:
+        wip_lines, masters, frozen = _wip_book(seed)
+        assert frozen, f"seed {seed}: nothing was in progress — the fixture is vacuous"
+
+        config = _config()
+        run = PlanRun(so_lines=list(wip_lines))
+        trace = pipeline.run_forward(run, config, masters, frozen=frozen)
+        assert trace["rule6"]["error"] is None, trace["rule6"]["error"]
+        assert run.schedule, f"seed {seed}: planned nothing"
+
+        # 2026-08-09 — a step never runs before the step that feeds it.
+        assert routing_order_violations(run.schedule, masters) == [], seed
+        # 2026-08-11 — no step is given fewer pieces than its batch owes.
+        assert batch_quantity_violations(run.schedule, run.batches) == [], seed
+        # ...and the four roster rules still hold with pins in place.
+        rows = rreport.all_violations(run.schedule, masters, config)
+        assert rows == [], (seed, [r["message"] for r in rows[:5]])
+
+
+def test_the_frozen_pins_really_landed_on_the_shop_sized_re_plan():
+    """Non-vacuity for the test above, in the direction that matters: a re-plan
+    that quietly dropped every pin would satisfy all three checks and prove
+    nothing about frozen work at all (measured against the real producer's row
+    shape, the drop rate was once 100%). Every in-progress operation must be
+    planned on the machine it is physically on."""
+    for seed in SCALED_SEEDS[:3]:
+        wip_lines, masters, frozen = _wip_book(seed)
+        notes = []
+        run = PlanRun(so_lines=list(wip_lines))
+        pipeline.run_forward(run, _config(), masters, frozen=frozen)
+        from engine.rules import rule1_consolidate
+        batches = rule1_consolidate.run(list(wip_lines), config=_config(),
+                                        masters=masters)
+        from engine import roster_adapter
+        jobs, batch_by_key, _sk = roster_adapter.build_jobs(batches, masters)
+        pins = roster_adapter._pins(frozen, batch_by_key, masters, notes)
+        assert pins, seed
+        placed = {(e.batch_id, e.process_seq): e.machine for e in run.schedule}
+        for pin in pins:
+            key = (pin["order_key"], pin["op_seq"])
+            assert placed.get(key) == pin["machine_id"], (seed, pin, placed.get(key))
+        assert not [n for n in notes if "could not be matched" in n], notes

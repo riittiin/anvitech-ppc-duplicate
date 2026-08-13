@@ -65,7 +65,8 @@ from roster_engine import report as rreport
 from tests.sample_workbook import build_sample_bytes
 from tests.scaled_workbook import PLAN_START, build_scaled_bytes
 
-KINDS = ("OPERATOR_SPLIT_SHIFT", "OPERATION_SEGMENTED", "IDLE_CAPACITY")
+KINDS = ("OPERATOR_SPLIT_SHIFT", "OPERATION_SEGMENTED", "MACHINE_DOUBLE_BOOKED",
+         "IDLE_CAPACITY")
 
 
 def load_book(kind, seed=7):
@@ -112,6 +113,8 @@ def measure(scheduler, so_lines, masters, overlap=80):
     counts["OPERATOR_SPLIT_SHIFT"] = len(
         rreport.operator_split_violations(entries, config, masters))
     counts["OPERATION_SEGMENTED"] = len(rreport.segmentation_violations(entries))
+    counts["MACHINE_DOUBLE_BOOKED"] = len(
+        rreport.machine_conflict_violations(entries))
     counts["IDLE_CAPACITY"] = len(
         rreport.idle_capacity_violations(entries, masters, config))
     scan = rreport.overlap_rounding_scan(entries, masters, config)
@@ -152,7 +155,8 @@ def compare(args):
         print(head)
         print(f"{'engine':9s} {'entries':>7s} {'ms':>6s} {'makespan':>9s} "
               f"{'late_d':>7s} {'late_o':>7s} {'score':>9s}  "
-              f"{'SPLIT':>6s} {'SEGMENT':>8s} {'IDLE':>5s}  ROUNDING(d/m/r)")
+              f"{'SPLIT':>6s} {'SEGMENT':>8s} {'DOUBLE':>7s} {'IDLE':>5s}  "
+              f"ROUNDING(d/m/r)")
         for engine in engines:
             got = measure(engine, so_lines, masters, args.overlap)
             if "error" in got:
@@ -167,7 +171,7 @@ def compare(args):
                   f"{m['makespan_days']:9.2f} {m['total_late_days']:7d} "
                   f"{m['late_orders']:7d} {got['score']:9.1f}  "
                   f"{c['OPERATOR_SPLIT_SHIFT']:6d} {c['OPERATION_SEGMENTED']:8d} "
-                  f"{c['IDLE_CAPACITY']:5d}  "
+                  f"{c['MACHINE_DOUBLE_BOOKED']:7d} {c['IDLE_CAPACITY']:5d}  "
                   f"{s['detected']:>3d}/{s['muted']:>3d}/{s['reported']:>3d}{note}")
         print()
 

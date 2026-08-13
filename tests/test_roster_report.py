@@ -578,7 +578,7 @@ def _report_kinds(scheduler):
 
 
 _ROSTER_KINDS = {"OPERATOR_SPLIT_SHIFT", "OPERATION_SEGMENTED", "IDLE_CAPACITY",
-                 "OVERLAP_FRACTIONAL_PIECE"}
+                 "OVERLAP_FRACTIONAL_PIECE", "MACHINE_DOUBLE_BOOKED"}
 
 
 def test_a_roster_plan_report_is_wired_to_the_checks():
