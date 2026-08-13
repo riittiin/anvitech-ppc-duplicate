@@ -52,6 +52,21 @@ class Built:
     machining_tasks: dict = field(default_factory=dict)   # task idx -> (job_key, op)
     setup_mode: str = "credit"
 
+    # The wall clock the shift minutes are measured from. Carried so a later
+    # layer can convert a Shift BACK to real time — operator absences arrive as
+    # datetimes (engine.book_store stores {from_date, to_date}) and rules.py has
+    # to test them against a shift, which is integer minutes.
+    plan_start: datetime | None = None
+
+    # Which encoding of Rule 2's "may span an unmanned shift" clause this data
+    # was built FOR (spec §5.1). It is not merely a rules.py concern: E2 needs
+    # allow_idle on the machining tasks (the held-but-unstaffed time is idle),
+    # and allow_idle is frozen into ProblemData — Variables gives the idle var an
+    # upper bound of 0 when it is False, and nothing downstream can relax it.
+    # Recorded here so rules.add_roster can check the caller agrees rather than
+    # silently building E2 constraints on a model that cannot satisfy them.
+    hold_across_unmanned_shift: bool = True
+
     # Filled by later layers. Declared HERE so there is one definition of this
     # object's shape: rules.py populates shift_work (E2) and setup_credit
     # (Rule 4), and both address the model by index through the maps above.
@@ -76,7 +91,8 @@ class Built:
 
 
 def build(jobs, shop, config, plan_start: datetime, shifts,
-          *, setup_mode: str = "credit") -> Built:
+          *, setup_mode: str = "credit",
+          hold_across_unmanned_shift: bool = True) -> Built:
     from pyjobshop import Model
 
     horizon_min = shifts[-1].end if shifts else 0
@@ -112,7 +128,13 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
             if op.kind != OUTSOURCED and (qty <= 0 or not op.machine_options):
                 continue
 
-            task = m.add_task(job=cp_job, allow_breaks=True,
+            # allow_idle, on a machining task, is EXACTLY Rule 2's "the part
+            # stays in the chuck across an unmanned shift": the machine is held,
+            # the clock runs, and nothing is cut. Off under E1, where an
+            # operation may not span a dark shift at all, and off always for
+            # manual/inspection tasks, which Rule 1 does not bind (spec §5.2).
+            hold = hold_across_unmanned_shift and op.kind == MACHINING
+            task = m.add_task(job=cp_job, allow_breaks=True, allow_idle=hold,
                               name=f"{job.key}/{op.seq}")
             idx = len(task_of)
             task_of[(job.key, op.seq)] = idx
@@ -162,7 +184,9 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
                  dated_jobs=dated, machining_tasks=machining,
                  setup_mode=setup_mode, machine_res_order=order,
                  operator_res_order=op_order,
-                 job_by_key={j.key: j for j in jobs})
+                 job_by_key={j.key: j for j in jobs},
+                 plan_start=plan_start,
+                 hold_across_unmanned_shift=hold_across_unmanned_shift)
 
 
 def _due_minutes(job, plan_start: datetime):
