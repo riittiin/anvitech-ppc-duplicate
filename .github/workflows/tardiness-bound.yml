@@ -22,13 +22,18 @@ on:
       level:
         description: "machines = loosest+fastest | operators = tighter (nobody in two places at once)"
         required: true
-        default: operators
+        default: machines
         type: choice
-        options: [operators, machines]
+        options: [machines, operators]
       time_limit:
-        description: "Solver seconds (900 = 15 min; the runner allows far more)"
+        description: "Solver seconds"
         required: true
-        default: "900"
+        default: "600"
+        type: string
+      horizon_days:
+        description: "Days of schedule to model. Smaller = far less memory. Raise only if it says the horizon is too short."
+        required: true
+        default: "70"
         type: string
 
 jobs:
@@ -59,6 +64,7 @@ jobs:
           python scripts/tardiness_bound.py \
             --level "${{ inputs.level }}" \
             --time-limit "${{ inputs.time_limit }}" \
+            --horizon-days "${{ inputs.horizon_days }}" \
             2>&1 | tee bound.txt
 
       - name: Summary

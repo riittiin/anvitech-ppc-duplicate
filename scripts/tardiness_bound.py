@@ -355,7 +355,7 @@ def main():
                     help="machines: machines only (loosest, fastest). "
                          "operators: + nobody in two places at once (tighter).")
     ap.add_argument("--time-limit", type=float, default=600.0, help="seconds")
-    ap.add_argument("--horizon-days", type=int, default=120)
+    ap.add_argument("--horizon-days", type=int, default=70)
     ap.add_argument("--workers", type=int, default=0, help="0 = all cores")
     ap.add_argument("--demo", action="store_true",
                     help="use the repo's generated book instead of the store — "
@@ -380,6 +380,8 @@ def main():
     model = build(batches, masters, config, plan_start, args.level, args.horizon_days)
 
     print(f"Solving (limit {args.time_limit:.0f}s)...")
+    print("  exit code 143 here means the RUNNER killed it for memory — rerun with"
+          " --level machines and a smaller --horizon-days.")
     res = model.solve(time_limit=args.time_limit, display=True,
                       num_workers=args.workers or None)
 
