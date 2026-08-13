@@ -5,6 +5,13 @@
 # we can tell whether the plan is near-optimal or whether the engine simply
 # cannot see a better one.
 #
+# With seed_engine on (the default) it goes one step further: it hands the
+# solver's JOB ORDER to the real engine as a starting sequence, re-plans under all
+# four shop rules, and prints engine-alone vs engine-seeded vs the CP target — so
+# the answer is "how much of the gap is reachable", not just "a gap exists". The
+# replay uses pipeline.run_forward with priority_rank, the app's own replay path,
+# and the result is PRINTED only: no ranks are saved and no plan is applied.
+#
 # Manual only (workflow_dispatch). Nothing about the live app changes; this
 # workflow is additive and no existing file was touched to add it.
 #
@@ -34,6 +41,16 @@ on:
         description: "Days of schedule to model. Smaller = far less memory. Raise only if it says the horizon is too short."
         required: true
         default: "70"
+        type: string
+      seed_engine:
+        description: "Also hand the solver's job order to the REAL engine, re-plan under all four rules, and print the comparison. Still read-only — applies nothing."
+        required: false
+        default: true
+        type: boolean
+      seed_search_evals:
+        description: "With seed_engine: also run the app's own sequence+crew search opened on the solver's order, for this many plans (0 = off)."
+        required: false
+        default: "0"
         type: string
 
 jobs:
@@ -65,6 +82,8 @@ jobs:
             --level "${{ inputs.level }}" \
             --time-limit "${{ inputs.time_limit }}" \
             --horizon-days "${{ inputs.horizon_days }}" \
+            ${{ inputs.seed_engine && '--seed-engine' || '' }} \
+            --seed-search-evals "${{ inputs.seed_search_evals || 0 }}" \
             2>&1 | tee bound.txt
 
       - name: Summary
@@ -74,7 +93,9 @@ jobs:
             echo '## Tardiness lower bound'
             echo ''
             echo '```'
-            tail -40 bound.txt 2>/dev/null || echo 'no output'
+            # 40 lines cut the --seed-engine comparison table off the top: the
+            # "HOW TO READ THIS" block below it is 16 lines on its own.
+            tail -90 bound.txt 2>/dev/null || echo 'no output'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
