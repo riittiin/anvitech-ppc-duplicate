@@ -123,6 +123,23 @@ def test_shifts_are_minutes_from_plan_start_and_thursday_is_off():
     assert [w.index for w in got] == list(range(len(got)))
 
 
+def _covered(breaks, start, end):
+    """True if every minute in [start, end) falls inside some break tuple.
+
+    Tests the MEANING of the break list (which minutes are forbidden), not its
+    representation (exact tuple boundaries) — machine_breaks is free to coalesce
+    touching/overlapping tuples into fewer, wider ones as long as the forbidden
+    minutes are unchanged."""
+    cursor = start
+    for b_start, b_end in sorted(breaks):
+        if b_start > cursor:
+            return False
+        cursor = max(cursor, b_end)
+        if cursor >= end:
+            return True
+    return cursor >= end
+
+
 def test_a_single_shift_station_is_broken_only_outside_its_first_shift():
     """08:00-19:00, NOT the legacy 09:00-18:00 manual window — that discrepancy
     hid 9,470 minutes of real planned work from four reporting features
@@ -132,9 +149,27 @@ def test_a_single_shift_station_is_broken_only_outside_its_first_shift():
         datetime(2026, 8, 12, 8, 0), cal, _cfg(), horizon_days=1)
     manual = Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5)
     breaks = windows.machine_breaks(manual, shifts, horizon_min=1440)
-    assert (11 * 60, 21 * 60) in breaks      # the second shift is unavailable
+    assert _covered(breaks, 11 * 60, 21 * 60)      # the second shift is unavailable
     cnc = Machine("CNC1", "CNC 1", "CNC lathe", available_hrs_per_day=19.5)
-    assert (11 * 60, 21 * 60) not in windows.machine_breaks(cnc, shifts, 1440)
+    cnc_breaks = windows.machine_breaks(cnc, shifts, 1440)
+    assert not any(b_start < 21 * 60 and b_end > 11 * 60
+                   for b_start, b_end in cnc_breaks)  # none of that window is broken
+
+
+def test_breaks_are_minimal_and_non_overlapping():
+    """Pins the coalescing invariant a consumer relies on: pyjobshop keys a
+    discrete break-duration choice per mode on start-time domains, so a
+    redundant touching boundary (found empirically: every working day, for
+    every single-shift machine) doubles the interval count for no reason."""
+    cal = WorkCalendar()
+    shifts = windows.build_shifts(
+        datetime(2026, 8, 12, 8, 0), cal, _cfg(), horizon_days=5)
+    manual = Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5)
+    breaks = windows.machine_breaks(manual, shifts, horizon_min=5 * 1440)
+    assert len(breaks) > 2                        # several working days are in range
+    assert breaks == sorted(breaks)
+    assert all(a_end < b_start for (a_start, a_end), (b_start, b_end)
+               in zip(breaks, breaks[1:]))
 
 
 def test_operator_shift_reads_the_settings_row():

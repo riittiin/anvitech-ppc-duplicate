@@ -84,21 +84,43 @@ def machine_breaks(machine, shifts: list[Shift],
     Getting this wrong in either direction breaks the plan: too few breaks and
     it schedules work the shop cannot do, too many and it throws away capacity
     that exists.
+
+    The result is COALESCED: sorted, non-overlapping, and never touching —
+    a single-shift machine's nightly gap and the next calendar-off day merge
+    into one interval rather than two that happen to share a boundary. This
+    matters to the consumer, not just for tidiness: pyjobshop pre-enumerates a
+    discrete break-duration choice per mode keyed on start-time domains, so a
+    redundant touching boundary doubles the interval count for every
+    single-shift station (most of the manual/inspection fleet) for no reason —
+    solver tractability is this project's top named risk. One definition of the
+    working calendar; a caller must never need to re-coalesce this itself.
     """
     two_shift = bool(machine.is_two_shift())
-    breaks: list[tuple[int, int]] = []
+    raw: list[tuple[int, int]] = []
     cursor = 0
     for s in sorted(shifts, key=lambda s: s.start):
         if s.start > cursor:
-            breaks.append((cursor, s.start))
+            raw.append((cursor, s.start))
         if two_shift or s.shift == FIRST:
             cursor = max(cursor, s.end)
         else:
-            breaks.append((max(cursor, s.start), s.end))
+            raw.append((max(cursor, s.start), s.end))
             cursor = max(cursor, s.end)
     if cursor < horizon_min:
-        breaks.append((cursor, horizon_min))
-    return breaks
+        raw.append((cursor, horizon_min))
+    return _coalesce(raw)
+
+
+def _coalesce(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping AND touching (start, end) intervals into the minimal
+    sorted set describing the same union of forbidden time."""
+    out: list[tuple[int, int]] = []
+    for start, end in sorted(intervals):
+        if out and start <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
 
 
 def operator_shift(operator) -> str:
