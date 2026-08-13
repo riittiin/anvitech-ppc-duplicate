@@ -1,0 +1,73 @@
+# How good could the plan POSSIBLY be?
+#
+# Read-only diagnostic. Plans nothing, applies nothing, writes nothing — it only
+# reads the book and asks a constraint solver for a PROVEN FLOOR on late-days, so
+# we can tell whether the plan is near-optimal or whether the engine simply
+# cannot see a better one.
+#
+# Manual only (workflow_dispatch). Nothing about the live app changes; this
+# workflow is additive and no existing file was touched to add it.
+#
+# Needs one repo secret: MONGODB_URI — the SAME store the duplicate app reads.
+# The script only ever reads from it.
+name: Tardiness lower bound
+
+on:
+  workflow_dispatch:
+    inputs:
+      level:
+        description: "machines = loosest+fastest | operators = tighter (nobody in two places at once)"
+        required: true
+        default: operators
+        type: choice
+        options: [operators, machines]
+      time_limit:
+        description: "Solver seconds (900 = 15 min; the runner allows far more)"
+        required: true
+        default: "900"
+        type: string
+
+jobs:
+  bound:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        # pyjobshop is NOT added to requirements.txt on purpose — it is a
+        # diagnostic-only dependency and must never reach the Render service.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyjobshop
+
+      - name: Compute the floor
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: |
+          python scripts/tardiness_bound.py \
+            --level "${{ inputs.level }}" \
+            --time-limit "${{ inputs.time_limit }}" \
+            2>&1 | tee bound.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Tardiness lower bound'
+            echo ''
+            echo '```'
+            tail -40 bound.txt 2>/dev/null || echo 'no output'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tardiness-bound
+          path: bound.txt
