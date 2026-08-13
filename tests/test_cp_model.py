@@ -124,6 +124,35 @@ def test_a_task_may_span_a_break_but_is_never_split():
     assert task.optional is False
 
 
+def test_the_index_maps_address_the_real_assign_var_keyspace():
+    """machine_res / operator_res hold pyjobshop OBJECTS (add_mode needs the
+    object), so they can never be an (task_idx, resource_idx) key themselves —
+    unhashable, per the review that caught this. The real guard is not that
+    machine_res_index()/operator_res_index() agree with the arithmetic that
+    built them (that proves nothing but its own consistency) — it's that the
+    indices they hand back are genuine keys in the solver layer's own
+    assign_vars, built independently by CPModel from the same ProblemData."""
+    from pyjobshop.solvers.ortools.CPModel import CPModel
+
+    masters = _masters(
+        [Process(1, "CNC FIRST SIDE", 5.0, None, "CNC4", "CNC1"),
+         Process(2, "DEBURING", 2.0, None, None, "MD1")],
+        operators=[Operator("A", "MD1", ["MD1"], "First shift"),
+                   Operator("B", "MD1", ["MD1"], "First shift")])
+    built, _jobs = _build(masters, [_B("B1", "ITEM", 10)])
+
+    variables = CPModel(built.data).variables
+
+    cnc_task = built.task_of[("B1", 1)]
+    for mid in ("CNC1", "CNC4"):
+        assert (cnc_task, built.machine_res_index(mid)) in variables.assign_vars
+
+    manual_task = built.task_of[("B1", 2)]
+    for name in ("A", "B"):
+        assert (manual_task,
+                built.operator_res_index(name)) in variables.assign_vars
+
+
 def test_a_job_with_no_delivery_date_gets_no_due_date():
     """pyjobshop asserts due_date is not None when it builds tardiness vars, and
     an undated order has no date to miss. Recording 0 would claim it landed

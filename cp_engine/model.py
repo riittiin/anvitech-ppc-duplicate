@@ -35,8 +35,16 @@ class Built:
     data: object                    # pyjobshop.ProblemData
     task_of: dict                   # (job_key, op_seq) -> task index
     job_of: dict                    # job_key -> job index
-    machine_res: dict               # machine id -> resource index
-    operator_res: dict              # operator name -> resource index
+    # machine_res / operator_res hold the pyjobshop OBJECTS returned by
+    # add_machine/add_renewable (add_mode needs the object, not an index) —
+    # they are NOT index maps despite the name. Unhashable
+    # (TypeError: unhashable type: 'Machine'), so they can never key a dict
+    # or appear in a tuple used as one. The INDEX a later layer needs to
+    # address Variables.assign_vars[(task_idx, resource_idx)] lives in
+    # machine_res_order / operator_res_order below — use
+    # machine_res_index()/operator_res_index(), never these two directly.
+    machine_res: dict               # machine id -> pyjobshop Machine object
+    operator_res: dict              # operator name -> pyjobshop Renewable object
     os_res: int
     shifts: list
     jobs: list
@@ -50,13 +58,21 @@ class Built:
     setup_credit: dict = field(default_factory=dict)   # task idx -> IntVar (Task 5)
     shift_work: dict = field(default_factory=dict)     # task idx -> [IntVar] (Task 4)
     job_by_key: dict = field(default_factory=dict)     # job key -> domain.Job
-    machine_res_order: dict = field(default_factory=dict)  # machine id -> res idx
+    machine_res_order: dict = field(default_factory=dict)   # machine id -> res idx
+    operator_res_order: dict = field(default_factory=dict)  # operator name -> res idx
 
     def machine_res_index(self, mid: str) -> int:
         """Resource index of a machine. PyJobShop's Variables are keyed by
         index — assign_vars is (task_idx, resource_idx) — and machines are added
         first, so a machine's resource index is its position in machine_res."""
         return self.machine_res_order[mid]
+
+    def operator_res_index(self, name: str) -> int:
+        """Resource index of a manual/inspection operator. Resources are
+        indexed machines first, then operators (in the same sorted-by-name
+        order build() creates them in), then the OS pool — mirroring
+        machine_res_index so the two can never disagree about that ordering."""
+        return self.operator_res_order[name]
 
 
 def build(jobs, shop, config, plan_start: datetime, shifts,
@@ -131,16 +147,21 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
             prev_task, prev_op = task, op
 
     # Resources are indexed in creation order: machines first, then the manual/
-    # inspection operators, then the OS pool. Recording the machine order here is
-    # what lets rules.py address assign_vars[(task_idx, resource_idx)] without
-    # re-deriving an index and getting it silently wrong.
+    # inspection operators, then the OS pool. Recording that order here is what
+    # lets rules.py address assign_vars[(task_idx, resource_idx)] without
+    # re-deriving an index and getting it silently wrong. The operator order
+    # uses the SAME sort key (by name) as the add_renewable loop above, so
+    # operator_res_order can never drift out of step with what was actually built.
     order = {mid: i for i, mid in enumerate(sorted(shop.machines))}
+    op_order = {op.name: len(machine_res) + i
+                for i, op in enumerate(sorted(shop.operators, key=lambda o: o.name))}
     return Built(m=m, data=m.data(), task_of=task_of, job_of=job_of,
                  machine_res=machine_res, operator_res=operator_res,
                  os_res=len(machine_res) + len(operator_res),
                  shifts=list(shifts), jobs=list(jobs),
                  dated_jobs=dated, machining_tasks=machining,
                  setup_mode=setup_mode, machine_res_order=order,
+                 operator_res_order=op_order,
                  job_by_key={j.key: j for j in jobs})
 
 
