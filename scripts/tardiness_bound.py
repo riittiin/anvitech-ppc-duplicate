@@ -310,17 +310,19 @@ def build(batches, masters, config, plan_start, level, horizon_days):
                     m.add_end_before_end(prev, t)
             prev, prev_op = t, op
 
-    # --- 90-minute setup, only on a real (item, process) change -------------- #
-    n_setup = 0
-    for mid, tasks in per_machine.items():
-        machine = masters.machines.get(mid)
-        if machine is None or not is_machining_machine(machine):
-            continue
-        for a, ka in tasks:
-            for b, kb in tasks:
-                if a is not b and ka != kb:
-                    m.add_setup_time(mach[mid], a, b, setup_min)
-                    n_setup += 1
+    # --- the 90-minute setup is DELIBERATELY NOT MODELLED --------------------- #
+    # Measured, not assumed. Sequence-dependent setups need one pair per ordered
+    # pair of tasks per machine — 18,944 of them on a book this size — and CP-SAT
+    # encodes that as an O(n^2) circuit. On the real book that alone consumed the
+    # entire solve: 90 s with setups returned NO feasible solution and a floor of
+    # 0; the same 90 s without them returned a real solution and a real floor.
+    # It is also what killed the first live runs (exit 143).
+    #
+    # Omitting it UNDER-estimates every duration, which is a relaxation — so the
+    # answer stays a valid FLOOR, just a looser one. Charging setup would have been
+    # the invalid direction: over-estimating durations could push the "floor" ABOVE
+    # the true optimum and make it a lie.
+    _ = setup_min       # kept: the release delay below still uses it
 
     if unstaffed:
         print(f"  {len(unstaffed)} machine group(s) have NO qualified operator in "
@@ -328,7 +330,7 @@ def build(batches, masters, config, plan_start, level, horizon_days):
               f"{', '.join(sorted(unstaffed)[:4])}")
     m.set_objective(weight_total_tardiness=1)
     print(f"  model: {len(jobs)} jobs, {len(mach)} machines, "
-          f"{len(ops_res)} operators, {n_modes} modes, {n_setup} setup pairs")
+          f"{len(ops_res)} operators, {n_modes} modes, setups relaxed away")
     return m
 
 
@@ -356,7 +358,9 @@ def main():
                          "operators: + nobody in two places at once (tighter).")
     ap.add_argument("--time-limit", type=float, default=600.0, help="seconds")
     ap.add_argument("--horizon-days", type=int, default=70)
-    ap.add_argument("--workers", type=int, default=0, help="0 = all cores")
+    ap.add_argument("--workers", type=int, default=2,
+                    help="solver threads; each one costs memory (2 is safe "
+                         "on a GitHub runner)")
     ap.add_argument("--demo", action="store_true",
                     help="use the repo's generated book instead of the store — "
                          "proves the tool runs; not a real answer")
@@ -383,7 +387,7 @@ def main():
     print("  exit code 143 here means the RUNNER killed it for memory — rerun with"
           " --level machines and a smaller --horizon-days.")
     res = model.solve(time_limit=args.time_limit, display=True,
-                      num_workers=args.workers or None)
+                      num_workers=max(1, args.workers))
 
     lb_min = getattr(res, "lower_bound", None)
     obj_min = getattr(res, "objective", None)
