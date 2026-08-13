@@ -72,6 +72,9 @@ class Built:
     # (Rule 4), and both address the model by index through the maps above.
     setup_credit: dict = field(default_factory=dict)   # task idx -> IntVar (Task 5)
     shift_work: dict = field(default_factory=dict)     # task idx -> [IntVar] (Task 4)
+    # (task idx, shift idx) -> IntVar. The overlap of a task with a shift depends
+    # on nothing else, so it is built once and shared by every candidate machine.
+    shift_overlap: dict = field(default_factory=dict)
     job_by_key: dict = field(default_factory=dict)     # job key -> domain.Job
     machine_res_order: dict = field(default_factory=dict)   # machine id -> res idx
     operator_res_order: dict = field(default_factory=dict)  # operator name -> res idx
@@ -105,10 +108,19 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
             breaks=windows.machine_breaks(machine, shifts, horizon_min), name=mid)
 
     # Manual/inspection operators are ordinary capacity-1 renewables: Rule 1 does
-    # not bind them, so they are a free per-task choice. CNC/VMC operators do NOT
-    # appear here at all — they enter through the roster in rules.py.
+    # not roster them, so which one runs a bench step is a free per-task choice.
+    # Their SHIFT and their ABSENCES are not free, though, and nothing else in
+    # the model carries those for a bench operator — Rule 1's roster covers
+    # CNC/VMC only. They ride in as breaks on the renewable, from the same
+    # windows helper the machine calendar comes from, so a shut station and a man
+    # who is not there can never be read two ways.
     for operator in sorted(shop.operators, key=lambda o: o.name):
-        operator_res[operator.name] = m.add_renewable(capacity=1, name=operator.name)
+        operator_res[operator.name] = m.add_renewable(
+            capacity=1,
+            breaks=windows.operator_breaks(operator, shifts, horizon_min,
+                                           shop.absent.get(operator.name, ()),
+                                           plan_start),
+            name=operator.name)
 
     os_res = m.add_renewable(capacity=max(1, len(jobs) + _OS_HEADROOM), name="OS")
 
@@ -141,22 +153,18 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
 
             if op.kind == OUTSOURCED:
                 m.add_mode(task, os_res, int(max(1, op.cycle_min)), demands=1)
-            elif op.kind == MACHINING:
-                # Rule 4, inverted (§5.4): 90 minutes is ALWAYS in the duration
-                # and credited back in rules.py only for a same-part changeover.
-                # A Machine is unary and takes no demand, so no demands= here.
-                duration = setup_min + max(1, int(round(qty * op.cycle_min)))
-                for mid in op.machine_options:
-                    m.add_mode(task, machine_res[mid], duration)
-                machining[idx] = (job.key, op)
             else:
-                duration = max(1, int(round(qty * op.cycle_min)))
+                if op.kind == MACHINING:
+                    # Rule 4, inverted (§5.4): 90 minutes is ALWAYS in the
+                    # duration and credited back in rules.py only for a same-part
+                    # changeover.
+                    duration = setup_min + max(1, int(round(qty * op.cycle_min)))
+                    machining[idx] = (job.key, op)
+                else:
+                    duration = max(1, int(round(qty * op.cycle_min)))
                 for mid in op.machine_options:
-                    for name in _qualified(shop, mid):
-                        # [0, 1]: unary machine takes no capacity, the operator
-                        # takes one. [1, 1] is rejected as "infeasible demands".
-                        m.add_mode(task, [machine_res[mid], operator_res[name]],
-                                   duration, demands=[0, 1])
+                    _add_modes(m, task, mid, duration, shop,
+                               machine_res, operator_res)
 
             if prev_task is not None:
                 if prev_op.kind == OUTSOURCED or op.kind == OUTSOURCED:
@@ -187,6 +195,34 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
                  job_by_key={j.key: j for j in jobs},
                  plan_start=plan_start,
                  hold_across_unmanned_shift=hold_across_unmanned_shift)
+
+
+def _add_modes(m, task, mid: str, duration: int, shop,
+               machine_res: dict, operator_res: dict) -> None:
+    """Every way ONE machine can run this step.
+
+    Keyed on the MACHINE, never on the step's kind. Rule 1 is a property of
+    people and the machines they are rostered to, and a step's kind is only ever
+    read off its FIRST machine option (``domain._kind_for_machine_id``), so the
+    two disagree the moment a routing lists ``MD1/CNC1`` or ``CNC1/MD1`` — and
+    real routings do.
+
+    * A machine the roster covers (CNC/VMC) gets a **machine-only** mode: the man
+      is whoever Rule 1 put on it for the shift. Booking one here as well would
+      charge the same person twice for the same work, and a shop with one
+      qualified operator would come out INFEASIBLE for work it can plainly do.
+    * Every other machine carries its operator in the mode, because nothing else
+      in the model will.
+
+    ``demands=[0, 1]``: a unary Machine takes no capacity and the operator takes
+    one. ``[1, 1]`` is rejected as "infeasible demands".
+    """
+    if mid in shop.machining_ids:
+        m.add_mode(task, machine_res[mid], duration)
+        return
+    for name in _qualified(shop, mid):
+        m.add_mode(task, [machine_res[mid], operator_res[name]],
+                   duration, demands=[0, 1])
 
 
 def _due_minutes(job, plan_start: datetime):

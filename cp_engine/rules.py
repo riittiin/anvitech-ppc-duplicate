@@ -107,6 +107,13 @@ def add_roster(cp_model, variables, built, shop, *,
     # Rule 1 itself: nobody is on two machines in the same shift. He may change
     # machine at the next shift, which is why this groups on (person, shift) and
     # not on the person alone.
+    #
+    # Since _reserve_rostered_operators consumes a rostered man's capacity-1
+    # renewable for the whole shift, this is now REDUNDANT — measured, not
+    # assumed: removing it fails no test. It is kept because it is the direct
+    # statement of the rule, and because a clause propagates where a cumulative
+    # has to reason. If it is ever removed, Rule 1 stops being written down
+    # anywhere and survives only as a side effect of the bench-work fix.
     per_person: dict = {}
     for (name, _mid, shift_idx), var in roster.x.items():
         per_person.setdefault((name, shift_idx), []).append(var)
@@ -114,9 +121,45 @@ def add_roster(cp_model, variables, built, shop, *,
         if len(group) > 1:
             cp_model.add_at_most_one(group)
 
+    _reserve_rostered_operators(cp_model, variables, built, roster)
     _link_work_to_roster(cp_model, variables, built, roster.staffed,
                          hold=hold_across_unmanned_shift)
     return roster
+
+
+def _reserve_rostered_operators(cp_model, variables, built, roster):
+    """A man on a CNC is on that CNC — he is not also at a bench.
+
+    Rule 1 rosters CNC/VMC only, but that scopes which MACHINES get a roster; it
+    never licensed a rostered man to be booked somewhere else in the same shift.
+    One person legitimately spans kinds — the live 2026-08-07 case ran manual
+    stations AND CNC4 — and every operator, machining or not, is a capacity-1
+    renewable in the model that manual and inspection modes book. Without this,
+    the published roster is not merely noisy but WRONG: it names a man on a CNC
+    while the schedule has him at MD1.
+
+    So the roster boolean CONSUMES that operator's own renewable for the whole
+    shift, as an optional interval present iff he is rostered. It goes in a
+    second cumulative of its own for the same reason E1 needs a second
+    no-overlap: CP-SAT fixes a cumulative's interval list when it is created, and
+    PyJobShop already built one per renewable. ``res2assign`` and ``res2demand``
+    are walked in the same order PyJobShop's own ``_renewable_capacity`` walks
+    them, which is what keeps interval i paired with demand i.
+    """
+    by_operator: dict = {}
+    for (name, mid, shift_idx), var in sorted(roster.x.items()):
+        shift = built.shifts[shift_idx]
+        by_operator.setdefault(name, []).append(
+            cp_model.new_optional_interval_var(
+                shift.start, shift.minutes, shift.end, var,
+                f"mans_{name}_{mid}_{shift_idx}"))
+
+    for name, manning in sorted(by_operator.items()):
+        res_idx = built.operator_res_index(name)
+        booked = [assign.interval for assign in variables.res2assign(res_idx)]
+        demands = list(variables.res2demand(res_idx))
+        cp_model.add_cumulative(booked + manning,
+                                demands + [1] * len(manning), 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,60 +213,78 @@ def _block_unstaffed_shifts(cp_model, variables, built, staffed):
 
 
 def _work_only_in_staffed_shifts(cp_model, variables, built, staffed):
-    """E2. The processing minutes of a machining task, shift by shift.
+    """E2. The processing minutes of a rostered machine's work, shift by shift.
 
     ``w[t,m,s] <= overlap(t, s)`` and ``w[t,m,s] <= len(s) * staffed[m,s]``, and
     the w's over a machine must cover the task's whole processing time when the
     task is assigned to it. The interval may then stretch across an unmanned
     shift — the machine is held, and that time is the task's ``idle``, which is
-    why E2 needs ``allow_idle`` on the machining tasks and E1 does not.
+    why E2 needs ``allow_idle`` on those tasks and E1 does not.
 
-    Note the sum is enforced PER MACHINE, under that machine's assignment
-    literal, and only over machines the ROSTER covers. A routing may list a
-    machining step's alternatives as CNC1/MD1 — the step's kind comes from the
-    first option, so the task is machining while MD1 is not. Rule 1 does not bind
-    MD1, so MD1 must carry no roster constraint at all: one sum across both
-    machines, or a per-machine sum that treats MD1's empty w list as "cover your
-    processing from nothing", would each quietly forbid a legal assignment.
+    Driven, like E1, off the ROSTERED MACHINE and every task that can run on it —
+    never off the tasks' kinds. A step's kind is read from its first machine
+    option, so a routing written ``MD1/CNC1`` is a manual-kind step that can land
+    on a CNC; keyed on kind, E2 would leave it entirely unconstrained while E1
+    caught it, and the flag would then decide WHICH WORK RULE 1 COVERS instead of
+    only how a part may span a dark shift.
+
+    Conversely a machine the roster does not cover (MD1 in ``CNC1/MD1``) gets no
+    constraint at all here, or its empty w list would read as "cover your
+    processing from nothing" and forbid a legal assignment.
     """
-    rostered = {mid for (mid, _shift_idx) in staffed}
-    for task_idx in sorted(built.machining_tasks):
-        task_var = variables.task_vars[task_idx]
-        shifts = _shifts_in_window(built, task_idx)
-        for mid in _machines_for(built, task_idx):
-            if mid not in rostered:
-                continue                  # Rule 1 does not bind this machine
-            res_idx = built.machine_res_index(mid)
+    for mid, res_idx in sorted((mid, built.machine_res_index(mid))
+                               for mid in {m for (m, _s) in staffed}):
+        for task_idx in sorted(_tasks_on(built, res_idx)):
             assign = variables.assign_vars.get((task_idx, res_idx))
             if assign is None:
                 continue
+            task_var = variables.task_vars[task_idx]
             work = []
-            for shift in shifts:
+            for shift in _shifts_in_window(built, task_idx):
                 flag = staffed.get((mid, shift.index))
                 if flag is None:
                     continue      # a break for this machine: no work either way
-                name = f"{task_idx}_{mid}_{shift.index}"
-                overlap = _overlap_minutes(cp_model, task_var, shift, name)
-                minutes = cp_model.new_int_var(0, shift.minutes, f"w_{name}")
+                overlap = _overlap_minutes(cp_model, built, task_var,
+                                           task_idx, shift)
+                minutes = cp_model.new_int_var(
+                    0, shift.minutes, f"w_{task_idx}_{mid}_{shift.index}")
                 cp_model.add(minutes <= overlap)
                 cp_model.add(minutes <= shift.minutes * flag)
                 work.append(minutes)
             built.shift_work.setdefault(task_idx, []).extend(work)
             # An empty ``work`` is not a special case: the machine is open in no
             # shift this task could touch, and ``0 >= processing`` is false for
-            # every machining task (90 minutes of setup are always in the
-            # duration), so the same line rules the assignment out.
+            # every real step, so the same line rules the assignment out.
             cp_model.add(
                 sum(work) >= task_var.processing
             ).only_enforce_if(assign.present)
 
 
-def _overlap_minutes(cp_model, task_var, shift, name):
+def _tasks_on(built, res_idx) -> set:
+    """Every task with a mode on this resource — the same set PyJobShop's own
+    machine no-overlap covers, so E1 and E2 can never disagree about which work a
+    rostered machine is answerable for."""
+    return {built.data.modes[mode_idx].task
+            for mode_idx in built.data.resource2modes(res_idx)}
+
+
+def _overlap_minutes(cp_model, built, task_var, task_idx, shift):
     """``min(end_t, end_s) - max(start_t, start_s)``, clipped at 0.
 
     A variable, not a constant: how much of a shift a task covers is exactly what
     the solver is deciding.
+
+    Cached on ``(task, shift)``, which is everything the value depends on. A task
+    with k candidate machines asks for this k times, and three IntVars plus three
+    equalities per ask — building them per machine would inflate E2 k-fold in
+    exactly the number Task 1 measures E2 against E1 by, and bias that choice for
+    no modelling reason.
     """
+    cached = built.shift_overlap.get((task_idx, shift.index))
+    if cached is not None:
+        return cached
+
+    name = f"{task_idx}_{shift.index}"
     lower = cp_model.new_int_var(shift.start, MAX_VALUE, f"lo_{name}")
     cp_model.add_max_equality(lower, [task_var.start, shift.start])
 
@@ -232,6 +293,7 @@ def _overlap_minutes(cp_model, task_var, shift, name):
 
     overlap = cp_model.new_int_var(0, shift.minutes, f"ov_{name}")
     cp_model.add_max_equality(overlap, [upper - lower, 0])
+    built.shift_overlap[(task_idx, shift.index)] = overlap
     return overlap
 
 
@@ -267,16 +329,6 @@ def _absent(shop, name: str, shift, built) -> bool:
     start = built.plan_start + timedelta(minutes=shift.start)
     end = built.plan_start + timedelta(minutes=shift.end)
     return any(away_from < end and start < away_to for away_from, away_to in blocks)
-
-
-def _machines_for(built, task_idx) -> tuple:
-    """The machine ids this machining task may run on, in a stable order.
-
-    Read from the op's own ``machine_options`` — the list ``model.build`` created
-    one mode per — so this cannot drift from what the model actually contains.
-    """
-    _job_key, op = built.machining_tasks[task_idx]
-    return tuple(mid for mid in op.machine_options if mid in built.machine_res_order)
 
 
 def _shifts_in_window(built, task_idx) -> list:

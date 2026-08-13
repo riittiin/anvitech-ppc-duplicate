@@ -67,6 +67,7 @@ class _Solved:
     manned: dict              # (machine id, shift index) -> operator name
     machine_of: dict          # (job key, op seq) -> machine id
     span: dict                # (job key, op seq) -> (start, end) in plan minutes
+    operator_of: dict         # (job key, op seq) -> operator booked IN THE MODE
 
     def makespan(self) -> int:
         return max(end for _start, end in self.span.values())
@@ -109,12 +110,12 @@ def _solve_tiny(masters, batches, *, hold=True, absent=None,
     status = solver.solve(cp.model)
     ok = status in (cp_sat.OPTIMAL, cp_sat.FEASIBLE)
     if not ok:
-        return _Solved(False, built, roster, {}, {}, {})
+        return _Solved(False, built, roster, {}, {}, {}, {})
 
     manned = {(mid, idx): name
               for (name, mid, idx), var in roster.x.items()
               if solver.value(var)}
-    machine_of, span = {}, {}
+    machine_of, span, operator_of = {}, {}, {}
     for key, task_idx in built.task_of.items():
         task_var = cp.variables.task_vars[task_idx]
         span[key] = (solver.value(task_var.start), solver.value(task_var.end))
@@ -123,7 +124,12 @@ def _solve_tiny(masters, batches, *, hold=True, absent=None,
                 (task_idx, built.machine_res_index(mid)))
             if assign is not None and solver.value(assign.present):
                 machine_of[key] = mid
-    return _Solved(True, built, roster, manned, machine_of, span)
+        for name in sorted(built.operator_res_order):
+            assign = cp.variables.assign_vars.get(
+                (task_idx, built.operator_res_index(name)))
+            if assign is not None and solver.value(assign.present):
+                operator_of[key] = name
+    return _Solved(True, built, roster, manned, machine_of, span, operator_of)
 
 
 def _machines_per_person(res) -> dict:
@@ -285,6 +291,96 @@ def test_rule_1_does_not_bind_a_manual_station():
     assert res.ok
     assert res.roster.x == {} and res.roster.staffed == {}
     assert res.span[("B1", 1)] == (0, 20)      # no setup on a manual step
+
+
+# --------------------------------------------------------------------------- #
+# Rule 1 is a property of PEOPLE, not of machines
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("hold", [True, False])
+def test_a_man_on_a_cnc_is_not_also_at_a_bench(hold):
+    """The operator shape CLAUDE.md records as a live production bug: one person
+    legitimately spans kinds (Sandeep runs manual stations AND CNC4).
+
+    Rule 1 rosters him on the CNC for the WHOLE shift. Booking him at a bench in
+    the same shift does not merely make the published roster noisy — it makes it
+    wrong, naming a man on a CNC while the schedule has him at MD1."""
+    machines = {"CNC1": Machine("CNC1", "CNC 1", "CNC lathe",
+                                available_hrs_per_day=19.5),
+                "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5)}
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None, [_proc("CNC1")]),
+         "B": Routing("B", "b", "c", "rm", None,
+                      [_proc("MD1", cycle=5.0, name="DEBURING")])},
+        [_op("Sandeep", ["CNC1", "MD1"])], machines=machines)
+    res = _solve_tiny(masters, [_B("B1", "A", 10), _B("B2", "B", 10)], hold=hold)
+    assert res.ok
+    assert res.manned                      # he really was put on the CNC
+    for (mid, shift_idx), _name in res.manned.items():
+        if mid != "CNC1":
+            continue
+        shift = res.built.shifts[shift_idx]
+        assert not _runs_in(res, ("B2", 1), shift), (
+            f"rostered on CNC1 for shift {shift_idx} and at MD1 in it too")
+
+
+@pytest.mark.parametrize("hold", [True, False])
+def test_a_step_that_lands_on_a_cnc_is_manned_whatever_its_kind(hold):
+    """Which work Rule 1 covers is decided by the MACHINE, never by the step's
+    kind, and never by the hold encoding.
+
+    ``domain._kind_for_machine_id`` takes a step's kind from its FIRST machine
+    option and ``_candidates`` puts Allotted first, so a routing written
+    ``MD1/CNC1`` is a manual-kind step that can land on a CNC. It is still a man
+    on a CNC, and the roster must say so."""
+    machines = {"CNC1": Machine("CNC1", "CNC 1", "CNC lathe",
+                                available_hrs_per_day=19.5),
+                "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5)}
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None,
+                      [_proc("MD1/CNC1", cycle=5.0, name="DEBURING")])},
+        [_op("Pravin", ["CNC1"])], machines=machines)   # nobody can run MD1
+    res = _solve_tiny(masters, [_B("B1", "A", 10)], hold=hold)
+    assert res.ok
+    assert res.machine_of[("B1", 1)] == "CNC1"
+    ran_in = [s for s in res.built.shifts if _runs_in(res, ("B1", 1), s)]
+    assert [s for s in ran_in if ("CNC1", s.index) in res.manned], (
+        f"ran on CNC1 over shifts {[s.index for s in ran_in]} with roster "
+        f"{res.manned}")
+
+
+def test_an_absent_operator_does_no_bench_work_either():
+    """Rule 1's CNC/VMC scope is about ROSTERING. Absence is physical
+    unavailability and binds everyone — a man away from the shop is not deburring
+    either."""
+    machines = {"MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5)}
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None,
+                      [_proc("MD1", cycle=5.0, name="DEBURING")])},
+        [_op("Anturam", ["MD1"]), _op("Bhau", ["MD1"])], machines=machines)
+    absent = {"Anturam": [(datetime(2026, 8, 12, 0, 0),
+                           datetime(2026, 9, 12, 0, 0))]}
+    res = _solve_tiny(masters, [_B("B1", "A", 10)], absent=absent)
+    assert res.ok
+    assert res.operator_of[("B1", 1)] == "Bhau"
+
+
+def test_a_night_operator_does_not_work_a_day_only_station():
+    """The same shift discipline the roster gives CNC operators. MD1 shuts at
+    19:00, so a second-shift man cannot run it however qualified he is — and the
+    control proves the station itself is fine."""
+    machines = {"MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5)}
+    routing = {"A": Routing("A", "a", "c", "rm", None,
+                            [_proc("MD1", cycle=5.0, name="DEBURING")])}
+    batches = [_B("B1", "A", 10)]
+
+    night = _masters(routing, [_op("Ravi", ["MD1"], shift="2nd shift")],
+                     machines=machines)
+    assert not _solve_tiny(night, batches).ok
+
+    day = _masters(routing, [_op("Anturam", ["MD1"])], machines=machines)
+    control = _solve_tiny(day, batches)
+    assert control.ok and control.operator_of[("B1", 1)] == "Anturam"
 
 
 # --------------------------------------------------------------------------- #

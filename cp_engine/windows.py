@@ -96,19 +96,61 @@ def machine_breaks(machine, shifts: list[Shift],
     working calendar; a caller must never need to re-coalesce this itself.
     """
     two_shift = bool(machine.is_two_shift())
+    return _coalesce(_time_off(shifts, horizon_min,
+                              lambda s: two_shift or s.shift == FIRST))
+
+
+def operator_breaks(operator, shifts: list[Shift], horizon_min: int,
+                    away=(), plan_start=None) -> list[tuple[int, int]]:
+    """Every interval this PERSON cannot work, as CP breaks.
+
+    The same complement of the same shift list ``machine_breaks`` takes — one
+    definition of the working calendar — narrowed to the one shift he works and
+    then minus the days he is away.
+
+    It exists because Rule 1's roster covers CNC/VMC only, and a shop where the
+    CNC operators have shift discipline and the bench operators have none is not
+    a model of anything. Rule 1's SCOPE is about rostering; a shut station and an
+    absent man are physical facts that bind everyone.
+
+    ``away`` is that operator's absence blocks as wall-clock ``(from, to)``
+    pairs, which is how they reach this engine (``engine.book_store`` stores
+    ``{from_date, to_date}``); ``plan_start`` converts them into the same integer
+    minutes the shifts use. Blocks are clipped to the horizon and coalesced with
+    the off-shift time, so an absence that swallows a night makes one interval.
+    """
+    mine = operator_shift(operator)
+    raw = _time_off(shifts, horizon_min, lambda s: s.shift == mine)
+    if plan_start is not None:
+        for away_from, away_to in away or ():
+            start = max(0, _minutes(away_from, plan_start))
+            end = min(horizon_min, _minutes(away_to, plan_start))
+            if end > start:
+                raw.append((start, end))
+    return _coalesce(raw)
+
+
+def _time_off(shifts: list[Shift], horizon_min: int, works) -> list:
+    """The complement of the shifts ``works`` accepts, over the whole horizon.
+
+    Walks the shifts in time order rather than filtering and complementing
+    against the horizon, because a boundary at a second shift's own end is only
+    visible while walking the shifts themselves. Uncoalesced — every caller
+    coalesces, most of them after adding intervals of their own.
+    """
     raw: list[tuple[int, int]] = []
     cursor = 0
     for s in sorted(shifts, key=lambda s: s.start):
         if s.start > cursor:
             raw.append((cursor, s.start))
-        if two_shift or s.shift == FIRST:
+        if works(s):
             cursor = max(cursor, s.end)
         else:
             raw.append((max(cursor, s.start), s.end))
             cursor = max(cursor, s.end)
     if cursor < horizon_min:
         raw.append((cursor, horizon_min))
-    return _coalesce(raw)
+    return raw
 
 
 def _coalesce(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
