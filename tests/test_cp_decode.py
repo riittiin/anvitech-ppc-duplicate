@@ -621,6 +621,140 @@ def test_a_pool_pick_can_never_steal_a_person_the_genome_already_rostered():
     assert [who for _s, _e, who in on_cnc1.segments][0] == "A"
 
 
+def _helper_masters():
+    """The live 2026-08-07 shape: H spans kinds — one CNC and one bench — and is
+    the ONLY person who can be on either. N covers the genome's own CNC1."""
+    return _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC1")]),
+         "Z": Routing("Z", "z", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC4")]),
+         "M": Routing("M", "m", "cust", "rm", None,
+                      [Process(1, "DEBURING", 1.0, None, None, "MD1")])},
+        [Operator("H", "CNC4/MD1", ["CNC4", "MD1"], "First shift"),
+         Operator("N", "CNC1", ["CNC1"], "First shift")])
+
+
+def test_a_pool_staffed_cnc_reserves_nobody_once_it_has_nothing_to_run():
+    """THE ROUND-2 REGRESSION, in the shape it was measured in.
+
+    ``live`` is derived ONCE from ``assigned`` and is never pruned as jobs
+    finish, so a machining machine stays "live" for the whole 400-day horizon.
+    Reserving its pool operator for the whole shift unconditionally therefore
+    reserved them FOREVER: CNC4 ran its only order out by 10:00 on day one and
+    went on eating H — the shop's one flexible helper — in every first shift
+    after it, so MD1 was never staffed and five one-minute DEBURING orders were
+    DROPPED off the plan entirely. **5 of 7 orders absent from the Gantt** is the
+    2026-08-11 director escalation and CLAUDE.md's "a resource with no work must
+    never disappear", reintroduced by the fix that was meant to end it.
+
+    The assertion is that NOTHING IS DROPPED, not that the timings look right:
+    an order in no plan at all is the failure this guards.
+
+    Rule 1 is asserted in the same breath on purpose. Staffing the CNC per
+    operation like a bench also plans all seven — and puts H on a CNC and a bench
+    in one shift, which is the defect round 2 existed to fix. Only a reservation
+    that is BOTH whole-shift AND conditional passes both halves.
+    """
+    from engine.config import Config as _Config
+    from roster_engine import report as roster_report
+
+    masters = _helper_masters()
+    g = {"cp_machine_of": {("B1", 1): "CNC1"},
+         # CNC1 rostered across the horizon; CNC4 nowhere, because the solve gave
+         # it no work. CNC4 therefore falls to the qualified pool — H.
+         "cp_roster": {("CNC1", i): "N" for i in range(0, 40, 2)},
+         "cp_overlap_of": {}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    batches = [_B("B1", "A", 60), _B("B9", "Z", 30)] + [
+        _B(f"D{i}", "M", 1) for i in range(1, 6)]
+    plan = _lay(masters, batches, g)
+
+    assert plan.dropped == ()
+    assert set(plan.completion) == {b.batch_id for b in batches}
+    for b in batches:
+        assert [p for p in plan.placements if p.job_key == b.batch_id], b.batch_id
+
+    entries = [_RosterEntry(p) for p in plan.placements if p.machine]
+    config = _Config(plan_start_date=date(2026, 8, 12), scheduler="cp")
+    assert roster_report.operator_split_violations(entries, config, masters) == []
+    assert roster_report.machine_conflict_violations(entries) == []
+
+    # Non-vacuous: H really is contested — the fixture puts H on the pool-staffed
+    # CNC first and on the bench only once that CNC is empty.
+    on_cnc4 = [p for p in plan.placements if p.machine == "CNC4"][0]
+    assert [who for _s, _e, who in on_cnc4.segments] == ["H"]
+    assert on_cnc4.start == PLAN_START
+    on_md1 = [p for p in plan.placements if p.machine == "MD1"]
+    assert {who for p in on_md1 for _s, _e, who in p.segments} == {"H"}
+    assert min(p.start for p in on_md1) > on_cnc4.end
+
+
+def _two_pool_cnc_masters():
+    """Both CNCs fall to the pool (the genome rosters neither) and H is the only
+    person who can be on either — so exactly one of them runs each first shift."""
+    return _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC1")]),
+         "Z": Routing("Z", "z", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC4")])},
+        [Operator("H", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift")])
+
+
+def _two_pool_cnc_genome(**over):
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B9", 1): "CNC4"},
+         "cp_roster": {},              # a degraded genome: EVERY CNC takes the pool
+         "cp_overlap_of": {}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    g.update(over)
+    return g
+
+
+@pytest.mark.parametrize("floored,expected_first", [("B1", "B9"), ("B9", "B1")])
+def test_the_contested_helper_goes_to_the_machine_whose_work_is_ready_first(
+        floored, expected_first):
+    """THE ALPHABETICAL SUB-CASE. The pool pick walked ``sorted(shop.machines)``,
+    so CNC1 took the shop's one helper whether or not it could use them — an idle
+    CNC1 held H all shift while CNC4's ready-now job waited.
+
+    Both machines have work here; only the MOMENT differs, so machine naming is
+    the only thing left that could decide it. The two legs are mirror images: the
+    winner follows the readiness, and under an alphabetical pick CNC1 would win
+    BOTH.
+    """
+    masters = _two_pool_cnc_masters()
+    g = _two_pool_cnc_genome(
+        cp_start_of={(floored, 1): "2026-08-12T15:00:00"})
+    plan = _lay(masters, [_B("B1", "A", 1000), _B("B9", "Z", 30)], g)
+
+    started = {p.job_key: p.start for p in plan.placements}
+    assert started[expected_first] == PLAN_START
+    assert started[floored] > PLAN_START
+    assert plan.dropped == ()
+    # Non-vacuous: CNC1 really is the alphabetically first machine, so leg one
+    # can only pass by reading the readiness.
+    assert sorted(masters.machines)[0] == "CNC1"
+
+
+@pytest.mark.parametrize("first_key", ["B1", "B9"])
+def test_two_pool_cncs_ready_at_once_are_separated_by_the_genome_rank(first_key):
+    """The remaining tie, settled by READING the genome rather than by naming.
+    Both machines can act at 08:00 and one person can staff either; the job the
+    solver ranked first is the one that gets the shift. The decoder decides
+    nothing it can read (spec §8) — and machine id survives only as the final
+    determinism tie-break, when the genome has said nothing at all.
+    """
+    other = "B9" if first_key == "B1" else "B1"
+    item = {"B1": "A", "B9": "Z"}
+    plan = _lay(_two_pool_cnc_masters(), [_B("B1", "A", 1000), _B("B9", "Z", 30)],
+                _two_pool_cnc_genome(ranks={f"SO-{first_key}\x1f{item[first_key]}": 1,
+                                            f"SO-{other}\x1f{item[other]}": 2}))
+    started = {p.job_key: p.start for p in plan.placements}
+    assert started[first_key] == PLAN_START
+    assert started[other] > PLAN_START
+    assert plan.dropped == ()
+
+
 class _RosterEntry:
     """The four fields ``roster_engine.report``'s checks read off a schedule
     entry. Built here rather than through the app seam because that seam is a

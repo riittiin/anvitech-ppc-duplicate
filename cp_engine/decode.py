@@ -738,6 +738,60 @@ def _pending_escape_machines(order, state, assigned, fallback_ops) -> set:
     return out
 
 
+def _first_work_moment(mid, ms, order, state, assigned, floors, cursor, window,
+                       only):
+    """``(earliest moment this machine could act in this window, the genome rank
+    of the job it would act on)``, or ``None`` when it has nothing to run.
+
+    The SAME walk ``_next_on_machine`` and ``_earliest_ready`` do, asked one
+    question earlier: it is what decides whether reserving a person for this
+    machine is justified at all. Deliberately not a second definition of "has
+    work" — a staffing rule that disagreed with the dispatch rule would book
+    people onto machines that then stand idle, which is the exact defect it
+    exists to stop.
+
+    The second element is the tie-break, and it is READ, NEVER DECIDED: among
+    machines whose work is ready at the same instant the person goes to the one
+    carrying the job the genome ranked first. Machine id is only the final
+    determinism tie-break, never a reason — an alphabetical pick handed the
+    shop's one flexible helper to CNC1 while CNC4's ready-now job went unplanned.
+
+    It reads CURRENT ops only, so work released into this shift by another
+    machine's overlap mid-window is not seen and the machine waits for the next
+    window. That is a one-shift delay for pool-staffed machines only (a
+    genome-rostered machine is manned regardless of demand), it is the
+    conservative direction, and it can never drop anything: the op is still
+    current at the next window's start, when it IS seen.
+    """
+    if ms.job_key is not None:
+        # A part physically in the chuck: the machine has work by construction
+        # (``ms.job_key`` is cleared the moment the op finishes).
+        if only is not None and (ms.job_key, ms.op_seq) not in only:
+            return None
+        when = max(cursor, ms.busy_until or cursor)
+        if when >= window.end:
+            return None
+        return when, order.index(ms.job_key)
+    best = None
+    for rank, key in enumerate(order):
+        js = state[key]
+        if js.on_machine is not None:
+            continue
+        op = _current_op(js)
+        if op is None or assigned.get((key, op.seq)) != mid:
+            continue
+        if only is not None and (key, op.seq) not in only:
+            continue
+        if js.job.qty_for(op.seq) <= 0:
+            continue
+        when = max(cursor, _ready_at(js, op, floors))
+        if when >= window.end:
+            continue
+        if best is None or (when, rank) < best:
+            best = (when, rank)
+    return best
+
+
 def _run_shift(window, cursor, order, state, machines, shop, crew, assigned,
                fallback_ops, floors, bench_of, overlap_of, config, setup_min,
                placements, completion):
@@ -780,26 +834,52 @@ def _run_shift(window, cursor, order, state, machines, shop, crew, assigned,
     for name in manned.values():
         booked.setdefault(name, []).append((window.start, window.end))
 
+    # A pool-staffed MACHINING machine binds ONE person for the WHOLE shift, the
+    # same way the roster binds the genome's own — staffing a CNC per operation
+    # like a bench publishes a plan in which one man runs a CNC and then walks to
+    # a bench in the same shift, which ``operator_split_violations`` flags and
+    # spec §8 requires to be zero.
+    #
+    # It binds that person ONLY IF THE MACHINE HAS SOMETHING TO RUN in this
+    # window, and where two such machines want the same person the one whose
+    # work is ready SOONEST — then the one carrying the genome's higher-ranked
+    # job — picks first. Both clauses are load-bearing and both were learned the
+    # hard way.
+    #
+    # An unconditional reservation is PERMANENT: ``live`` is derived once from
+    # ``assigned`` and is never pruned as jobs finish, so a CNC that emptied at
+    # 10:00 on day one went on eating the shop's only flexible helper for the
+    # rest of the 400-day horizon — measured at 5 of 7 real orders DROPPED, the
+    # 2026-08-11 director-escalation shape and the very thing the escape exists
+    # to prevent. And picking in machine-id order handed that helper to an idle
+    # CNC1 while CNC4's ready-now job was dropped: the decoder must not settle a
+    # contest by an accident of naming when the genome has an opinion. Gating
+    # here rather than pruning ``live`` keeps ONE definition of "has work" — the
+    # same walk ``_next_on_machine`` does.
+    machining_pool, bench_pool = [], []
     for mid, pool in pooled:
-        if mid in shop.machining_ids:
-            # RULE 1, and it binds the pool exactly as the roster binds the
-            # genome's own: ONE person, for the WHOLE shift. Staffing a CNC the
-            # way a bench is staffed — per operation, with only a clash check —
-            # publishes a plan in which one man runs a CNC and then walks to a
-            # bench in the same shift, which is precisely what
-            # ``roster_engine.report.operator_split_violations`` flags and what
-            # spec §8 requires to be zero.
-            pick = next((name for name in pool
-                         if not any(s < window.end and window.start < e
-                                    for s, e in booked.get(name, ()))), None)
-            if pick is None:
-                continue                  # nobody free all shift; the machine is dark
-            manned[mid] = pick
-            booked.setdefault(pick, []).append((window.start, window.end))
-        else:
-            benches[mid] = pool
-            for name in pool:
-                booked.setdefault(name, [])
+        if mid not in shop.machining_ids:
+            bench_pool.append((mid, pool))
+            continue
+        when = _first_work_moment(mid, machines[mid], order, state, assigned,
+                                  floors, cursor, window,
+                                  fallback_ops if mid in restricted else None)
+        if when is not None:
+            machining_pool.append((when[0], when[1], mid, pool))
+
+    for _when, _rank, mid, pool in sorted(machining_pool):
+        pick = next((name for name in pool
+                     if not any(s < window.end and window.start < e
+                                for s, e in booked.get(name, ()))), None)
+        if pick is None:
+            continue                  # nobody free all shift; the machine is dark
+        manned[mid] = pick
+        booked.setdefault(pick, []).append((window.start, window.end))
+
+    for mid, pool in bench_pool:
+        benches[mid] = pool
+        for name in pool:
+            booked.setdefault(name, [])
 
     if not manned and not benches:
         return                      # every machine dark; anything in a chuck HOLDS
