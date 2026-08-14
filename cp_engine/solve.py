@@ -52,7 +52,16 @@ _PHASE_ONE_SHARE = 0.6
 
 @dataclass
 class Solved:
-    """What one solve produced, in the shape every later layer reads it in."""
+    """What one solve produced, in the shape every later layer reads it in.
+
+    ``total_late_days`` and ``days_late`` are UNCAPPED — the real number the
+    owner is judged on, derived from the solved completions. ``spread`` is the
+    sum of CAPPED squares, because the cap exists only to stop one hopeless
+    order dominating the distribution. ``stats["capped_total_late_days"]`` is the
+    domain the spread was computed over, for anyone reconciling the two.
+
+    ``status`` is the WEAKER of the two phases' statuses — see ``_weaker``.
+    """
 
     status_ok: bool
     status: str
@@ -63,7 +72,7 @@ class Solved:
     stats: dict
     shifts: list
     completion: dict                      # job key -> completion datetime
-    days_late: dict = field(default_factory=dict)   # job key -> capped days late
+    days_late: dict = field(default_factory=dict)   # job key -> TRUE days late
 
     # Per-task detail. ``windows`` is the raw map ``task_window`` reads; it is
     # public because a whole-plan check wants to sweep it rather than ask for one
@@ -186,7 +195,11 @@ def solve_book(batches, masters, config, plan_start: datetime, *,
         return Solved(False, solver.status_name(status), {}, None, None, None,
                       stats, shifts, {})
 
-    total_star = sum(solver.value(d) for d in days.values())
+    # The UNCAPPED total — phase 1's own objective value, and the number phase 2
+    # is held to. Never the capped sum: an order already past the cap would then
+    # be free to drift later, and the guarantee would hold only on the metric
+    # that cannot see the drift.
+    total_star = sum(solver.value(d.true) for d in days.values())
     stats["phase_one_total"] = float(total_star)
     lower_bound = float(solver.best_objective_bound)
 
@@ -215,7 +228,14 @@ def solve_book(batches, masters, config, plan_start: datetime, *,
         if two_status in (cp_sat.OPTIMAL, cp_sat.FEASIBLE):
             solver = two_solver
             spread = float(two_solver.objective_value)
-            status_name = stats["phase_two_status"]
+            # The WEAKER of the two, never simply phase 2's. Phase 2 is the
+            # cheap, warm-started, ``sum(true) <= T*``-constrained half, so a
+            # book whose phase 1 times out at FEASIBLE will very often see
+            # phase 2 prove the optimal SPREAD at that unproven total — and
+            # reporting OPTIMAL would publish "proven optimal" for a headline
+            # total that is merely the best found. ``lower_bound_days`` still
+            # carries phase 1's bound; this makes ``status`` say it too.
+            status_name = _weaker(status_name, stats["phase_two_status"])
         else:
             # Phase 1's answer is feasible for phase 2 by construction (the added
             # constraint is ``<= T*``, read off that very solution), so a phase-2
@@ -266,6 +286,24 @@ def _run(cp_model, time_limit, num_workers, seed, on_progress, should_cancel,
     return solver, status
 
 
+# How much a solve status claims, strongest first. Anything unlisted claims
+# least of all: a plan exists (the caller only reaches ``_weaker`` on success)
+# but nothing about it is proven.
+_STRENGTH = ("OPTIMAL", "FEASIBLE")
+
+
+def _weaker(a: str, b: str) -> str:
+    """The status that claims LESS of the two.
+
+    A lexicographic solve is only as proven as its first phase: the headline
+    number is the total, and phase 1 owns it. Phase 2 proving the best spread
+    *at* an unproven total says nothing about the total.
+    """
+    rank = {name: i for i, name in enumerate(_STRENGTH)}
+    fallback = len(_STRENGTH)
+    return a if rank.get(a, fallback) >= rank.get(b, fallback) else b
+
+
 def _hint(cp_model, variables, built, solver, days, roster, released) -> None:
     """Warm-start phase 2 from phase 1's plan.
 
@@ -290,8 +328,9 @@ def _hint(cp_model, variables, built, solver, days, roster, released) -> None:
         cp_model.add_hint(var, solver.value(var))
     for var in released.values():
         cp_model.add_hint(var, solver.value(var))
-    for var in days.values():
-        cp_model.add_hint(var, solver.value(var))
+    for late in days.values():
+        cp_model.add_hint(late.true, solver.value(late.true))
+        cp_model.add_hint(late.capped, solver.value(late.capped))
 
 
 # --------------------------------------------------------------------------- #
@@ -335,9 +374,12 @@ def _read_back(cp, built, shifts, roster, released, days, solver, plan_start,
 
     result = _Result(Solution(built.data, scheduled))
 
-    solved_days = {key: solver.value(var) for key, var in days.items()}
-    stats["uncapped_total_late_days"] = _uncapped_total(built, result,
-                                                        plan_start)
+    # Read off the COMPLETIONS, not off ``late.true``. Under phase 2 an order
+    # past the cap has a flat square, so its ``true`` variable is free to float
+    # anywhere the budget allows and would over-report. The schedule cannot.
+    solved_days = _days_late_by_job(built, result)
+    stats["capped_total_late_days"] = float(
+        sum(solver.value(late.capped) for late in days.values()))
     completion = {
         job.key: plan_start + timedelta(
             minutes=result.best.jobs[built.job_of[job.key]].end)
@@ -378,23 +420,23 @@ class _Resolved:
     x: dict
 
 
-def _uncapped_total(built, result, plan_start) -> int:
-    """Total late-days with NO cap, from the solved completions.
+def _days_late_by_job(built, result) -> dict:
+    """``{job key: true days late}``, UNCAPPED, from the solved completions.
 
-    Reported alongside the capped figure so a book carrying a hopeless order
-    cannot quietly publish 60 as if it were the truth. Computed in Python from
-    the completion and the due date — not from a model variable — because the
-    uncapped variable is not in the objective and so is free to sit anywhere at
-    or above its bound."""
-    total = 0
+    The headline number, so it is derived from the schedule rather than read off
+    a model variable: ``Lateness.true`` is only pinned to its lower bound while
+    it is in the objective, and phase 2 leaves an order past the cap free to
+    float. The completion cannot float — it is what the shop will actually do.
+    """
+    out = {}
     for job in built.jobs:
         if job.key not in built.dated_jobs:
             continue
         job_idx = built.job_of[job.key]
         due = built.data.jobs[job_idx].due_date
         end = result.best.jobs[job_idx].end
-        total += max(0, -(-(end - due) // 1440))       # ceil for positive gaps
-    return total
+        out[job.key] = max(0, -(-(end - due) // 1440))  # ceil for positive gaps
+    return out
 
 
 def _base_stats(cp_model, built, shifts, days, skipped) -> dict:

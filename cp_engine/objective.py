@@ -1,7 +1,28 @@
 """Total late-days first, then the most even distribution at that total.
 
-    phase 1    minimise  sum_j D_j
-    phase 2    minimise  sum_j D_j^2      subject to  sum_j D_j <= T* + eps
+    phase 1    minimise  sum_j L_j
+    phase 2    minimise  sum_j D_j^2      subject to  sum_j L_j <= T* + eps
+
+    where  L_j = true days late          (uncapped — the owner's headline number)
+           D_j = min(L_j, CAP_DAYS)      (capped — the SQUARES, and only those)
+
+WHICH METRIC GOES WHERE, AND WHY IT IS NOT INTERCHANGEABLE. The cap exists for
+exactly one job: stopping one hopeless order's square from dominating the spread
+and sending the search chasing an order it cannot save instead of the ones it
+can. It has no business anywhere else, and letting it leak breaks the owner's
+rule in a way that is invisible on the reported number:
+
+* leaked into PHASE 1, an order already past sixty days late has a flat penalty,
+  so delaying it further is FREE — the search will happily push it to buy a day
+  somewhere cheaper, and the real total rises while the reported one does not.
+* leaked into PHASE 2's constraint, the "fairness never costs a late-day"
+  guarantee holds only on the capped metric. Phase 2 could push a capped order
+  arbitrarily later to shave a square off another order, at zero cost to
+  `sum D_j`, while the owner's real late-days climb.
+
+Neither is theoretical: the soft cap exists precisely BECAUSE orders past sixty
+days late are the normal state of this shop's book. So the no-regression
+constraint and the headline number are both on L, and only the squares see D.
 
 WHY SQUARED, AND WHY IT IS NOT ARBITRARY. With the total held fixed by phase 2's
 constraint,
@@ -23,9 +44,9 @@ where phase 1 was indifferent. That keeps b7beb18 (2026-08-13, the incumbent
 engine's on-time term made LINEAR so the score tracks total late-days) intact
 rather than quietly reverting it.
 
-D is in DAYS, not minutes: it is the number the owner is judged on, it matches
-the app's ``(completion.date() - due_date).days``, and it keeps the squares small
-(0..60 -> 0..3600) so the tangent-line encoding below stays tiny.
+Both are in DAYS, not minutes: it is the number the owner is judged on, it
+matches the app's ``(completion.date() - due_date).days``, and it keeps the
+squares small (0..60 -> 0..3600) so the chord encoding below stays tiny.
 
 WORKER-ONLY. This module imports ortools, which is deliberately absent on Render
 (see ``cp_engine/__init__.py``).
@@ -34,18 +55,34 @@ WORKER-ONLY. This module imports ortools, which is deliberately absent on Render
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 # The app's own on-time cap. One hopeless order must not swamp the plan and send
 # the search chasing it instead of the orders it can still save.
 #
-# It is a cap on the PENALTY, never on the completion — see ``add_days_late``.
+# It is a cap on the SQUARE, and on nothing else — never on the completion, never
+# on the headline total, never on phase 2's no-regression constraint. See
+# ``add_days_late`` and the module docstring for what each leak costs.
 CAP_DAYS = 60
 
 _MINUTES_PER_DAY = 1440
 
 
+class Lateness(NamedTuple):
+    """One order's tardiness, in the two forms the two phases need.
+
+    They are deliberately NOT interchangeable, and carrying them as one object is
+    what stops a caller reaching for the wrong one: ``true`` is what the owner is
+    judged on and what may never be traded away, ``capped`` exists only so one
+    hopeless order's square cannot dominate the spread.
+    """
+
+    true: object            # uncapped days late — phase 1 and phase 2's cap
+    capped: object          # min(true, CAP_DAYS) — the squares, and only those
+
+
 def add_days_late(cp_model, variables, built) -> dict:
-    """``{job key: D_j IntVar}``, integer days late, capped at ``CAP_DAYS``.
+    """``{job key: Lateness(true, capped)}``, in whole integer days.
 
     Undated jobs get no variable at all: an order with no delivery date cannot be
     judged on-time or late, and recording 0.0 would claim a perfect landing.
@@ -59,11 +96,15 @@ def add_days_late(cp_model, variables, built) -> dict:
     state of this shop's book — comes out INFEASIBLE, with no plan at all and
     nothing on screen to explain why.
 
-    So the true tardiness gets its own variable, sized off the horizon so it can
-    never bind, and ``D = min(true, CAP_DAYS)``. The search still stops chasing a
-    hopeless order past sixty days; the plan still exists. Minimisation drives
-    ``true`` to its lower bound ``ceil((end - due)/1440)`` and D with it, so D is
-    exact below the cap.
+    So ``true`` is sized off the closed horizon and can never bind, and
+    ``capped = min(true, CAP_DAYS)``. Phase 1 minimises ``true``, so it sits
+    exactly at ``ceil((end - due)/1440)``.
+
+    ⚠ ``true`` is only pinned to that lower bound while it is IN the objective.
+    Under phase 2 an order past the cap has a flat square, so its ``true`` is
+    free to float anywhere the ``sum(true) <= T*`` budget allows. Read a solved
+    order's days late from its COMPLETION, not from this variable
+    (``solve._days_late_by_job``).
 
     An order finishing any time ON its delivery date is on time, because
     ``model._due_minutes`` puts ``due`` at the last minute of that date.
@@ -79,35 +120,48 @@ def add_days_late(cp_model, variables, built) -> dict:
 
         # The most days late this job could possibly be, given the closed
         # horizon: enough that ``true`` is never the binding constraint, and no
-        # more, so its domain stays small.
+        # more, so its domain stays as small as the horizon allows.
         ceiling = max(0, math.ceil((horizon - due) / _MINUTES_PER_DAY))
         true = cp_model.new_int_var(0, ceiling, f"late_{job.key}")
         cp_model.add(true * _MINUTES_PER_DAY >= job_var.end - due)
 
         capped = cp_model.new_int_var(0, CAP_DAYS, f"D_{job.key}")
         cp_model.add_min_equality(capped, [true, CAP_DAYS])
-        out[job.key] = capped
+        out[job.key] = Lateness(true, capped)
     return out
 
 
 def phase_one(cp_model, days: dict) -> None:
     """Minimise total late-days — the number on the Schedule tab, and the number
-    the owner is judged on."""
-    cp_model.minimize(sum(days.values()) if days else 0)
+    the owner is judged on.
+
+    On ``true``, never on ``capped``. Minimising the capped sum makes delaying an
+    order already past sixty days FREE, so the search buys a day somewhere
+    cheaper by pushing a hopeless order further out and the real total rises
+    while the reported one does not.
+    """
+    cp_model.minimize(sum(d.true for d in days.values()) if days else 0)
 
 
 def phase_two(cp_model, days: dict, total_star: int, slack_days: int = 0) -> None:
-    """Minimise the spread, holding the total at phase 1's result.
+    """Minimise the spread, holding the UNCAPPED total at phase 1's result.
 
-    ``slack_days`` is the eps above: 0 makes phase 2 a strict tie-break that can
-    never cost a late-day. It is a parameter rather than a constant so buying
-    evenness is a config change if the owner ever asks for one, not a redesign.
+    The constraint is on ``true`` and the objective on ``capped``, and that split
+    is the whole of the owner's rule. Constrain the capped sum instead and
+    "fairness never costs a late-day" holds only on the capped metric: an order
+    pinned at sixty could be pushed arbitrarily later to shave a square off
+    another order, free on the reported number and expensive on the real one.
+
+    ``slack_days`` is the eps: 0 makes phase 2 a strict tie-break that can never
+    cost a late-day. It is a parameter rather than a constant so buying evenness
+    is a config change if the owner ever asks for one, not a redesign.
     """
     if not days:
         cp_model.minimize(0)
         return
-    cp_model.add(sum(days.values()) <= int(total_star) + int(slack_days))
-    cp_model.minimize(sum(_square(cp_model, d, f"sq_{i}")
+    cp_model.add(sum(d.true for d in days.values())
+                 <= int(total_star) + int(slack_days))
+    cp_model.minimize(sum(_square(cp_model, d.capped, f"sq_{i}")
                           for i, d in enumerate(days.values())))
 
 

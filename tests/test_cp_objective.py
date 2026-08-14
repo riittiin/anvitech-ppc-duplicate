@@ -97,6 +97,16 @@ def test_squares_are_exact_integers_via_the_integer_chords():
         assert solver.value(sq) == value * value
 
 
+def _lateness(model, name, lo=0, hi=100):
+    """A ``Lateness`` pair wired the way ``add_days_late`` wires it: ``capped``
+    really is ``min(true, CAP_DAYS)``, so a unit test that pins which phase reads
+    which cannot pass by both names happening to mean the same thing."""
+    true = model.new_int_var(lo, hi, name)
+    capped = model.new_int_var(0, objective.CAP_DAYS, f"cap_{name}")
+    model.add_min_equality(capped, [true, objective.CAP_DAYS])
+    return objective.Lateness(true, capped)
+
+
 def test_fairness_spreads_lateness_when_the_total_is_unchanged():
     """The owner's example. Ten orders sharing 100 unavoidable late-days: an even
     split scores 1,000, nine-slightly-late-plus-one-disaster scores 6,760. Same
@@ -106,14 +116,13 @@ def test_fairness_spreads_lateness_when_the_total_is_unchanged():
     the total held fixed, Var(D) = (sum D^2)/n - ((sum D)/n)^2 and the second term
     is a constant, so minimising sum D^2 IS minimising the variance."""
     model = ortools_cp.CpModel()
-    days = {f"J{i}": model.new_int_var(0, objective.CAP_DAYS, f"D{i}")
-            for i in range(10)}
-    model.add(sum(days.values()) == 100)
+    days = {f"J{i}": _lateness(model, f"D{i}") for i in range(10)}
+    model.add(sum(d.true for d in days.values()) == 100)
     objective.phase_two(model, days, total_star=100, slack_days=0)
     solver = ortools_cp.CpSolver()
     solver.parameters.num_workers = 1
     assert solver.solve(model) in (ortools_cp.OPTIMAL, ortools_cp.FEASIBLE)
-    got = sorted(solver.value(v) for v in days.values())
+    got = sorted(solver.value(v.true) for v in days.values())
     assert got == [10] * 10
 
 
@@ -122,15 +131,40 @@ def test_fairness_never_buys_evenness_with_late_days():
     raise the total by even one day — b7beb18 (2026-08-13) made the on-time term
     linear precisely to stop the objective spreading at the total's expense."""
     model = ortools_cp.CpModel()
-    days = {"A": model.new_int_var(0, 100, "A"), "B": model.new_int_var(0, 100, "B")}
+    days = {"A": _lateness(model, "A"), "B": _lateness(model, "B")}
     # An even split is available only at a HIGHER total: (0,10) totals 10,
     # (6,6) totals 12. The cap must keep the uneven, cheaper plan.
-    model.add_allowed_assignments([days["A"], days["B"]], [(0, 10), (6, 6)])
+    model.add_allowed_assignments([days["A"].true, days["B"].true],
+                                  [(0, 10), (6, 6)])
     objective.phase_two(model, days, total_star=10, slack_days=0)
     solver = ortools_cp.CpSolver()
     solver.parameters.num_workers = 1
     assert solver.solve(model) in (ortools_cp.OPTIMAL, ortools_cp.FEASIBLE)
-    assert (solver.value(days["A"]), solver.value(days["B"])) == (0, 10)
+    assert (solver.value(days["A"].true), solver.value(days["B"].true)) == (0, 10)
+
+
+def test_the_no_regression_constraint_is_on_the_UNCAPPED_total():
+    """Phase 2's guarantee must hold on the number the owner is judged on, not on
+    the capped one.
+
+    Both plans here have the SAME capped total (60 + 1 = 61): the hopeless order
+    is pinned at the cap either way. Their real totals are not — 81 against 91 —
+    and the squares prefer the expensive one, because pushing an order that is
+    already past the cap ten days further out is free to ``sum(capped)`` and
+    buys the other order's square down from 1 to 0.
+
+    Constrain the capped sum and phase 2 takes that trade: ten real late-days
+    spent on a number nobody can see. Constrain the true sum and it cannot."""
+    model = ortools_cp.CpModel()
+    days = {"HOPELESS": _lateness(model, "H"), "SLIP": _lateness(model, "S")}
+    model.add_allowed_assignments([days["HOPELESS"].true, days["SLIP"].true],
+                                  [(80, 1), (91, 0)])
+    objective.phase_two(model, days, total_star=81, slack_days=0)
+    solver = ortools_cp.CpSolver()
+    solver.parameters.num_workers = 1
+    assert solver.solve(model) in (ortools_cp.OPTIMAL, ortools_cp.FEASIBLE)
+    assert (solver.value(days["HOPELESS"].true),
+            solver.value(days["SLIP"].true)) == (80, 1)
 
 
 def test_slack_lets_the_owner_buy_evenness_when_he_asks_for_it():
@@ -138,13 +172,14 @@ def test_slack_lets_the_owner_buy_evenness_when_he_asks_for_it():
     phase 2 takes it. The knob exists so the trade-off is a config change rather
     than a redesign."""
     model = ortools_cp.CpModel()
-    days = {"A": model.new_int_var(0, 100, "A"), "B": model.new_int_var(0, 100, "B")}
-    model.add_allowed_assignments([days["A"], days["B"]], [(0, 10), (6, 6)])
+    days = {"A": _lateness(model, "A"), "B": _lateness(model, "B")}
+    model.add_allowed_assignments([days["A"].true, days["B"].true],
+                                  [(0, 10), (6, 6)])
     objective.phase_two(model, days, total_star=10, slack_days=2)
     solver = ortools_cp.CpSolver()
     solver.parameters.num_workers = 1
     assert solver.solve(model) in (ortools_cp.OPTIMAL, ortools_cp.FEASIBLE)
-    assert (solver.value(days["A"]), solver.value(days["B"])) == (6, 6)
+    assert (solver.value(days["A"].true), solver.value(days["B"].true)) == (6, 6)
 
 
 # --------------------------------------------------------------------------- #
@@ -194,9 +229,68 @@ def test_an_order_past_the_cap_does_not_make_the_model_infeasible():
     hopeless order past 60 days, and the plan still exists."""
     res = _solve(_one_bench_step(), [_B("B1", "A", 660, due=date(2026, 1, 1))])
     assert res.status_ok
-    assert res.total_late_days == float(objective.CAP_DAYS)
-    # ...and the true figure is reported rather than silently replaced by 60.
-    assert res.stats["uncapped_total_late_days"] > objective.CAP_DAYS
+    # The headline number is the TRUE one — 60 is never published as the truth.
+    assert res.total_late_days == 223.0
+    assert res.days_late["B1"] == 223
+    # ...and the capped figure, which is all the squares ever see, is 60.
+    assert res.stats["capped_total_late_days"] == float(objective.CAP_DAYS)
+
+
+def _capped_and_uncapped():
+    """A book mixing one hopeless order with one that can still be saved — the
+    shape where a capped headline number stops telling the truth.
+
+    One bench station, one first-shift operator, running 0..660 (Wed),
+    2880..3540 (Fri, Thursday off) and 4320..4980 (Sat).
+
+      HOPELESS is 660 minutes, due 01-01: already 223 days gone. Capped at 60
+               whatever happens, so on the CAPPED metric its completion is free.
+      SLIP     is 1320 minutes (two full shifts), due 12-08.
+
+    Only two schedules exist:
+
+      HOPELESS first -> ends  660 (Wed) = 223 days late
+                SLIP  ends   4980 (Sat) =   3 days late    TRUE total 226
+      SLIP     first -> ends 3540 (Fri) =   2 days late
+                HOPELESS ends 4980 (Sat) = 226 days late   TRUE total 228
+
+    On the CAPPED metric those read 63 and 62, so a capped objective prefers the
+    second — and costs the shop TWO REAL LATE-DAYS to shave one off a number
+    nobody can see. Asymmetric durations are what makes this bite: with two equal
+    jobs the completions merely swap and both totals tie.
+    """
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None,
+                      [_proc("MD1", cycle=1.0, name="DEBURING")])},
+        [_op("Anturam", ["MD1"])])
+    return masters, [_B("HOPELESS", "A", 660, due=date(2026, 1, 1)),
+                     _B("SLIP", "A", 1320, due=date(2026, 8, 12))]
+
+
+def test_the_cap_never_reaches_the_headline_total_or_the_fairness_guarantee():
+    """The cap belongs to the squares and nowhere else.
+
+    Leaked into phase 1, delaying an order already past sixty days is FREE, so
+    the search buys a cheap day by pushing a hopeless order further out. Leaked
+    into phase 2's constraint, "fairness never costs a late-day" holds only on
+    the capped metric and the same trade returns one phase later. This fixture
+    fails under EITHER leak: both put HOPELESS second and cost two real days.
+    """
+    masters, batches = _capped_and_uncapped()
+    res = _solve(masters, batches)
+    assert res.status_ok
+    assert res.days_late == {"HOPELESS": 223, "SLIP": 3}
+    assert res.total_late_days == 226.0          # not 228, the capped answer
+    assert res.task_window("HOPELESS", 1)[1] == 660     # it really went first
+    # The capped view is still available, and still says the other thing — which
+    # is exactly why it must not be what the plan is chosen on.
+    assert res.stats["capped_total_late_days"] == 63.0
+    # And phase 2 really RAN on this book. T* has to be the uncapped total here
+    # too: budget phase 2 with the capped sum (63) against true days (226) and
+    # its own constraint is unsatisfiable, so it dies INFEASIBLE and the spread
+    # silently disappears on every book carrying a hopeless order.
+    assert res.stats["phase_two_status"] == "OPTIMAL"
+    assert res.spread == 3609.0                         # 60^2 + 3^2
 
 
 def test_an_undated_order_gets_no_late_day_variable():
@@ -471,6 +565,41 @@ def test_a_cancelled_search_keeps_the_best_plan_it_had():
     assert res.total_late_days == 4.0
     assert res.genome["cp_machine_of"][("LATE", 1)] == "MD1"
     assert _solve(masters, batches).total_late_days == 3.0    # the control
+
+
+def test_a_status_claims_only_what_the_weaker_phase_proved():
+    """A lexicographic solve is only as proven as its FIRST phase."""
+    assert solve._weaker("OPTIMAL", "OPTIMAL") == "OPTIMAL"
+    assert solve._weaker("FEASIBLE", "OPTIMAL") == "FEASIBLE"
+    assert solve._weaker("OPTIMAL", "FEASIBLE") == "FEASIBLE"
+    assert solve._weaker("FEASIBLE", "UNKNOWN") == "UNKNOWN"
+    assert solve._weaker("UNKNOWN", "OPTIMAL") == "UNKNOWN"
+
+
+def test_an_unproven_total_is_never_published_as_optimal():
+    """Phase 2 is the cheap half — warm-started and constrained to
+    ``sum(true) <= T*`` — so a book whose phase 1 runs out of time will very
+    often see phase 2 prove the best SPREAD at that unproven total. Reporting
+    phase 2's status would publish "proven optimal" for a headline number that is
+    merely the best found, which is the 50-batch class exactly.
+
+    Driven by cancelling phase 1 only: ``on_progress`` fires before
+    ``should_cancel`` in each callback, so the flag lands on phase 1's first
+    solution and is clear again by phase 2."""
+    seen = {"phase": None}
+
+    def progress(row):
+        seen["phase"] = row["phase"]
+
+    masters, batches = _forced_choice()
+    res = _solve(masters, batches, on_progress=progress,
+                 should_cancel=lambda: seen["phase"] == 1)
+    assert res.status_ok
+    assert res.stats["phase_one_status"] == "FEASIBLE"   # it really was stopped
+    assert res.stats["phase_two_status"] == "OPTIMAL"    # ...and phase 2 was not
+    assert res.status == "FEASIBLE"                      # the weaker of the two
+    # The bound is phase 1's, and it says the total is not proven.
+    assert res.lower_bound_days < res.total_late_days
 
 
 def test_an_unroutable_item_is_reported_and_the_rest_still_plans():
