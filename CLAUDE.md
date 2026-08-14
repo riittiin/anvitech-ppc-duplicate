@@ -1,6 +1,101 @@
 # CLAUDE.md — Anvitech PPC Engine
 
-> ## ⚠️ CURRENT STATE — READ THIS FIRST (updated 2026-08-11)
+> ## ⚠️ CURRENT STATE — READ THIS FIRST (updated 2026-08-14)
+>
+> - **🟡 A CONSTRAINT-PROGRAMMING SCHEDULER + OPTIMIZER EXISTS, BEHIND
+>   `DEFAULT_SCHEDULER=cp`, AND IS NOT YET SWITCHED ON (2026-08-14, spec
+>   `docs/superpowers/specs/2026-08-14-cp-scheduler-optimizer-design.md`, plan
+>   `docs/superpowers/plans/2026-08-14-cp-scheduler-optimizer.md`).** `cp_engine/`
+>   replaces `roster_engine`'s greedy shift clock AND its local-search optimizer with
+>   ONE model that decides job sequence, machine, crew roster and overlap together
+>   under the shop's four rules. It is built on **PyJobShop 0.0.9** for the native
+>   job-shop layer, then reaches **pyjobshop's internal `CPModel(data).model` /
+>   `.variables` / `assign_vars`** to add the two things the public API cannot
+>   express — Rule 1's per-shift roster and the fairness objective.
+>   `tests/test_cp_escape_hatch.py` is the canary for that internal API; if it fails
+>   after a pyjobshop upgrade, STOP. **pyjobshop is PINNED in CI and must NEVER enter
+>   `requirements.txt`** — Render runs only the REPLAY path (`domain`, `windows`,
+>   `genome`, `decode`, `report`) and has neither pyjobshop nor ortools.
+>   **THE OBJECTIVE IS THE OWNER'S, IN TWO PHASES:** minimise **total late-days**,
+>   then — holding that total — minimise **Σ(days late)²**, which with the total
+>   fixed is exactly minimising the VARIANCE of tardiness, i.e. the most even
+>   spread achievable at the best total. Ten orders ten days late scores 1,000;
+>   nine orders two days plus one eighty-two scores 6,760 at the same total. The
+>   fairness slack defaults to **0**, so fairness can never cost a late-day — it
+>   decides only where phase 1 was indifferent, which keeps `b7beb18`'s linear
+>   on-time term intact. Squares enter as exact integer chords, never
+>   `add_multiplication_equality`.
+>   **Measured, not assumed — the phase-2 constraint MUST use the UNCAPPED total.**
+>   Capping it (the first cut) bought 2 capped days and 4 spread points for **124
+>   REAL late-days** (797 → 673 on one book, 533 → 449 on another), because an
+>   order already past the 60-day cap is pinned and phase 2 can push it later for
+>   free. Overdue-past-60 is normal on this book, so it was reachable, not
+>   theoretical. Worse, taking `T*` capped makes phase 2 silently **INFEASIBLE**
+>   and **25 of 26 tests still pass** — it presents as "no fairness improvement
+>   available", not as a bug.
+>   **🔴 THE ENGINE IS FEASIBLE-WITH-A-BOUND, NOT PROVABLY OPTIMAL. Never let
+>   "provably optimal" reach the UI.** Measured at the owner's scale (61 batches):
+>   a complete rule-legal plan with a proven lower bound, but a **2.4× gap that six
+>   times the wall clock does not close** (300 s → 454 late-days/bound 168; 1800 s →
+>   409/170). Proven optimality survives only to ~10 batches. **CORES, NOT TIME,
+>   BUY THE BOUND: 4 workers at the same 30 min gave bound 215 (gap 1.99×) against
+>   2 workers' 170 (gap 2.4×) — the solve worker must be pinned at 4+ cores, and a
+>   smaller runner degrades the plan silently, with no error.**
+>   **⚠️ AUTHORIZED DEVIATION FROM RULE 2 (owner's explicit call, 2026-08-14, with
+>   the number in front of him).** `cp_hold_across_unmanned_shift` ships **False**
+>   (E1): an operation may NOT span an unstaffed shift, which trims Rule 2's "the
+>   part stays in the chuck" clause. Cost measured: given the freedom, the solver
+>   held a part across an unmanned shift in **3 of 116 operations** (1 fully). It
+>   was not a trade for speed — the exact encoding (E2) is 11× the variables /
+>   8.5× the constraints and returns **UNKNOWN, i.e. NO PLAN AT ALL, from 30
+>   batches upward even at 1800 s**, and is dominated where it does survive (16×
+>   slower at 10, **21% worse plan** at 20). Both encodings remain in the code;
+>   only the default moved. Rule 4 stays **exact** (`setup_mode="credit"`, +2.7%).
+>   **🔴 RULE 3'S PER-JOB OVERLAP IS A VARIABLE WITH NO DECISION IN IT.** `k`
+>   appears in exactly two lower bounds on the successor's start, both increasing
+>   in `k`, and in NO objective — so the feasible set at `k=1` contains every
+>   other and no objective can make `k>1` strictly pay. **Under this engine Rule 3
+>   is "release after one piece, always" — maximum overlap.** The spec's claim that
+>   the solver picks overlap per job is VACUOUS. Making it a real trade-off needs a
+>   term that CHARGES for early release; that is an owner decision, not a patch.
+>   A decoder must read `cp_overlap_of` as *"at least this many pieces had
+>   cleared"*, never as the release the schedule needs.
+>   **THE MODEL AND THE REPLAY MUST NOT BECOME TWO DEFINITIONS OF THE SCHEDULE.**
+>   The solve runs off-box and stores a **decision genome**; `/run` replays it in
+>   milliseconds, exactly as it replays applied ranks today. `cp_engine/report.py::
+>   completion_drift` compares the replay against the solve. It EARNED ITS KEEP:
+>   the first genome could not reproduce its own solve — 2–7 days' drift across 12
+>   books — because `from_solution` flattened a **per-machine sequence with
+>   deliberately non-left-shifted starts** into ONE GLOBAL JOB RANK, which a greedy
+>   left-shifting decoder can never reproduce at any book size (on one book, 17 of
+>   21 ops replayed EARLIER). Fixed by carrying `cp_start_of` (the solved start, a
+>   HARD FLOOR) and `cp_bench_of` (the bench operator, which the genome was
+>   discarding because Rule 1 rosters CNC/VMC only). Now: **completion-DATE drift is
+>   EXACTLY 0 across 40 books / 280 orders.** A one-sided **LATE** residual of up to
+>   **+83 min** remains at MINUTE resolution — the decoder's `_JobState` tracks one
+>   op at a time and cannot release a successor while its predecessor is in the
+>   chuck, while the CP release is a linear bound that fires mid-operation. It is
+>   INHERITED (the greedy engine has the same job state), it moves no published
+>   date, and its remedy is named in `decode.py`'s docstring. **If a shift-wise
+>   mismatch is ever reported, look here first.**
+>   **Rules this cost us, each paid for twice:** (1) **a modelling decision must be
+>   keyed on the MACHINE a step lands on, never on the step's `op.kind`** — kind is
+>   read from the FIRST machine option and Allotted sorts first, so an Allotted
+>   `MD1` with Suggested `CNC1` yields kind `manual` for work that runs on a CNC.
+>   That defect appeared in THREE consecutive review rounds: which work Rule 1
+>   covered, whether a task could book an operator, whether it could idle, and the
+>   setup duration. (2) **Rule 1 binds the PERSON, not the machine** — "binds
+>   CNC/VMC only" scopes which machines are ROSTERED; it never licensed a rostered
+>   operator to also be booked at a bench in the same shift (the live 2026-08-07
+>   Sandeep shape, reproduced in a solver). (3) **absence is physical and binds
+>   EVERYONE**, not just the rostered crew. (4) a tractability measurement on a book
+>   with **zero total tardiness is meaningless** — the first pass reported "OPTIMAL,
+>   0 late-days, 288 s" at full scale and was measuring FEASIBILITY while reporting
+>   it as OPTIMISATION.
+>   **Not yet done:** the seven `config.scheduler` dispatch sites, the app seam and
+>   the end-to-end wiring. Until `DEFAULT_SCHEDULER=cp` is set, NOTHING about the
+>   live plan changes; rollback is that one env var, and the genome lives under its
+>   own store key no other engine reads.
 >
 > - **🔴 PIECES OF A CLUBBED ORDER WERE IN NO PLAN AT ALL (2026-08-11, live, director
 >   escalation).** A director opened the Gantt for `26-27SO120` + `26-27SO122` — same

@@ -66,11 +66,20 @@ jobs:
 
       - name: Install
         # pyjobshop is NOT added to requirements.txt on purpose — it is a
-        # diagnostic-only dependency and must never reach the Render service.
+        # solver-only dependency and must never reach the Render service, which
+        # runs the REPLAY path (cp_engine domain/windows/genome/decode/report)
+        # and has neither pyjobshop nor ortools installed. A test pins that those
+        # modules import without them.
+        #
+        # PINNED, deliberately. The cp_engine design reaches pyjobshop's internal
+        # API — CPModel(data).model / .variables / assign_vars — because Rule 1's
+        # per-shift roster and the fairness objective cannot be expressed in the
+        # public one. Verified against 0.0.9; tests/test_cp_escape_hatch.py is the
+        # canary that fails loudly if an upgrade moves it.
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyjobshop
+          pip install pyjobshop==0.0.9
 
       - name: Compute the floor
         env:
