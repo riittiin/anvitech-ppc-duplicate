@@ -1,0 +1,412 @@
+"""The replay decoder: genome + today's book -> laid-out times.
+
+The tests below are written against the CONTRACT, not the implementation: the
+decoder decides nothing, so every test that pins a decision (machine, operator,
+order, release) works by making the decoder's own preference DIFFERENT from the
+genome's answer and asserting the genome wins.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+from cp_engine import decode, domain
+from engine.config import Config
+from engine.models import (Machine, Masters, Operator, Process, Routing,
+                           WorkCalendar)
+
+PLAN_START = datetime(2026, 8, 12, 8, 0)      # a Wednesday; 13-08 is the weekly off
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _B:
+    def __init__(self, key, item, qty, due=date(2026, 12, 1), remaining=None):
+        self.batch_id, self.item_code, self.qty = key, item, qty
+        self.so_refs, self.delivery_date = [f"SO-{key}"], due
+        self.process_remaining = remaining
+
+
+def _cfg(**kw):
+    return Config(plan_start_date=date(2026, 8, 12), scheduler="cp",
+                  setup_time_min=90.0, **kw)
+
+
+_DEFAULT_MACHINES = {
+    "CNC1": Machine("CNC1", "CNC 1", "CNC lathe", available_hrs_per_day=19.5),
+    "CNC4": Machine("CNC4", "CNC 4", "CNC lathe", available_hrs_per_day=19.5),
+    "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5),
+}
+
+
+def _masters(routings, operators, machines=None):
+    return Masters(
+        machines=dict(machines or _DEFAULT_MACHINES),
+        routings=routings, operators=list(operators), calendar=WorkCalendar())
+
+
+def _lay(masters, batches, g, frozen=None, config=None):
+    jobs, _by_key, _skipped = domain.build_jobs(batches, masters)
+    shop = domain.build_shop(masters, {})
+    return decode.lay_out(jobs, shop, config or _cfg(), PLAN_START, g,
+                          frozen=frozen)
+
+
+def _routing():
+    return {"A": Routing("A", "a", "cust", "rm", None, [
+        Process(1, "CNC FIRST SIDE", 5.0, None, None, "CNC1/CNC4"),
+        Process(2, "DEBURING", 1.0, None, None, "MD1")])}
+
+
+def _op(plan, seq):
+    return [p for p in plan.placements if p.op_seq == seq][0]
+
+
+# --------------------------------------------------------------------------- #
+# The decoder decides nothing
+# --------------------------------------------------------------------------- #
+
+def test_the_decoder_uses_the_genome_machine_not_its_own_preference():
+    """The decoder DECIDES NOTHING. If it re-picked a machine, the plan on
+    screen would not be the plan that was solved (spec §8)."""
+    masters = _masters(_routing(),
+                       [Operator("N", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift"),
+                        Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC4", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC4", 0): "N"}, "cp_overlap_of": {"B1": 10},
+         "ranks": {}, "cp_completion": {}, "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 10)], g)
+    machines = {p.op_seq: p.machine for p in plan.placements}
+    assert machines[1] == "CNC4"
+
+
+def test_the_operator_on_a_machining_op_comes_from_the_roster():
+    masters = _masters(_routing(), [Operator("N", "CNC1", ["CNC1"], "First shift"),
+                                    Operator("S", "CNC1", ["CNC1"], "First shift"),
+                                    Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC1", 0): "S"}, "cp_overlap_of": {"B1": 10},
+         "ranks": {}, "cp_completion": {}, "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 10)], g)
+    first = _op(plan, 1)
+    assert [who for _s, _e, who in first.segments] == ["S"]
+
+
+def test_the_genome_rank_decides_which_job_takes_the_machine_first():
+    """Two batches, one machine, both ready at the plan start. The order is the
+    solver's, not the decoder's — reverse the ranks and the plan reverses."""
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 5.0, None, None, "CNC1")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift")])
+    base = {"cp_machine_of": {("B1", 1): "CNC1", ("B2", 1): "CNC1"},
+            "cp_roster": {("CNC1", i): "N" for i in range(20)},
+            "cp_overlap_of": {"B1": 10, "B2": 10}, "cp_completion": {},
+            "cp_solved_book_sig": ""}
+    batches = [_B("B1", "A", 10), _B("B2", "A", 10)]
+
+    forward = _lay(masters, batches, dict(base, ranks={"SO-B1\x1fA": 1,
+                                                       "SO-B2\x1fA": 2}))
+    reverse = _lay(masters, batches, dict(base, ranks={"SO-B1\x1fA": 2,
+                                                       "SO-B2\x1fA": 1}))
+    first_of = lambda plan: min(plan.placements, key=lambda p: p.start).job_key
+    assert first_of(forward) == "B1"
+    assert first_of(reverse) == "B2"
+
+
+def test_an_operation_spanning_two_shifts_is_segmented_by_the_roster():
+    """Rule 2 keeps the operation whole; op_segments names WHO ran each part.
+    Five surfaces read that list, and the shift-wise export is a live floor
+    document people plan their day around."""
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 2.0, None, None, "CNC1")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("S", "CNC1", ["CNC1"], "2nd shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1"},
+         "cp_roster": {("CNC1", 0): "N", ("CNC1", 1): "S"},
+         "cp_overlap_of": {"B1": 400}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 400)], g)
+    first = _op(plan, 1)
+    assert len(first.segments) >= 2
+    assert [who for _s, _e, who in first.segments][:2] == ["N", "S"]
+    assert first.segments[0][1] == first.segments[1][0]      # contiguous, not split
+
+
+# --------------------------------------------------------------------------- #
+# The release — the exact half of the pair (spec §5.3)
+# --------------------------------------------------------------------------- #
+
+def test_the_release_is_computed_in_worked_minutes_not_wall_clock():
+    """The decoder is the EXACT half of the pair (spec §5.3). An overnight gap
+    must not release pieces that were never cut."""
+    masters = _masters(_routing(), [Operator("N", "CNC1", ["CNC1"], "First shift"),
+                                    Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {"B1": 100}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 100)], g)
+    first, second = _op(plan, 1), _op(plan, 2)
+    worked = sum((e - s).total_seconds() / 60.0
+                 for s, e, _who in first.segments if s < second.start)
+    assert worked >= 90 + 100 * 5 - 1e-6      # setup + all 100 pieces
+    # The MOMENT, not just the accumulated segment: the setup is part of the
+    # worked minutes the successor waits for, exactly as ``rules._setup_charged``
+    # puts it into the model's own release bound.
+    assert second.start == PLAN_START + timedelta(minutes=90 + 100 * 5)
+
+
+def test_a_release_that_straddles_the_weekly_off_waits_for_the_worked_minutes():
+    """The discriminating case the test above cannot see: the predecessor's work
+    does not fit in one shift, so wall-clock and worked minutes give different
+    answers 12 hours apart.
+
+    MD1 is a single-shift bench: 800 minutes of deburring runs 08:00-19:00 on
+    Wed 12-08 (660 min) and resumes Fri 14-08 (13-08 is the weekly off) at 08:00,
+    finishing the 800th minute at 10:20. Wall clock would put it at 21:20 on the
+    Wednesday — inside a dark shop, on pieces nobody cut.
+    """
+    masters = _masters(
+        {"C": Routing("C", "c", "cust", "rm", None, [
+            Process(1, "DEBURING", 1.0, None, None, "MD1"),
+            Process(2, "CNC FIRST SIDE", 0.1, None, None, "CNC1")])},
+        [Operator("M", "MD1", ["MD1"], "First shift"),
+         Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("S", "CNC1", ["CNC1"], "2nd shift")])
+    g = {"cp_machine_of": {("B2", 1): "MD1", ("B2", 2): "CNC1"},
+         "cp_roster": {("CNC1", i): ("N" if i % 2 == 0 else "S")
+                       for i in range(20)},
+         "cp_overlap_of": {"B2": 800}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B2", "C", 800)], g)
+    first, second = _op(plan, 1), _op(plan, 2)
+
+    assert first.machine == "MD1" and second.machine == "CNC1"
+    # The wall-clock answer, which must NOT be the one the decoder gives.
+    assert PLAN_START + timedelta(minutes=800) == datetime(2026, 8, 12, 21, 20)
+    assert second.start >= datetime(2026, 8, 14, 10, 20)
+    worked = sum((e - s).total_seconds() / 60.0
+                 for s, e, _who in first.segments if s < second.start)
+    assert worked >= 800 - 1e-6
+
+
+def test_a_repeat_of_the_same_part_pays_no_setup_and_releases_that_much_earlier():
+    """Rule 4's credit, and the release that follows from it. The model grants a
+    setup-free mode to a back-to-back same-(item, seq) pair; if the decoder
+    charged 90 minutes anyway the two would disagree by exactly that."""
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 5.0, None, None, "CNC1")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B2", 1): "CNC1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {"B1": 10, "B2": 10},
+         "ranks": {"SO-B1\x1fA": 1, "SO-B2\x1fA": 2},
+         "cp_completion": {}, "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 10), _B("B2", "A", 10)], g)
+    by_job = {p.job_key: p for p in plan.placements}
+    assert by_job["B1"].work_min == 90 + 10 * 5.0
+    assert by_job["B2"].work_min == 10 * 5.0          # warm fixture, no setup
+
+
+def test_setup_follows_the_machine_not_the_step_kind():
+    """A step whose FIRST option is a bench is manual-KIND, but on a CNC it still
+    changes a fixture. The model charges setup per MODE (``mid in
+    shop.machining_ids``); reading ``op.kind`` here would hand the plan 90
+    minutes of CNC capacity that does not exist — the trap that produced two
+    defect rounds in Task 5."""
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "DEBURING", 5.0, None, None, "MD1/CNC1")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {"B1": 10}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 10)], g)
+    first = _op(plan, 1)
+    assert first.machine == "CNC1"
+    assert first.work_min == 90 + 10 * 5.0
+
+
+def test_a_fast_step_never_finishes_before_the_step_that_feeds_it():
+    """Overlap may START a step early; it may never let it END first — it cannot
+    finish pieces its predecessor has not delivered (RULES.md:132). 590 minutes
+    of turning feed 10 minutes of deburring, released after one piece.
+
+    The paced tail is real OCCUPANCY, not a cosmetic end date: ``B2`` is waiting
+    at the same bench and may not be dropped into it. Publishing the paced end
+    while freeing the machine underneath it would double-book MD1.
+    """
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None, [
+            Process(1, "CNC FIRST SIDE", 5.0, None, None, "CNC1"),
+            Process(2, "DEBURING", 0.1, None, None, "MD1")]),
+         "E": Routing("E", "e", "cust", "rm", None, [
+             Process(1, "HEAT TREATMENT OS", 100.0, None, None, "OS"),
+             Process(2, "DEBURING", 0.1, None, None, "MD1")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 2): "MD1",
+                           ("B2", 2): "MD1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {"B1": 1, "B2": 1},
+         "ranks": {"SO-B1\x1fA": 1, "SO-B2\x1fE": 2},
+         "cp_completion": {}, "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 100), _B("B2", "E", 100)], g)
+    first, second = _op(plan, 1), _op(plan, 2)
+    assert second.job_key == "B1" and first.job_key == "B1"
+    assert second.start < first.end                       # overlap really fired
+    assert second.end >= first.end                        # but it is paced out
+    assert plan.completion["B1"] >= first.end
+
+    other = [p for p in plan.placements
+             if p.job_key == "B2" and p.machine == "MD1"][0]
+    assert other.start >= second.end                      # the bench was HELD
+
+
+# --------------------------------------------------------------------------- #
+# Off-machine lanes — visible, never silently skipped
+# --------------------------------------------------------------------------- #
+
+def test_an_outsourced_block_and_the_dispatch_milestone_are_both_placed():
+    """Outsourcing is shown, never ignored (2026-08-09: 0 of 1,648 delay-report
+    rows ever named an OS step). OS is fully sequential both sides, and DISPATCH
+    waits for the whole batch, not for its immediate predecessor."""
+    masters = _masters(
+        {"D": Routing("D", "d", "cust", "rm", None, [
+            Process(1, "CNC FIRST SIDE", 5.0, None, None, "CNC1"),
+            Process(2, "HEAT TREATMENT OS", 100.0, None, None, "OS"),
+            Process(3, "DEBURING", 1.0, None, None, "MD1"),
+            Process(4, "DISPATCH", 0.0, None, None, "")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 3): "MD1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         # k = 1, so if OS were allowed to overlap it would start after ONE
+         # piece — 45 minutes before the turning finishes. It may not.
+         "cp_overlap_of": {"B1": 1}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "D", 10)], g)
+
+    assert {p.op_seq for p in plan.placements} == {1, 2, 3, 4}
+    turning, outsourced, dispatch = _op(plan, 1), _op(plan, 2), _op(plan, 4)
+    assert outsourced.machine is None
+    assert outsourced.start == turning.end                # nothing overlaps INTO OS
+    assert (outsourced.end - outsourced.start) == timedelta(minutes=100)
+    assert dispatch.start == dispatch.end                 # a zero-duration milestone
+    assert dispatch.end == max(p.end for p in plan.placements)
+
+
+# --------------------------------------------------------------------------- #
+# Nothing is ever dropped
+# --------------------------------------------------------------------------- #
+
+def test_an_op_the_genome_never_saw_is_reported_not_silently_dropped():
+    """An order uploaded since the solve. It must be laid out and FLAGGED, never
+    dropped — a piece of work in no plan at all is the 2026-08-11 defect."""
+    masters = _masters(_routing(), [Operator("N", "CNC1", ["CNC1"], "First shift"),
+                                    Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {}, "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 10)], g)
+    assert "B1" in plan.unassigned
+    assert {p.op_seq for p in plan.placements} == {1, 2}
+
+
+def test_a_genome_machine_the_routing_no_longer_lists_falls_back_and_is_flagged():
+    """The masters moved under the genome. The op still runs, on a machine its
+    routing really lists, and the job is flagged so the staleness banner fires."""
+    masters = _masters(_routing(), [Operator("N", "CNC1", ["CNC1"], "First shift"),
+                                    Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "MD1", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {"B1": 10}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 10)], g)
+    assert "B1" in plan.unassigned
+    assert _op(plan, 1).machine == "CNC1"     # options[0], not the stale MD1
+
+
+# --------------------------------------------------------------------------- #
+# Frozen work
+# --------------------------------------------------------------------------- #
+
+def test_a_frozen_op_keeps_its_machine_and_pays_no_setup_on_resume():
+    masters = _masters(_routing(),
+                       [Operator("N", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift"),
+                        Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC4", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {"B1": 10}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    pins = [{"job_key": "B1", "op_seq": 1, "machine": "CNC1", "operator": "N",
+             "remaining_qty": 4, "prev_start": PLAN_START}]
+    plan = _lay(masters, [_B("B1", "A", 10, remaining={1: 4})], g, frozen=pins)
+    first = _op(plan, 1)
+    assert first.machine == "CNC1"            # the pin beats the genome
+    assert first.qty == 4                     # batch remainder, never the line's
+    assert first.work_min == 4 * 5.0          # no setup on resume
+
+
+# --------------------------------------------------------------------------- #
+# The crew is never in two places at once
+# --------------------------------------------------------------------------- #
+
+def test_one_helper_is_never_on_two_benches_at_the_same_instant():
+    """Rule 1 rosters CNC/VMC only, so the genome carries no bench assignment at
+    all — the decoder has to staff a bench itself. It may not do so by publishing
+    the same person at two stations simultaneously: the model booked him as a
+    capacity-1 renewable, and the shift-wise sheet is a floor document."""
+    machines = {
+        "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5),
+        "MD2": Machine("MD2", "MD 2", "manual", available_hrs_per_day=9.5),
+    }
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "DEBURING", 1.0, None, None, "MD1/MD2")])},
+        [Operator("M", "MD1/MD2", ["MD1", "MD2"], "First shift")],
+        machines=machines)
+    g = {"cp_machine_of": {("B1", 1): "MD1", ("B2", 1): "MD2"},
+         "cp_roster": {}, "cp_overlap_of": {"B1": 60, "B2": 60},
+         "ranks": {"SO-B1\x1fA": 1, "SO-B2\x1fA": 2},
+         "cp_completion": {}, "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 60), _B("B2", "A", 60)], g)
+
+    busy: dict = {}
+    for p in plan.placements:
+        for start, end, who in p.segments:
+            for other_start, other_end in busy.setdefault(who, []):
+                assert not (start < other_end and other_start < end), (
+                    f"{who} is at two machines between {start} and {end}")
+            busy[who].append((start, end))
+    assert {p.machine for p in plan.placements} == {"MD1", "MD2"}
+
+
+# --------------------------------------------------------------------------- #
+# The replay path runs on Render
+# --------------------------------------------------------------------------- #
+
+def test_decode_imports_with_no_solver_installed():
+    """``cp_engine.decode`` runs on the production server, which deliberately has
+    neither pyjobshop nor ortools. Proven by blocking both and importing."""
+    probe = (
+        "import sys\n"
+        "class Blocker:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name.split('.')[0] in ('pyjobshop', 'ortools'):\n"
+        "            raise ImportError('blocked: ' + name)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Blocker())\n"
+        "import cp_engine.decode\n"
+        "assert 'pyjobshop' not in sys.modules and 'ortools' not in sys.modules\n"
+    )
+    done = subprocess.run([sys.executable, "-c", probe], cwd=str(REPO_ROOT),
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
