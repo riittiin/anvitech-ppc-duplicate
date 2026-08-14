@@ -116,6 +116,15 @@ class OptimizeResult:
     # different plan — so it is persisted by Apply alongside them. Empty for every
     # other engine, which has no such dimension.
     crew_rank: dict = field(default_factory=dict)
+    # The CP engine's answer is not a sequence at all: it is a decision GENOME
+    # (job order, machine per operation, crew roster, released pieces, the solved
+    # completion dates and the book it was solved against), replayed on every
+    # page load by engine/cp_adapter.run. ``ranks`` above is the genome's own job
+    # order, carried separately so Apply and pipeline.apply_priority_rank need no
+    # new vocabulary — but replay the ranks WITHOUT the genome and you get a
+    # different plan, so this is as much the artifact as they are. Empty for
+    # every other engine, which has no such thing.
+    genome: dict = field(default_factory=dict)
 
 
 def score(metrics: dict) -> float:
