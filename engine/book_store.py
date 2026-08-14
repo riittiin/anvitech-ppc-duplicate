@@ -28,6 +28,7 @@ ABSENCES_KEY = "anvitech:absences"          # kv: json list of operator absences
 OPERATORS_KEY = "anvitech:operators"        # kv: json {week_anchor, operators:[...]}
 LAST_APPLIED_SCHEDULE_KEY = "anvitech:last_applied_schedule"  # kv: json list of applied-schedule op rows
 FROZEN_OPS_KEY = "anvitech:frozen_ops"       # kv: json list of frozen (in-progress) op rows for today
+CP_GENOME_KEY = "anvitech:cp_genome"         # kv: json of the CP engine's applied decision genome
 PLAN_START_FLOOR_KEY = "anvitech:plan_start_floor"  # kv: json {date, floor} — today's pinned auto start
 
 _SEP = "\x1f"   # ASCII unit separator — never appears in an SO# or item code
@@ -280,6 +281,46 @@ def load_frozen_ops() -> list:
 
 def clear_frozen_ops() -> None:
     get_store().delete_key(FROZEN_OPS_KEY)
+
+
+# --- the CP engine's applied decision genome --- #
+# Its OWN key, deliberately: no other engine reads it, so rolling the deploy back
+# to DEFAULT_SCHEDULER=roster leaves nothing to migrate (plan §W.5). It is written
+# only when an optimize result is APPLIED, and read on every plan by
+# api._resolve_config, which attaches it to the config the seam receives.
+def save_cp_genome(g: dict | None) -> None:
+    """Persist the solved genome, flattened for JSON exactly once.
+
+    ``cp_engine.genome.to_json`` is **NOT idempotent**: handed an already-flat
+    genome it rebuilds each key from the FIRST TWO CHARACTERS of the string
+    (``"CNC1\\x1f1"`` -> ``("C", "N")``), because it assumes every tuple-keyed
+    value is still tuple-keyed. That is not an exception and not a malformed
+    genome — every later lookup simply MISSES, the decoder falls back for every
+    single operation, and the plan looks perfectly well-formed. A genome arrives
+    already flat whenever it came home over the wire (a cloud worker's row), so
+    the shape is checked here rather than assumed.
+    """
+    from cp_engine.genome import _TUPLE_KEYED, to_json
+    if not g:
+        get_store().kv_set(CP_GENOME_KEY, json.dumps({}))
+        return
+    flat = any(isinstance(key, str)
+               for name in _TUPLE_KEYED
+               for key in (g.get(name) or {}))
+    get_store().kv_set(CP_GENOME_KEY, json.dumps(g if flat else to_json(g)))
+
+
+def load_cp_genome() -> dict:
+    """The stored genome AS WRITTEN — flat, JSON-shaped. ``engine.cp_adapter._genome``
+    is the one door that converts it back to tuple keys, and it detects the shape
+    itself, so this deliberately does not decode: two decoders would be two
+    definitions."""
+    raw = get_store().kv_get(CP_GENOME_KEY)
+    return json.loads(raw) if raw else {}
+
+
+def clear_cp_genome() -> None:
+    get_store().delete_key(CP_GENOME_KEY)
 
 
 # --- operator absences --- #

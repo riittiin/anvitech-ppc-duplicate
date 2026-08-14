@@ -103,10 +103,30 @@
 >   with **zero total tardiness is meaningless** — the first pass reported "OPTIMAL,
 >   0 late-days, 288 s" at full scale and was measuring FEASIBILITY while reporting
 >   it as OPTIMISATION.
->   **Not yet done:** the seven `config.scheduler` dispatch sites, the app seam and
->   the end-to-end wiring. Until `DEFAULT_SCHEDULER=cp` is set, NOTHING about the
->   live plan changes; rollback is that one env var, and the genome lives under its
->   own store key no other engine reads.
+>   **THE DISPATCH SITES ARE WIRED, AND THERE ARE SIXTEEN OF THEM, NOT SEVEN.** The
+>   plan's W.1 table names seven; an AST scan for every function that reads
+>   `config.scheduler`/`DEFAULT_SCHEDULER` found **fourteen before a line changed**,
+>   and two helpers added by the wiring make sixteen. The nine outside W.1 are all
+>   real, and one of them is **`api._load_plan_config`'s `DEFAULT_SCHEDULER`
+>   whitelist — miss it and the owner's own switch does nothing.** A SECOND silent
+>   class rides alongside it: `optimizer.knob_for` returns `(None, ())` under cp and
+>   **nine** functions do `getattr(config, knob)` / `replace(cfg, **{knob: v})` with
+>   it — both raise `TypeError`, in production, on the first deep search after the
+>   cutover. Both sets are frozen registries in `tests/test_cp_wiring.py`, which
+>   **counts** the sites: a new one fails as `extra`, and any site branching on an
+>   engine name must contain the literal `"cp"`. **Never add a
+>   `config.scheduler` branch without running that test.**
+>   **Still to do:** the end-to-end run, the worker, and the deployment notes
+>   (Task 13). Until `DEFAULT_SCHEDULER=cp` is set, NOTHING about the live plan
+>   changes; rollback is that one env var, and the genome lives under its own store
+>   key (`anvitech:cp_genome`) that no other engine reads, so there is no migration
+>   to undo. **The Apply gate under cp ranks on total late-days then spread
+>   (`optimizer.apply_key`) — `optimizer.score` is symmetric and once made the app
+>   reject a plan 86 late-days better; every OTHER engine still applies on `score`,
+>   because that is what they search on.** Known limitation, deliberate: cp has **no
+>   local search fallback** — Render has no pyjobshop, so a deep search with the
+>   worker down reports `state="failed"` rather than burning 15 minutes of a
+>   0.1-CPU instance.
 >
 > - **🔴 PIECES OF A CLUBBED ORDER WERE IN NO PLAN AT ALL (2026-08-11, live, director
 >   escalation).** A director opened the Gantt for `26-27SO120` + `26-27SO122` — same

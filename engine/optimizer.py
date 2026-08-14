@@ -332,6 +332,17 @@ def optimize(so_lines, config, masters, *, reserved=None, budget_evals=150,
             so_lines, config, masters, reserved=reserved, budget_evals=budget_evals,
             seed=seed, on_progress=on_progress, should_cancel=should_cancel,
             frozen=frozen)
+    # The CP engine does not SEARCH a sequence at all — it solves the whole book
+    # once, under its own objective, and the job order is one field of the genome
+    # that falls out. ``frozen`` matters for the same reason it does for roster:
+    # ``cp_adapter.run`` pins in-progress work to the machine it is physically on,
+    # so a solve that ignored it would optimise a plan the app will never build.
+    if getattr(config, "scheduler", "classic") == "cp":
+        from engine import cp_adapter
+        return cp_adapter.solve(
+            so_lines, config, masters, reserved=reserved,
+            budget_evals=budget_evals, seed=seed, on_progress=on_progress,
+            should_cancel=should_cancel, frozen=frozen)
     config.validate()
 
     batches = rule1_consolidate.run(list(so_lines), config=config, masters=masters)
@@ -503,7 +514,50 @@ def knob_for(config):
         return "flow_chunks", FLOW_CHUNK_CANDIDATES
     if getattr(config, "scheduler", "classic") == "roster":
         return "overlap_percent", ROSTER_OVERLAP_CANDIDATES
+    # The CP engine has NO knob. Overlap is a MODEL VARIABLE there, picked per job
+    # by the solver under the same objective as everything else, so sweeping it
+    # outside would re-solve the same book N times to answer a question the model
+    # already answered — at N times the worker's wall clock. Falling through to
+    # the classic lineup is the silent failure: a contest that looks perfectly
+    # normal and burns four solves to pick a number the model overrides.
+    # ``knob_value`` below is what every caller of this must use for the CURRENT
+    # value: ``getattr(config, None)`` raises.
+    if getattr(config, "scheduler", "classic") == "cp":
+        return None, ()
     return "overlap_percent", OVERLAP_CANDIDATES
+
+
+def knob_value(config):
+    """The tuned knob's current value — ``None`` when this mode has no knob.
+
+    ``knob_for`` may return ``(None, ())``, and six call sites do
+    ``getattr(config, knob)`` or ``replace(config, **{knob: v})``; both raise
+    ``TypeError`` on ``None``. Rather than repeat the guard at each of them (and
+    miss one), "no knob" gets its own expression."""
+    knob, _cands = knob_for(config)
+    return getattr(config, knob) if knob else None
+
+
+def apply_key(metrics: dict, config=None) -> tuple:
+    """What the Apply gate ORDERS BY. Lower is better; ``<`` is "strictly better".
+
+    Under the CP engine: **total late-days, then the spread**. ``score`` below is
+    SYMMETRIC — it penalises finishing early exactly as it penalises finishing
+    late — which is right for an engine that SEARCHES on it, and wrong as the
+    acceptance test for an engine whose own objective is total lateness: measured,
+    it once made the app reject a plan 86 late-days better. ``slip_severity`` is
+    ``plan_metrics``' own capped-square spread, and it is used here because it is
+    the only spread BOTH sides of the comparison carry: the incumbent is measured
+    by ``plan_metrics``, which knows nothing of ``cp_spread``, and a gate that
+    compared two differently-derived numbers would be worse than a blunt one.
+
+    Every other engine keeps ``score`` byte-identically. They search on it, so the
+    gate that accepts their answer must read the same number, and nothing in this
+    repo may move until ``DEFAULT_SCHEDULER=cp``."""
+    if getattr(config, "scheduler", "classic") == "cp":
+        return (float(metrics.get("total_late_days", 0) or 0),
+                float(metrics.get("slip_severity", 0.0) or 0.0))
+    return (score(metrics),)
 
 
 def sweep_contenders(current_overlap=None, candidates=OVERLAP_CANDIDATES):
@@ -559,6 +613,17 @@ def sweep_optimize(so_lines, config, masters, *, budget_evals=150, seed=42,
     if getattr(config, "scheduler", "classic") == "roster":
         from engine import roster_adapter
         return roster_adapter.sweep_optimize(
+            so_lines, config, masters, budget_evals=budget_evals, seed=seed,
+            on_progress=on_progress, should_cancel=should_cancel,
+            base_reserved=base_reserved, frozen=frozen)
+    # CP: ONE solve wrapped in a SweepResult, because there is no knob to sweep
+    # (see knob_for). Falling through to _sweep_optimize_classic would ask
+    # `getattr(config, None)` and raise — but only on the FIRST deep search after
+    # the cutover, i.e. in production, which is why it is spelled out here rather
+    # than left to the fall-through.
+    if getattr(config, "scheduler", "classic") == "cp":
+        from engine import cp_adapter
+        return cp_adapter.sweep_optimize(
             so_lines, config, masters, budget_evals=budget_evals, seed=seed,
             on_progress=on_progress, should_cancel=should_cancel,
             base_reserved=base_reserved, frozen=frozen)

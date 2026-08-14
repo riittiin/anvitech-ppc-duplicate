@@ -65,6 +65,13 @@ def cloud_candidates(config) -> tuple:
         return CLOUD_NEW_OVERLAP_CANDIDATES
     if sched == "roster":
         return CLOUD_ROSTER_OVERLAP_CANDIDATES
+    if sched == "cp":
+        # ONE job, not a candidate grid: the CP engine has no knob (see
+        # optimizer.knob_for) — overlap is a variable inside the model. The single
+        # ``None`` is the candidate VALUE that ``contest_jobs`` and
+        # ``run_candidate`` then carry through as "no knob to set"; an empty tuple
+        # would produce an empty contest and silently search nothing.
+        return (None,)
     return CLOUD_OVERLAP_CANDIDATES
 
 
@@ -141,6 +148,15 @@ def cloud_budget(config) -> int:
     class on a 4-core box). Unset/invalid/≤0 → the mode defaults below.
     """
     import os
+    # A CP solve is TIME-boxed (Config.cp_time_limit_sec), not eval-boxed:
+    # cp_adapter.solve accepts ``budget_evals`` for signature symmetry and
+    # IGNORES it, and its ``evals`` counts IMPROVED SOLUTIONS, not plans tried.
+    # So a plan budget is not a number about this engine at all, and the env
+    # override must not reach it either — 400 would size the Optimize progress
+    # bar as "3 of 400" against a denominator that can never be reached. 1 = one
+    # job, which is exactly what the contest runs.
+    if getattr(config, "scheduler", "classic") == "cp":
+        return 1
     raw = os.environ.get("OPTIMIZE_CLOUD_BUDGET_PER_CANDIDATE", "").strip()
     try:
         v = int(raw)
@@ -389,23 +405,36 @@ def run_candidate(payload: dict, overlap: int, flexible: bool = False, *, on_pro
         from engine import new_engine
         _raw = payload.get("masters_xlsx_b64")
         new_engine.set_masters_bytes(base64.b64decode(_raw) if _raw else None)
-    # "roster": nothing to do here, deliberately. engine/roster_adapter.py reads the
-    # Masters OBJECT that prepare_contest builds below (build_jobs/build_shop take
-    # masters), never the workbook bytes, so a cloud run needs no masters priming.
-    # Recorded explicitly because an omission and a forgotten branch look identical.
+    # "roster" and "cp": nothing to do here, deliberately. engine/roster_adapter.py
+    # and engine/cp_adapter.py both read the Masters OBJECT that prepare_contest
+    # builds below (build_jobs/build_shop take masters), never the workbook bytes,
+    # so a cloud run needs no masters priming. Recorded explicitly because an
+    # omission and a forgotten branch look identical at runtime.
     setup = prepare_contest(orders, actuals, masters, config, absences=absences,
                             operator_table=operator_table, frozen=frozen)
     knob, _cands = optimizer.knob_for(setup.search_config)
-    cfg = replace(setup.search_config, flexible_machines=bool(flexible), **{knob: int(overlap)})
+    cfg = replace(setup.search_config, flexible_machines=bool(flexible))
+    # ``knob`` is None under "cp" — there is nothing to set, and ``overlap`` is the
+    # ``None`` cloud_candidates emitted. Both ``**{None: ...}`` and ``int(None)``
+    # raise, so the guard is not cosmetic: without it the first candidate of the
+    # first cloud contest after the cutover dies.
+    if knob:
+        cfg = replace(cfg, **{knob: int(overlap)})
     res = optimizer.optimize(setup.target, cfg, setup.masters,
                              reserved=setup.absence_reserved,
                              frozen=setup.frozen,
                              budget_evals=int(payload["budget_per_candidate"]),
                              seed=int(payload["seed"] if seed is None else seed),
                              on_progress=on_progress, should_cancel=should_cancel)
-    return {"overlap": int(overlap), "flexible": bool(flexible),
+    return {"overlap": int(overlap) if knob else None, "flexible": bool(flexible),
             "seed": int(payload["seed"] if seed is None else seed), "eligible": True,
             "best": res.best, "evals": res.evals, "ranks": res.ranks,
+            # The CP engine's decision genome. Same argument as ``crew_rank``
+            # below and it is the stronger case: a row is ALL the app ever sees of
+            # a cloud candidate, and applying ranks WITHOUT the genome makes the
+            # decoder fall back for every single operation — a well-formed plan
+            # that nobody searched. {} for every other engine.
+            "genome": dict(getattr(res, "genome", None) or {}),
             # The roster engine's second genome. A row is ALL the app ever sees of a
             # cloud candidate, so without it here the winning ranks would be applied
             # and then replayed against a different roster — a plan nobody searched.
@@ -463,9 +492,17 @@ def contest_jobs(payload: dict) -> list:
     whole sweep therefore runs first, so an early "Stop & keep best" still has the
     current settings fully searched."""
     config = Config.from_dict(payload["config"])
-    knob, _ = optimizer.knob_for(config)
-    cur_value = getattr(config, knob)
-    contenders = optimizer.sweep_contenders(cur_value, payload["candidates"])
+    # None under "cp" (no knob) — knob_value is the one expression that survives
+    # that; `getattr(config, None)` raises.
+    cur_value = optimizer.knob_value(config)
+    if getattr(config, "scheduler", "classic") == "cp":
+        # ONE candidate, spelled out. sweep_contenders(None, [None]) drops the
+        # sole `None` on both of its filters and returns [], which would make the
+        # whole contest an EMPTY list of jobs — a deep search that reports done in
+        # milliseconds, having searched nothing, with no error anywhere.
+        contenders = [None]
+    else:
+        contenders = optimizer.sweep_contenders(cur_value, payload["candidates"])
     # The machine-set dimension only affects the new engine (flexible_machines is
     # inert for classic/flow — see engine/new_engine._new_masters). Gate the outer
     # loop on scheduler so classic/flow cloud contests stay single-pass and byte-
@@ -481,6 +518,12 @@ def contest_jobs(payload: dict) -> list:
     # operators free. Those cells share no people, so widening the option set moves
     # work to a different machine AND a different crew. Cost: the job count doubles
     # (11 overlaps -> 22 jobs), which is two rounds of the workflow's 20 shards.
+    #
+    # "cp" is deliberately NOT in that list: under the CP engine the machine per
+    # operation is a MODEL VARIABLE (cp_engine.domain always offers Allotted ∪
+    # Suggested and the solver chooses), so doubling the contest buys nothing at
+    # all and costs two rounds of the workflow's 20 shards — on an engine whose
+    # single named risk is tractability.
     machine_sets = ((False, True)
                     if getattr(config, "scheduler", "classic") in ("new", "roster")
                     else (False,))
@@ -537,29 +580,57 @@ def merge_shard_rows(payload: dict, rows: list, evals: int, cancelled: bool) -> 
     ONCE over the global row set. Same shape run_contest returns."""
     config = Config.from_dict(payload["config"])
     knob, _ = optimizer.knob_for(config)
-    cur_value = getattr(config, knob)
+    # None under "cp"; `getattr(config, None)` raises.
+    cur_value = optimizer.knob_value(config)
     cur_flex = bool(getattr(config, "flexible_machines", False))
     winner = pick_winner(cur_value, cur_flex, rows, base_seed=int(payload["seed"]))
-    # ``crew_rank`` is kept in the STRIPPED table on purpose. The non-sharded cloud
-    # worker posts this table back as its ``rows`` (scripts/cloud_optimize_worker.py,
-    # untouched here) and no top-level crew field survives that hop, so the table is
-    # the only place the app can recover the winner's roster from — see
-    # ``crew_rank_of_winner``. ``ranks`` stays stripped: it is posted separately and
+    # ``crew_rank`` and ``genome`` are kept in the STRIPPED table on purpose. The
+    # non-sharded cloud worker posts this table back as its ``rows``
+    # (scripts/cloud_optimize_worker.py, untouched here) and no top-level crew or
+    # genome field survives that hop, so the table is the only place the app can
+    # recover the winner's roster/decisions from — see ``crew_rank_of_winner`` and
+    # ``genome_of_winner``. ``ranks`` stays stripped: it is posted separately and
     # is far larger.
     table = [{k: r[k] for k in ("overlap", "flexible", "seed", "eligible", "best",
-                                "evals", "crew_rank")
+                                "evals", "crew_rank", "genome")
               if k in r} for r in rows]
     if winner is None:
         return {"winner_overlap": cur_value, "winner_flexible": cur_flex, "rows": table,
                 "knob": knob, "best": None, "ranks": {}, "winner_crew_rank": {},
+                "winner_genome": {},
                 "evals": evals, "cancelled": cancelled}
     return {"winner_overlap": winner["overlap"], "winner_flexible": bool(winner["flexible"]),
             "winner_crew_rank": dict(winner.get("crew_rank") or {}),
+            # The CP decision genome the winning ranks were solved WITH. Applying
+            # the ranks without it replays a job order with no machine, crew or
+            # overlap decisions behind it: the decoder falls back per operation and
+            # publishes a plan nobody searched. {} for every other engine.
+            "winner_genome": dict(winner.get("genome") or {}),
             # Informational only: the seed is a SEARCH artifact, not a plan input.
             # The ranks are what gets applied, and they already encode the answer.
             "winner_seed": winner.get("seed"),
             "rows": table, "knob": knob, "best": winner["best"],
             "ranks": winner.get("ranks", {}), "evals": evals, "cancelled": cancelled}
+
+
+def genome_of_winner(rows, overlap, flexible=False, best=None) -> dict:
+    """The winning candidate's CP genome, recovered from a contest's rows.
+
+    Exactly ``crew_rank_of_winner``'s problem and exactly its solution, for the
+    other genome: the non-sharded cloud worker posts ``winner_overlap`` /
+    ``ranks`` / ``best`` / ``rows`` and nothing else, so the decisions have to be
+    read back out of the rows. Returns {} when nothing matches — and {} is safe,
+    because ``_optimize_apply`` never overwrites a stored genome with an empty one.
+    """
+    hits = [r for r in (rows or [])
+            if r.get("overlap") == overlap
+            and bool(r.get("flexible")) == bool(flexible)
+            and r.get("genome")]
+    if best is not None and len(hits) > 1:
+        exact = [r for r in hits if r.get("best") == best]
+        if exact:
+            hits = exact
+    return dict(hits[0]["genome"]) if hits else {}
 
 
 def crew_rank_of_winner(rows, overlap, flexible=False, best=None) -> dict:

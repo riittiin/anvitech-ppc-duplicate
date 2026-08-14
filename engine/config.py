@@ -163,6 +163,40 @@ class Config:
     # None (and {}) mean "not set"; every other engine ignores it entirely.
     crew_rank: Optional[dict] = None
 
+    # --- the CP engine (cp_engine/, 2026-08-14 spec) ------------------------- #
+    # Rule 2's "the part stays in the chuck" clause, as an encoding choice.
+    # False = E1: an operation may NOT span an unmanned shift. **E1 is the
+    # shipping default and that is a deliberate, owner-authorized reversal** of
+    # the provisional E2 default: measured, E2 is not a trade-off but unusable —
+    # 11x the variables, 8.5x the constraints, and it returns UNKNOWN (no plan at
+    # all) from 30 batches upward even at a 1800 s budget, while the owner's book
+    # is 61. The cost of E1 was measured too and he authorized it: the solver
+    # held a part across an unmanned shift ONCE IN 116 OPERATIONS; E1 forbids
+    # ~3 in 116. See docs/superpowers/plans/2026-08-14-cp-tractability-findings.md.
+    cp_hold_across_unmanned_shift: bool = False
+    # Phase 2's eps, in days: how much TOTAL lateness the fairness phase may
+    # spend to even the distribution out. 0 makes it a strict tie-break that can
+    # never cost a single late-day, which is the owner's rule; it is a knob only
+    # so that buying evenness would be a config change, not a redesign.
+    cp_fairness_slack_days: int = 0
+    # Seconds for ONE solve, both phases together. 900 (15 min) because Render's
+    # own OPTIMIZE_CLOUD_TIMEOUT_MIN is 20 and a budget that outlives the caller
+    # waiting for it is a budget nobody collects. This engine ships time-boxed and
+    # FEASIBLE-WITH-A-BOUND, not proved-optimal (a 2.4x gap that 6x the budget
+    # does not close) — cores buy the bound, not wall clock.
+    cp_time_limit_sec: int = 900
+    # The solved DECISION GENOME (job order, machine per operation, crew roster,
+    # released pieces, solved completions, the book it was solved against). It
+    # rides on the config into the seam because ``/run`` has no genome argument,
+    # exactly as ``crew_rank`` does — but unlike crew_rank it is NOT persisted in
+    # the saved plan config: it lives under its own store key
+    # (``book_store.CP_GENOME_KEY``), which no other engine reads, so W.5's
+    # one-env-var rollback needs no migration. ``api._resolve_config`` attaches
+    # it at every planning entry. It is an optimization OUTPUT and is POPPED from
+    # ``_inputs_signature`` — leave it in and every apply flags its own result
+    # stale the instant it lands.
+    cp_genome: Optional[dict] = None
+
     def validate(self) -> None:
         """Fail loud on a bad config (Design spec §8 — config validation)."""
         errs = []
@@ -200,8 +234,16 @@ class Config:
         # and optimize_service all call validate(), and api._load_plan_config drops
         # a config that fails validation back to a bare Config() — i.e. an admin's
         # saved choice would be silently downgraded to classic.
-        if self.scheduler not in ("classic", "flow", "new", "roster"):
-            errs.append("scheduler must be 'classic', 'flow', 'new', or 'roster'")
+        # "cp" = the CP-SAT engine (cp_engine/, 2026-08-14 spec), dispatched by
+        # pipeline.scheduler_for -> engine/cp_adapter.py. Same argument as roster
+        # above, and it is the exact silent-fallback class the whole CP wiring
+        # commit exists to prevent: a name missing here makes
+        # api._load_plan_config drop the stored config back to a bare Config(),
+        # i.e. an admin's saved engine choice is DOWNGRADED TO CLASSIC and the
+        # site plans on the wrong engine behind a completely green screen.
+        if self.scheduler not in ("classic", "flow", "new", "roster", "cp"):
+            errs.append("scheduler must be 'classic', 'flow', 'new', 'roster', "
+                        "or 'cp'")
         if not (1 <= int(self.flow_chunks) <= 50):
             errs.append("flow_chunks must be within 1..50")
         if not isinstance(self.split_parallel, bool):
@@ -220,6 +262,14 @@ class Config:
             errs.append("committed_promise_slack_days must be >= 0")
         if self.crew_rank is not None and not isinstance(self.crew_rank, dict):
             errs.append("crew_rank must be a {machine id: rank} mapping or null")
+        if not isinstance(self.cp_hold_across_unmanned_shift, bool):
+            errs.append("cp_hold_across_unmanned_shift must be true or false")
+        if int(self.cp_fairness_slack_days) < 0:
+            errs.append("cp_fairness_slack_days must be >= 0")
+        if int(self.cp_time_limit_sec) <= 0:
+            errs.append("cp_time_limit_sec must be > 0")
+        if self.cp_genome is not None and not isinstance(self.cp_genome, dict):
+            errs.append("cp_genome must be a decision-genome mapping or null")
         if errs:
             raise ValueError("Invalid config: " + "; ".join(errs))
 
@@ -247,10 +297,10 @@ class Config:
                     value = None
                 elif isinstance(value, str):
                     value = date.fromisoformat(value)
-            if key == "crew_rank":
-                # "" / null / {} from the wire all mean "no crew genome on file",
-                # and they must land as the SAME value or _inputs_signature would
-                # see a settings change where there is none.
+            if key in ("crew_rank", "cp_genome"):
+                # "" / null / {} from the wire all mean "no genome on file", and
+                # they must land as the SAME value or _inputs_signature would see
+                # a settings change where there is none.
                 value = dict(value) if value else None
             if key == "priority_window_days":
                 # "" / "none" / null from the UI means "no limit".

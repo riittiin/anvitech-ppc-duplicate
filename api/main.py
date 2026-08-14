@@ -420,6 +420,28 @@ def _inputs_signature(config: Config) -> str:
     if getattr(config, "scheduler", "classic") == "roster":
         from roster_engine import SCHEDULER_FINGERPRINT as _roster_fp
         d["roster_engine_fingerprint"] = _roster_fp
+    # The CP genome is an optimization OUTPUT, not an input — exactly like the
+    # transient ceiling and start floor popped above. Leave it in and the very
+    # apply that produced it changes the signature it is stored against, so every
+    # applied plan flags ITSELF stale with a "re-run the deep search" banner. It
+    # is popped for EVERY engine (the others never set it, so this cannot move
+    # their signature either way).
+    d.pop("cp_genome", None)
+    if getattr(config, "scheduler", "classic") == "cp":
+        # Same conditional-only rule as roster above: unconditional would move
+        # every classic/flow/new/roster signature the moment this line shipped.
+        import cp_engine
+        d["cp_engine_fingerprint"] = cp_engine.SCHEDULER_FINGERPRINT
+        # THE PLAN CLOCK IS PART OF THE GENOME'S VALIDITY. Storing absolute
+        # datetimes in it does NOT protect it: `cp_roster`'s shift indices, the
+        # decoder's calendar rebuild and its floor clamp are ALL counted from
+        # plan_start, so the same genome under a clock moved by one day slides
+        # every completion a day and reorders jobs (measured, Task 8 N3). Nothing
+        # else in this signature can see that — `plan_start_floor` is popped and a
+        # saved auto start is None on purpose — so the clock is folded in here,
+        # for cp only, where a stale genome is a wrong plan rather than a stale
+        # rank map.
+        d["cp_plan_start"] = _current_plan_start_sig()
     # The crew genome is a real plan input when it is set (replay the same ranks
     # against a different roster and the plan moves), but it must be INVISIBLE when
     # it is not: leaving `None` in the blob would change the signature for every
@@ -585,6 +607,39 @@ def _report_for_book(masters, so_lines, absences=None, config=None, schedule=Non
                         absences if absences is not None
                         else book_store.load_absences()),
                     batches=batches))
+            except Exception:  # noqa: BLE001 — a self-check must never break the report
+                pass
+        # The CP engine's own self-check: the same four rule checks, plus DRIFT
+        # (does the published plan match the schedule the solver actually scored?)
+        # and genome STALENESS. Gated to "cp" for exactly the reason the roster
+        # block above is — the live engine breaks the first two on every plan and
+        # this banner is the one the directors read.
+        #
+        # PARTITIONED, NOT PASSED THROUGH. `all_violations` returns rule breaches
+        # AND capacity MEASUREMENTS in one list, told apart only by `row["breach"]`,
+        # and on a contended solved plan the ENTIRE return value can be two
+        # IDLE_CAPACITY rows. IDLE_CAPACITY is legitimately non-zero under this
+        # engine (E1 forbids an operation spanning an unmanned shift; the decoder
+        # defers a pool-staffed machine's fallback work by one shift on purpose),
+        # so handing the list over undifferentiated puts a capacity note beside a
+        # real rule breach and buries the row that matters. Only breaches are
+        # shown. `cp_adapter.plan_violations` owns the partition and treats an
+        # unrecognised row as a breach.
+        if str(getattr(config if config is not None else _load_plan_config(),
+                       "scheduler", "") or "") == "cp":
+            try:
+                from engine import cp_adapter as _cp
+                _breaches, _measured = _cp.plan_violations(
+                    schedule, masters,
+                    config if config is not None else _load_plan_config(),
+                    batches=batches,
+                    # The absence blocks. Without them a person on leave reads as
+                    # spare capacity and IDLE_CAPACITY accuses the plan of wasting
+                    # a machine nobody could have run.
+                    reserved=optimize_service.absence_reservations(
+                        absences if absences is not None
+                        else book_store.load_absences()))
+                rows.extend(_breaches)
             except Exception:  # noqa: BLE001 — a self-check must never break the report
                 pass
     return to_table([
@@ -1109,7 +1164,7 @@ def _load_plan_config() -> Config:
     # "roster" belongs here as much as the others: a value missing from this
     # whitelist is not an error, it is silently IGNORED — the deploy keeps running
     # the saved/default engine while the env var says otherwise.
-    if env_sched in ("new", "classic", "flow", "roster"):
+    if env_sched in ("new", "classic", "flow", "roster", "cp"):
         cfg.scheduler = env_sched
     return cfg
 
@@ -1253,6 +1308,31 @@ def _ist_today():
     return _ist_now().date()
 
 
+def _local_search_budget(search_config, budget_evals) -> int:
+    """How many plans the LOCAL (non-cloud) search will evaluate — the Optimize
+    progress bar's denominator. ONE definition, called from the four places that
+    each used to spell the same three lines out (the initial local-mode estimate
+    plus three cloud-failure/timeout fallbacks).
+
+    Two things it exists to get right:
+
+    * ``optimizer.knob_for`` returns ``(None, ())`` under the CP engine, and
+      ``getattr(config, None)`` raises. This returns **0** there instead: a CP
+      "contest" is ONE time-boxed solve whose ``evals`` counts IMPROVED SOLUTIONS,
+      not plans tried, so there is no denominator to divide by and a fabricated
+      one would render a bar that can never fill. 0 is the honest "indeterminate".
+    * the new engine's contest also sweeps the machine-set dimension, so its true
+      candidate count is twice the overlap-only one (the bar used to overshoot to
+      ~200%).
+    """
+    if getattr(search_config, "scheduler", "classic") == "cp":
+        return 0
+    knob, cands = optimizer.knob_for(search_config)
+    mult = 2 if getattr(search_config, "scheduler", "classic") == "new" else 1
+    return mult * optimizer.sweep_total_evals(
+        budget_evals, optimizer.knob_value(search_config), cands)
+
+
 def _ceil_next_hour(dt):
     """Round ``dt`` UP to the next full hour (minutes/seconds zeroed). 23:30 -> next day
     00:00. Used to floor an auto plan start so a run never schedules in the past."""
@@ -1288,6 +1368,22 @@ def _resolve_config(config: Config) -> Config:
     # value can't reintroduce the regression.
     if config.consolidation_window_days != 1:
         config = replace(config, consolidation_window_days=1)
+    # THE CP GENOME RIDES ON THE RESOLVED CONFIG. `/run` has no genome argument —
+    # `pipeline.scheduler_for` hands the seam `(batches, config, masters)` and
+    # nothing else — so the applied decisions reach `cp_adapter.run` exactly the
+    # way the roster engine's crew genome reaches its adapter: on the config.
+    #
+    # Attached HERE, at the one function every planning entry already calls
+    # (`_plan`, `_plan_fingerprint`, `_start_optimize`, `_incumbent_metrics`,
+    # `_metrics_for_ranks`, `_movement_note`, `_optimize_apply`), rather than at
+    # each of them — the roster engine gets this free because its genome is
+    # persisted in the saved plan config, and the CP genome deliberately is NOT
+    # (its own store key is what makes the W.5 rollback need no migration).
+    # Because `_plan_fingerprint` hashes the RESOLVED config, this is also what
+    # makes an Apply visible on the next page load instead of serving a cached
+    # plan built with the previous genome.
+    if getattr(config, "scheduler", "classic") == "cp" and config.cp_genome is None:
+        config = replace(config, cp_genome=book_store.load_cp_genome() or None)
     if config.plan_start_date is None:
         # Auto: resolve to today. The plan then starts at 08:00 of that date — the shift
         # start — whatever time of day this runs (owner decision 2026-08-11; see
@@ -1612,6 +1708,23 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
         new_engine_run = getattr(base_config, "scheduler", "classic") == "new"
         if new_engine_run:
             budget_evals = min(budget_evals, 200)
+        # "cp" is not budgeted in PLANS at all — it is ONE solve, time-boxed by
+        # `Config.cp_time_limit_sec` — so the eval budget is zeroed rather than
+        # capped: `cp_adapter.solve` accepts `budget_evals` for signature symmetry
+        # and ignores it, and its `evals` counts IMPROVED SOLUTIONS, so any
+        # non-zero number here would be a fiction that the progress bar then
+        # divides by. Recorded explicitly because an omission and a forgotten
+        # branch are indistinguishable at runtime.
+        #
+        # The LOCAL fallback under cp is a known, accepted limitation rather than
+        # an oversight: Render has no pyjobshop, so `cp_adapter.solve`'s lazy
+        # import raises and `local_job` reports state="failed" carrying that
+        # message. That is the honest outcome — a 15-minute CP solve on a 0.1-CPU
+        # free instance is not a fallback anybody wants — and the solve must run
+        # on the 4+-core worker (tractability findings: CORES, not wall clock, buy
+        # the bound).
+        if getattr(base_config, "scheduler", "classic") == "cp":
+            budget_evals = 0
         config = _resolve_config(config)   # None -> today (IST) for the engine/contest
         # Worst-order ceiling: the current plan's worst lateness. The search barrier +
         # apply backstop use it so a re-optimization never pushes any order past today's
@@ -1671,10 +1784,7 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
             denom = _bpc * len(optimize_service.contest_jobs(payload))
         else:
             payload = None
-            _knob, _kcands = optimizer.knob_for(setup.search_config)
-            _mult = 2 if getattr(setup.search_config, "scheduler", "classic") == "new" else 1
-            denom = _mult * optimizer.sweep_total_evals(
-                budget_evals, getattr(setup.search_config, _knob), _kcands)
+            denom = _local_search_budget(setup.search_config, budget_evals)
 
         # Snapshot the book/inputs fingerprints AT START — a punch that lands
         # mid-run must still force a re-run on the next Done click, even though
@@ -1729,7 +1839,12 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
                                winner_flexible=sw.flexible_machines, ranks=res.ranks,
                                best=res.best, evals=sw.evals, table=sw.table,
                                cancelled=sw.cancelled,
-                               crew_rank=getattr(sw, "crew_rank", None))
+                               crew_rank=getattr(sw, "crew_rank", None),
+                               # The CP genome hangs off the winning
+                               # OptimizeResult (SweepResult has no field for it —
+                               # it is not a swept knob). None for every other
+                               # engine.
+                               genome=getattr(res, "genome", None))
         except Exception as e:  # noqa: BLE001 — a failed search must report, not hang
             with _OPTIMIZE_LOCK:
                 _OPTIMIZE.update(state="failed", error=str(e), cancel=False)
@@ -1807,11 +1922,8 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
                                       and _OPTIMIZE["job_id"] == job_id)
                         if still_mine:
                             _OPTIMIZE["mode"] = "local"
-                            _k, _kc = optimizer.knob_for(setup.search_config)
-                            _mult = 2 if getattr(setup.search_config, "scheduler",
-                                                  "classic") == "new" else 1
-                            _OPTIMIZE["budget_evals"] = _mult * optimizer.sweep_total_evals(
-                                budget_evals, getattr(setup.search_config, _k), _kc)
+                            _OPTIMIZE["budget_evals"] = _local_search_budget(
+                                setup.search_config, budget_evals)
                     if still_mine:
                         local_job()
                     return
@@ -1856,11 +1968,8 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
                         go_local = not have_shards
                         if go_local:
                             _OPTIMIZE["mode"] = "local"
-                            _k, _kc = optimizer.knob_for(setup.search_config)
-                            _mult = 2 if getattr(setup.search_config, "scheduler",
-                                                  "classic") == "new" else 1
-                            _OPTIMIZE["budget_evals"] = _mult * optimizer.sweep_total_evals(
-                                budget_evals, getattr(setup.search_config, _k), _kc)
+                            _OPTIMIZE["budget_evals"] = _local_search_budget(
+                                setup.search_config, budget_evals)
                             _OPTIMIZE["evals"] = 0
                         # else: shards present but another finalize already
                         # claimed (the collector, e.g. the very last shard
@@ -1908,11 +2017,8 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
                             needs_local = still_running and bool(_OPTIMIZE.get("cloud_failed"))
                             if needs_local:
                                 _OPTIMIZE["mode"] = "local"
-                                _k, _kc = optimizer.knob_for(setup.search_config)
-                                _mult = 2 if getattr(setup.search_config, "scheduler",
-                                                      "classic") == "new" else 1
-                                _OPTIMIZE["budget_evals"] = _mult * optimizer.sweep_total_evals(
-                                    budget_evals, getattr(setup.search_config, _k), _kc)
+                                _OPTIMIZE["budget_evals"] = _local_search_budget(
+                                    setup.search_config, budget_evals)
                                 _OPTIMIZE["evals"] = 0
                         if needs_local:
                             local_job()   # salvaged shards had no eligible winner
@@ -1940,7 +2046,7 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
 
 def _finalize_optimize(job_id, base_config, real_baseline, label, *,
                        winner_overlap, winner_flexible=False, ranks, best, evals,
-                       table, cancelled, crew_rank=None):
+                       table, cancelled, crew_rank=None, genome=None):
     """Store a finished contest (local sweep OR cloud worker result) as the
     Optimize outcome — one place computes improved/inputs_sig for both paths."""
     # THE PLAN CLOCK STARTS HERE — only while PLAN_START_NEXT_HOUR is on (2026-08-07
@@ -1963,9 +2069,10 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
     # Both `best` and `real_baseline` (already local) are then on the same footing, so
     # `improved` is judged honestly. Keep the contest's number only if the replay fails.
     crew_rank = dict(crew_rank or {})
+    genome = dict(genome or {})
     if ranks:
         _local_best = _metrics_for_ranks(ranks, winner_overlap, winner_flexible,
-                                         crew_rank=crew_rank)
+                                         crew_rank=crew_rank, cp_genome=genome)
         if _local_best is not None:
             best = _local_best
     # `real_baseline` was measured when the contest STARTED, on the previous plan clock.
@@ -1983,9 +2090,13 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
     # Fingerprint against the WINNING settings: Apply persists the winning
     # overlap into the saved plan config, so the staleness check must
     # compare future plans against exactly that config.
+    # ``_knob`` is None under the CP engine (overlap is a model variable), and both
+    # ``replace(cfg, **{None: v})`` and ``getattr(cfg, None)`` raise — so the knob
+    # is only applied when there IS one. Nothing else about the fingerprint changes.
     _knob, _ = optimizer.knob_for(base_config)
-    _won_config = replace(base_config, flexible_machines=bool(winner_flexible),
-                          **{_knob: winner_overlap})
+    _won_config = replace(base_config, flexible_machines=bool(winner_flexible))
+    if _knob:
+        _won_config = replace(_won_config, **{_knob: winner_overlap})
     if crew_rank:
         # Apply persists the crew genome into the saved config too, so it belongs in
         # the fingerprint for the same reason the overlap does.
@@ -2004,13 +2115,18 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
                     "budget": label, "seed": _OPT_SEED,
                     "inputs_sig": inputs_sig,
                     "best_overlap": winner_overlap,
-                    "current_overlap": getattr(base_config, _knob),
+                    "current_overlap": optimizer.knob_value(base_config),
                     "knob": _knob,
                     "flexible_machines": bool(winner_flexible),
                     "current_flexible": bool(getattr(base_config, "flexible_machines", False)),
                     # The roster engine's winning crew genome ({} for every other
                     # engine). Persisted by _optimize_apply beside the ranks.
                     "crew_rank": crew_rank,
+                    # The CP engine's winning decision genome ({} for every other
+                    # engine). Persisted by _optimize_apply under its own store
+                    # key. Without it the applied ranks replay with no machine,
+                    # crew or overlap decisions behind them.
+                    "genome": genome,
                     "sweep_table": table})
         # Record a "last searched" marker for EVERY completed contest — not
         # just an applied one — so a redundant Done click (no improvement
@@ -2185,10 +2301,17 @@ def _format_movers(movers):
             + "; ".join(parts) + more + ".")
 
 
-def _movement_note(new_ranks):
+def _movement_note(new_ranks, cp_genome=None):
     """Compare the winning plan to the currently-applied one (both replayed on
     today's book) and summarize which orders now finish later. '' if none.
-    Must be called BEFORE _optimize_apply() persists the new ranks."""
+    Must be called BEFORE _optimize_apply() persists the new ranks.
+
+    ``cp_genome`` is the WINNING genome, for the same reason ``_metrics_for_ranks``
+    takes it: Apply has not persisted it yet, so the "after" side would otherwise
+    be the new ranks replayed against the OLD decisions — a plan that will never
+    run, and a note naming orders that are not actually moving. The "before" side
+    deliberately keeps the stored genome: that IS the plan the floor has now.
+    """
     config = _resolve_config(_load_plan_config())
     masters = _current_masters()
     setup = optimize_service.prepare_contest(
@@ -2199,6 +2322,11 @@ def _movement_note(new_ranks):
     prio = book_store.load_plan_priority()
     old_ranks = (prio or {}).get("ranks") or None
     old_sched, _ = _all_lines_schedule(setup, setup.masters, old_ranks)
+    if cp_genome:
+        setup = replace(setup, config=replace(setup.config,
+                                              cp_genome=dict(cp_genome)),
+                        search_config=replace(setup.search_config,
+                                              cp_genome=dict(cp_genome)))
     new_sched, _ = _all_lines_schedule(setup, setup.masters, new_ranks or None)
     movers = _movers(_expected_by_order(old_sched),
                      _expected_by_order(new_sched), _MOVE_LATER_THRESHOLD_DAYS)
@@ -2206,7 +2334,7 @@ def _movement_note(new_ranks):
 
 
 def _metrics_for_ranks(ranks, overlap=None, flexible=None, *, with_distribution=True,
-                       crew_rank=None):
+                       crew_rank=None, cp_genome=None):
     """Metrics of the plan that replays ``ranks`` through the SAME local path ``_plan``
     uses (optionally at a given overlap). This is the ONE source of truth for "what
     this optimized plan achieves": the contest (cloud worker OR local sweep) can report
@@ -2216,8 +2344,15 @@ def _metrics_for_ranks(ranks, overlap=None, flexible=None, *, with_distribution=
     number by construction. Returns None on any failure (caller keeps the contest's)."""
     try:
         config = _resolve_config(_load_plan_config())
-        if overlap is not None:
-            knob = optimizer.knob_for(config)[0]
+        if cp_genome:
+            # The CP engine's decisions. Apply has not persisted them yet at this
+            # point, so `_resolve_config` above just attached the PREVIOUS genome —
+            # replaying at that one would measure the winning ranks against the old
+            # plan and report a number the apply does not reproduce. Same argument,
+            # same shape, as `crew_rank` below.
+            config = replace(config, cp_genome=dict(cp_genome))
+        knob = optimizer.knob_for(config)[0]
+        if overlap is not None and knob:
             config = replace(config, **{knob: overlap})
         if flexible is not None:
             config = replace(config, flexible_machines=bool(flexible))
@@ -2294,11 +2429,22 @@ def _auto_apply_result():
         return
     stamp = _ist_now().strftime("%H:%M")
     worst_ok = best.get("max_late_days", 0) <= inc.get("max_late_days", 0)
-    _slack = _resolve_config(_load_plan_config()).committed_promise_slack_days
+    _cfg_now = _resolve_config(_load_plan_config())
+    _slack = _cfg_now.committed_promise_slack_days
     promise_ok = best.get("max_committed_slip", 0) <= max(_slack, inc.get("max_committed_slip", 0))
-    if optimizer.score(best) < optimizer.score(inc) and worst_ok and promise_ok:
+    # WHAT "BETTER" MEANS IS PER ENGINE. `optimizer.score` is symmetric — it
+    # penalises finishing early exactly like finishing late — which is right for
+    # the engines that SEARCH on it and wrong as the acceptance test for the CP
+    # engine, whose own objective is total late-days: measured, it once made the
+    # app reject a plan 86 late-days better. `optimizer.apply_key` is the one
+    # definition; under cp it reads late-days then spread, and it is byte-for-byte
+    # `score` for every other engine. The worst-order no-regression check and the
+    # committed-promise backstop above are UNCHANGED and still both apply.
+    if (optimizer.apply_key(best, _cfg_now) < optimizer.apply_key(inc, _cfg_now)
+            and worst_ok and promise_ok):
         try:
-            move = _movement_note(res.get("ranks") or None)
+            move = _movement_note(res.get("ranks") or None,
+                                  cp_genome=res.get("genome"))
         except Exception:  # noqa: BLE001 - the note is advisory; never block an apply
             move = ""
         meta = _optimize_apply()          # persists ranks + overlap + inputs_sig + book_sig
@@ -2352,6 +2498,10 @@ def _optimize_apply():
                 # The roster engine's winning crew genome ({} for every other engine).
                 "crew_rank": dict(res.get("crew_rank") or {}),
                 "book_sig": _current_book_sig(),
+                # The CP genome is NOT stored in this meta blob: it is far larger
+                # than a rank map and it belongs under its own store key (see
+                # below), which is what makes the DEFAULT_SCHEDULER rollback need
+                # no migration.
                 # The date this optimization's clock started from. A later day must
                 # re-search rather than replay a sequence built for another start.
                 "plan_start": _current_plan_start_sig(),
@@ -2359,6 +2509,22 @@ def _optimize_apply():
                 # later plan can flag "the dates moved, re-run the deep search".
                 "dates": _delivery_dates()}
         book_store.save_plan_priority(res["ranks"], meta)
+        # THE CP DECISION GENOME, under its own key. The ranks alone are only the
+        # job ORDER; the machine per operation, the crew roster and the released
+        # pieces all live here, and replaying ranks WITHOUT them makes
+        # cp_engine.decode fall back for every single operation and publish a
+        # well-formed plan that nobody searched. Written BEFORE the schedule
+        # snapshot below, because that snapshot re-plans and must see the genome
+        # it is about to freeze work against.
+        #
+        # An EMPTY genome is never written: every other engine returns one, and
+        # applying a roster/classic plan must not wipe what is on file (the same
+        # rule `crew_rank` follows below).
+        if res.get("genome"):
+            try:
+                book_store.save_cp_genome(res["genome"])
+            except Exception:  # noqa: BLE001 — never let a store hiccup break an apply
+                pass
         # Persist the applied plan's per-op assignment (machine/operator/time) so the
         # next "Done" can freeze whatever is in progress on its real machine. Recompute
         # from the winning ranks the same way the incumbent is scored.
@@ -2381,7 +2547,10 @@ def _optimize_apply():
         cfg = _load_plan_config()
         knob = res.get("knob") or optimizer.knob_for(cfg)[0]
         target = cfg
-        if best_ov is not None:
+        # `knob` is None under the CP engine — there is no setting to persist,
+        # because the overlap it searched is a per-job model variable that lives
+        # in the genome written above, not a single number.
+        if best_ov is not None and knob:
             target = replace(target, **{knob: best_ov})
         if best_flex is not None:
             target = replace(target, flexible_machines=bool(best_flex))
@@ -2489,6 +2658,15 @@ def run(request: Request, req: Optional[RunRequest] = None):
         # pin the authoritative one so a Save can never persist a stale/other engine
         # (and a store already corrupted with "classic" self-heals on the next Save).
         config.scheduler = _load_plan_config().scheduler
+        # A BROWSER MAY NOT SUPPLY THE "cp" ENGINE'S GENOME. It is optimizer-owned
+        # and lives
+        # under its own store key; `_resolve_config` attaches it and only when the
+        # config carries none. So a `cp_genome` posted with a Settings save would
+        # be written into the saved plan config and then WIN over the applied one
+        # on every later plan — a client-shaped schedule, which is exactly the
+        # 2026-08-09 "a user's browser could shape the plan" defect. Stripped here,
+        # beside the engine pin, for the same reason and in the same place.
+        config.cp_genome = None
         book_store.save_plan_config(json.dumps(config.to_dict()))
     elif book_store.load_plan_config():
         config = _load_plan_config()   # a saved plan exists → everyone sees it
@@ -3077,6 +3255,8 @@ class WorkerResult(BaseModel):
     # Forward-compatible: today's worker never sends this (scripts/ is deliberately
     # untouched), so the roster's crew genome is recovered from `rows` instead.
     crew_rank: dict = Field(default_factory=dict)
+    # Ditto for the CP decision genome — recovered from `rows` when absent.
+    genome: dict = Field(default_factory=dict)
     error: Optional[str] = None
 
 
@@ -3153,7 +3333,12 @@ def optimize_result_ep(req: WorkerResult, request: Request):
                                 crew_rank=(req.crew_rank or
                                            optimize_service.crew_rank_of_winner(
                                                req.rows, req.winner_overlap,
-                                               bool(req.winner_flexible), req.best)))
+                                               bool(req.winner_flexible), req.best)),
+                                # Same hop, same problem, for the CP decisions.
+                                genome=(req.genome or
+                                        optimize_service.genome_of_winner(
+                                            req.rows, req.winner_overlap,
+                                            bool(req.winner_flexible), req.best)))
     if not stored:
         raise HTTPException(status_code=409, detail="job superseded")
     return {"ok": True}
@@ -3216,7 +3401,8 @@ def _finalize_from_shards(job_id):
                        ranks=merged["ranks"], best=merged["best"],
                        evals=merged["evals"], table=merged["rows"],
                        cancelled=merged["cancelled"],
-                       crew_rank=merged.get("winner_crew_rank"))
+                       crew_rank=merged.get("winner_crew_rank"),
+                       genome=merged.get("winner_genome"))
 
 
 @app.post("/optimize/shard-result")
