@@ -1840,6 +1840,14 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
                                           base_reserved=setup.absence_reserved,
                                           frozen=setup.frozen)
             res = sw.result
+            # Same class as the cloud path: a search that found nothing hands back
+            # an EMPTY best, not None. Under cp that is a real outcome (a time-boxed
+            # solve can return no solution), and there is nothing further to try, so
+            # say so in a sentence. Every other engine is untouched — the helper
+            # returns False for them and this falls through exactly as before.
+            if (not optimizer.scoreable(res.best)
+                    and _no_usable_plan_outcome(job_id, base_config)):
+                return
             _finalize_optimize(job_id, base_config, real_baseline, label,
                                winner_overlap=sw.overlap_percent,
                                winner_flexible=sw.flexible_machines, ranks=res.ranks,
@@ -2076,6 +2084,15 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
     # `improved` is judged honestly. Keep the contest's number only if the replay fails.
     crew_rank = dict(crew_rank or {})
     genome = dict(genome or {})
+    # "NO PLAN" HAS EXACTLY ONE SPELLING FROM HERE ON: None. A search that found
+    # nothing hands back `OptimizeResult.best`'s default EMPTY DICT — not None —
+    # and every `best is not None` test downstream (this function's `improved`,
+    # `_auto_apply_result`, `_optimize_apply`) read that as a plan. Scoring it then
+    # raised KeyError('ontime_breach') and the owner read the raw Python error
+    # (live, 2026-08-15, twice). Normalise once, here, rather than teaching each
+    # reader a second spelling. `optimizer.scoreable` is the one test.
+    if not optimizer.scoreable(best):
+        best = None
     if ranks:
         _local_best = _metrics_for_ranks(ranks, winner_overlap, winner_flexible,
                                          crew_rank=crew_rank, cp_genome=genome)
@@ -2091,7 +2108,7 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
             real_baseline = _incumbent_metrics(with_distribution=True)
         except Exception:  # noqa: BLE001 — a re-measure must never fail a finished contest
             pass
-    improved = (best is not None and real_baseline is not None
+    improved = (optimizer.scoreable(best) and optimizer.scoreable(real_baseline)
                 and optimizer.score(best) < optimizer.score(real_baseline))
     # Fingerprint against the WINNING settings: Apply persists the winning
     # overlap into the saved plan config, so the staleness check must
@@ -2160,6 +2177,55 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
                     f"press \"Done entering — update plan\" again.")
             except Exception:  # noqa: BLE001 — the store is what just failed
                 pass
+    return True
+
+
+# What the owner reads when a deep search comes home with nothing to apply. A
+# SENTENCE, in `cp_adapter.solve`'s voice, not a Python exception: a time-boxed
+# solve returning no solution is a normal outcome, and the only things the floor
+# needs are that the plan on screen is untouched and that pressing the button
+# again is safe. This replaces the raw `KeyError: 'ontime_breach'` the owner read
+# twice on 2026-08-15. The UI prefixes it with "Optimization failed: "
+# (web/app.js), so it opens with WHAT happened rather than repeating that it
+# failed — and it must stay distinguishable from `cp_adapter.solve`'s "the worker
+# is not reachable": here the worker WAS reachable and did run.
+_NO_USABLE_PLAN_MSG = (
+    "the solve worker ran but did not return a usable plan in the time allowed. "
+    "The plan you have now is unchanged. Press \"Start deep search\" again to try "
+    "a fresh solve.")
+
+
+def _no_usable_plan_outcome(job_id, base_config) -> bool:
+    """End a contest that came home with no plan to apply. True when it ended it.
+
+    ONLY under the CP engine, and the asymmetry is the point. Every other engine
+    can genuinely re-run its contest in-process, so for them this returns False and
+    the caller keeps today's `cloud_failed` → watchdog → local-fallback behaviour,
+    byte-identical. The CP engine cannot: the solver is deliberately absent from
+    the app server (`cp_adapter.solve`'s ImportError branch), so a fallback would
+    spend the watchdog only to end with "the solve worker is not reachable" — which
+    would be FALSE here. It was reachable, it ran, and it found nothing. Say that.
+
+    `cloud_failed` is cleared for the same reason `_cancel_cloud_job` clears it: a
+    terminal state plus a set flag would still send the watchdog local.
+    """
+    if getattr(base_config, "scheduler", "classic") != "cp":
+        return False
+    was_auto = False
+    with _OPTIMIZE_LOCK:
+        if _OPTIMIZE["state"] != "running" or _OPTIMIZE["job_id"] != job_id:
+            return True          # somebody else already ended it; do not fall back
+        was_auto = bool(_OPTIMIZE.get("auto"))
+        _OPTIMIZE.update(state="failed", cancel=False, cloud_failed=False,
+                         shards={}, error=_NO_USABLE_PLAN_MSG)
+    if was_auto:
+        # The 2026-08-09 rule: a Done click must never end in silence. The panel's
+        # error is in-process only; this note is what the floor and the owner see
+        # on the next page load.
+        try:
+            _auto_note_write(f"Checked {_hhmm()}: {_NO_USABLE_PLAN_MSG}")
+        except Exception:  # noqa: BLE001 — the note must never mask the outcome
+            pass
     return True
 
 
@@ -3357,12 +3423,31 @@ def optimize_result_ep(req: WorkerResult, request: Request):
         base_config = _OPTIMIZE.get("base_config")
         baseline = _OPTIMIZE.get("baseline")
         label = _OPTIMIZE.get("label")
-        if running and (req.error or req.best is None or req.winner_overlap is None):
+        if running and req.error:
             _OPTIMIZE["cloud_failed"] = True     # watchdog → local fallback now
-            _OPTIMIZE["error"] = req.error or "cloud worker returned no result"
+            _OPTIMIZE["error"] = req.error
             return {"ok": True, "fallback": "local"}
     if not running:
         raise HTTPException(status_code=404, detail="no such running job")
+    # IS THERE A PLAN HERE? Two things used to be tested with `is None` and both
+    # were the wrong question for the CP engine:
+    #   * `best` — a search that found nothing posts OptimizeResult.best's EMPTY
+    #     dict, which is not None; scoring it raised KeyError('ontime_breach') and
+    #     put a raw Python error on the owner's screen (live, 2026-08-15).
+    #   * `winner_overlap` — under cp there IS no knob (optimizer.knob_for returns
+    #     None), so a perfectly good CP result legitimately reports None here and
+    #     was being thrown away as "no result". Only demand a winning value from an
+    #     engine that has a knob to report.
+    _knob = optimizer.knob_for(base_config)[0] if base_config is not None else None
+    if not optimizer.scoreable(req.best) or (_knob and req.winner_overlap is None):
+        if _no_usable_plan_outcome(req.job_id, base_config):
+            return {"ok": True}
+        with _OPTIMIZE_LOCK:
+            if (_OPTIMIZE["state"] == "running"
+                    and _OPTIMIZE.get("job_id") == req.job_id):
+                _OPTIMIZE["cloud_failed"] = True   # watchdog → local fallback now
+                _OPTIMIZE["error"] = "cloud worker returned no result"
+        return {"ok": True, "fallback": "local"}
     stored = _finalize_optimize(req.job_id, base_config, baseline, label,
                                 winner_overlap=req.winner_overlap,
                                 winner_flexible=bool(req.winner_flexible),
@@ -3422,7 +3507,15 @@ def _finalize_from_shards(job_id):
     total_evals = sum(int(s.get("evals", 0)) for s in shards)
     any_cancel = any(bool(s.get("cancelled")) for s in shards)
     merged = optimize_service.merge_shard_rows(payload, all_rows, total_evals, any_cancel)
-    if merged["best"] is None:
+    # `scoreable`, not `is None`: a candidate that found nothing carries an EMPTY
+    # dict (OptimizeResult.best's default), which `pick_winner` now refuses to
+    # elect — but a merge from an older worker, or any future producer, could still
+    # hand one back here. One test, asked at every gate.
+    if not optimizer.scoreable(merged["best"]):
+        # No plan, and under cp no local fallback that could find one: end the job
+        # with a sentence instead of leaving the watchdog to report the wrong cause.
+        if _no_usable_plan_outcome(job_id, base_config):
+            return
         with _OPTIMIZE_LOCK:
             if _OPTIMIZE["state"] == "running" and _OPTIMIZE["job_id"] == job_id:
                 _OPTIMIZE["cloud_failed"] = True   # watchdog → local fallback

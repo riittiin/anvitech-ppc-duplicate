@@ -127,6 +127,33 @@ class OptimizeResult:
     genome: dict = field(default_factory=dict)
 
 
+# The keys ``score`` REQUIRES. Kept beside it (and read by ``scoreable`` below) so
+# the "can this be scored?" test and the scoring itself can never drift apart.
+SCORE_REQUIRED_KEYS: tuple = ("ontime_breach", "makespan_days")
+
+
+def scoreable(metrics) -> bool:
+    """True when ``metrics`` is a plan ``score`` can actually rank.
+
+    THE ONE DEFINITION OF "THIS CANDIDATE PRODUCED A PLAN", and it exists because
+    ``is None`` was never that test. ``OptimizeResult.best`` defaults to an EMPTY
+    DICT, so every search that legitimately finds nothing — most reachably
+    ``cp_adapter.solve`` when the solver returns no solution inside its time limit
+    — hands the contest ``{}``, which is not None and sails through an ``is None``
+    guard straight into ``score``, where the missing ``ontime_breach`` raises. That
+    is the 2026-08-15 live failure: "could not finalize the cloud result:
+    'ontime_breach'" on the owner's screen, twice.
+
+    The remedy is NOT to soften ``score`` (see its docstring — a defaulted
+    ``ontime_breach`` would score a missing plan as a PERFECT one). It is to ask
+    this question first, everywhere a metrics dict of unknown provenance is about
+    to be ranked: ``pick_winner`` (rows from remote workers), the classic sweep's
+    own contest, and ``api.main._finalize_optimize``.
+    """
+    return (isinstance(metrics, dict)
+            and all(k in metrics for k in SCORE_REQUIRED_KEYS))
+
+
 def score(metrics: dict) -> float:
     """Lower is better. ONE on-time term plus a makespan tie-break, and the two
     dormant guards.
@@ -146,6 +173,9 @@ def score(metrics: dict) -> float:
     would otherwise score as a PERFECT plan, and dicts arrive here from remote
     contest workers (engine/optimize_service.py). Fail loud, per CLAUDE.md. The
     two dormant guards below keep ``.get`` — absent means genuinely zero for them.
+
+    Callers holding a dict that may be a NON-plan (an empty ``OptimizeResult.best``,
+    a worker row) must ask ``scoreable`` first. That is the guard; this stays loud.
     """
     return (ONTIME_WEIGHT * metrics["ontime_breach"]
             + MAKESPAN_WEIGHT * metrics["makespan_days"]
@@ -692,8 +722,12 @@ def _sweep_optimize_classic(so_lines, config, masters, *, budget_evals=150, seed
 
     def _sc(res):
         """A comparable score, or None when the candidate never ran (cancelled:
-        _run returned None)."""
-        return score(res.best) if (res is not None and res.best is not None) else None
+        _run returned None) or produced no plan at all.
+
+        ``scoreable``, not ``is not None``: an ``OptimizeResult`` that found nothing
+        carries an EMPTY dict, which is not None and would reach ``score`` — see
+        ``scoreable``'s docstring for the live failure that taught us."""
+        return score(res.best) if (res is not None and scoreable(res.best)) else None
 
     # The current setting runs FIRST (an early Stop still leaves the user's
     # own setting fully searched), then every other contender gets the SAME

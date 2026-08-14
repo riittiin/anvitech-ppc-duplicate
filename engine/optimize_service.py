@@ -378,6 +378,14 @@ def pick_winner(current_overlap, current_flexible, rows, base_seed=None):
     second seed that merely EQUALS the incumbent never displaces it — same
     no-churn rule the overlap dimension already has. Rows from an older worker
     carry no ``seed`` key and simply never win a tie.
+
+    A row is eligible to WIN only if its ``best`` is a plan ``score`` can rank
+    (``optimizer.scoreable``). ``is None`` was the old test and it was the wrong
+    one: a candidate that found nothing carries ``OptimizeResult.best``'s default
+    EMPTY DICT, which is not None — so an empty candidate could be elected winner
+    and then blow up in ``score`` (the 2026-08-15 'ontime_breach' failure). A
+    contest where NO candidate produced a plan returns None, exactly as one where
+    every candidate was cancelled does, and the caller reports that.
     """
     def _is_current(r):
         return (r.get("overlap") == current_overlap
@@ -386,7 +394,7 @@ def pick_winner(current_overlap, current_flexible, rows, base_seed=None):
     ordered = sorted(rows, key=lambda r: (not _is_current(r), r.get("overlap")))
     best = None
     for r in ordered:
-        if not r.get("eligible") or r.get("best") is None:
+        if not r.get("eligible") or not optimizer.scoreable(r.get("best")):
             continue
         if best is None or optimizer.score(r["best"]) < optimizer.score(best["best"]):
             best = r

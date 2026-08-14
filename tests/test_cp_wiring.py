@@ -97,6 +97,13 @@ DISPATCH_SITES = {
     # the Rule-6 machine table each described a shop 2 h/day narrower than the
     # plan they were describing. Third occurrence of the 2026-08-07 incident.
     ("engine/operator_coverage.py", "_day_window"): "cp -> the full first shift",
+    # THE EIGHTEENTH SITE (2026-08-15). When a contest comes home with no plan to
+    # apply, every other engine still has a local fallback that could find one, so
+    # the watchdog runs it. cp has none — the solver is deliberately absent from
+    # the app server — so falling back would spend the watchdog only to report
+    # "the solve worker is not reachable", which is FALSE when the worker just ran
+    # and found nothing. cp ends the job with a sentence instead.
+    ("api/main.py", "_no_usable_plan_outcome"): "cp -> terminal sentence, no local",
 }
 
 # Everything that asks ``optimizer.knob_for`` for the tuned setting. It returns
@@ -115,6 +122,11 @@ KNOB_CONSUMERS = {
     ("api/main.py", "_metrics_for_ranks"),
     ("api/main.py", "_finalize_optimize"),
     ("api/main.py", "_optimize_apply"),
+    # 2026-08-15: the worker's own result endpoint. It used to reject any result
+    # whose ``winner_overlap`` was None as "no result" — which is every CP result,
+    # because cp HAS no knob to report. It now asks `knob_for` and only demands a
+    # winning value from an engine that has one. `if _knob` is the None case.
+    ("api/main.py", "optimize_result_ep"),
 }
 
 _ENGINE_NAMES = {"classic", "flow", "new", "roster", "cp"}
@@ -549,9 +561,19 @@ def test_merge_shard_rows_brings_the_cp_genome_home(monkeypatch):
     it the ranks are applied and then replayed with no genome at all — the
     decoder falls back for every operation and the plan is one nobody searched."""
     payload = _cp_cloud_payload()
+    # ``best`` carries what ``optimizer.plan_metrics`` really returns for a solved
+    # book — specifically the keys ``score`` requires. It used to be a two-field
+    # stub, and a stub is no longer scoreable: since 2026-08-15 ``pick_winner``
+    # elects only rows whose ``best`` is a plan that can be RANKED, because a
+    # candidate that found nothing carries ``OptimizeResult.best``'s empty dict and
+    # was being elected winner and then blowing up in ``score``
+    # (tests/test_no_usable_plan.py). A fixture the engine could never emit would
+    # make this test pass on a code path production never takes.
     monkeypatch.setattr(cp_adapter, "solve",
                         lambda *a, **kw: optimizer.OptimizeResult(
-                            ranks={"k": 1}, best={"total_late_days": 3},
+                            ranks={"k": 1},
+                            best={"total_late_days": 3, "ontime_breach": 4.0,
+                                  "makespan_days": 12.0},
                             genome={"ranks": {"k": 1}, "cp_overlap_of": {"B1": 5}},
                             evals=1))
     rows = [optimize_service.run_candidate(payload, None)]
