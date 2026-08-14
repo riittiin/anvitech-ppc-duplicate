@@ -369,37 +369,42 @@ def add_release(cp_model, variables, built, config) -> dict:
 
     **The release is an APPROXIMATION, and knowingly so.** The shop's rule is
     WORKED minutes (the sibling greedy engine's ``release`` module:
-    "an overnight gap must not release pieces that were never cut"), while both
-    bounds below are WALL CLOCK. So each is wrong in its own direction:
+    "an overnight gap must not release pieces that were never cut"), while the
+    bound below is WALL CLOCK, and it is wrong in the PESSIMISTIC direction: a
+    break falling late in the predecessor makes ``a.end`` later than the moment
+    the last k pieces really needed, so the successor waits a little longer than
+    the shop would.
 
-    * the HEAD bound ``b.start >= a.start + setup + k x cycle`` is optimistic
-      when a break falls early in the predecessor — it counts the break as
-      cutting time;
-    * the TAIL bound ``b.start >= a.end - (qty - k) x cycle`` is pessimistic when
-      one falls late, for the mirror-image reason.
-
-    Both are imposed. Be clear about what that buys, because it is less than it
-    looks: the tail bound PROVABLY DOMINATES the head bound and the head can
-    never bind. ``a.end - a.start >= processing = setup + cutting``, so
-    ``tail - head = (a.end - a.start - setup) - cutting >= 0`` always. The head
-    bound is kept because it is the direct statement of the other side of the
-    rule and costs one linear constraint per pair — measured redundant, not
-    assumed so (see this task's mutation table) — and because it becomes load
-    bearing the moment anything narrows the interval. The model's effective
-    release is therefore the PESSIMISTIC one.
+    **There used to be a second, HEAD bound**
+    ``b.start >= a.start + setup + k x cycle`` — the other side of the same rule,
+    optimistic where this one is pessimistic. It was REMOVED (owner-authorized,
+    2026-08-14) because it can never bind: ``a.end - a.start >= processing =
+    setup + cutting``, so ``tail - head = (a.end - a.start - setup) - cutting >=
+    0`` always, and the tail bound provably dominates. Removing it also retired
+    ``_setup_charged``, 28 lines that read the assignment and mode variables back
+    out of the model to work out what setup the predecessor would really pay —
+    the subtlest code in this package, feeding an inert constraint. Measured
+    before removal on three tardy books x two frozen states: identical
+    ``total_late_days`` and ``spread``, -1.2% model size. **It is restorable from
+    git, and the condition that would make it live again is anything that NARROWS
+    a task's interval** — a latest_end, a fixed duration, a no-idle regime — since
+    the dominance argument rests entirely on the interval being at least as long
+    as the processing time.
 
     A later task's decoder computes the exact worked-minute release and a drift
-    check measures what this cost. If the drift is material, tighten these —
+    check measures what this cost. If the drift is material, tighten this —
     never loosen the decoder.
 
-    Both bounds are written in SCALED integer arithmetic (multiplied through by
+    The bound is written in SCALED integer arithmetic (multiplied through by
     ``qty``) rather than with a per-piece minute constant. Rounding a sub-minute
-    cycle to whole minutes would otherwise make the two bounds inconsistent with
-    the duration ``model.build`` charged — ``qty x round(cycle)`` is not
-    ``round(qty x cycle)`` — and could push the head bound above the tail, which
-    is exactly the direction that releases pieces before they exist.
+    cycle to whole minutes would otherwise make it inconsistent with the duration
+    ``model.build`` charged — ``qty x round(cycle)`` is not ``round(qty x
+    cycle)`` — in the direction that releases pieces before they exist.
+
+    ``config`` is unused since the head bound went (it was read only for
+    ``setup_time_min``) and is kept so every ``add_*`` in this module takes the
+    same four arguments.
     """
-    setup_min = int(getattr(config, "setup_time_min", 90) or 0)
     out: dict = {}
     for job in built.jobs:
         pairs = _overlapping_pairs(built, job)
@@ -425,8 +430,6 @@ def add_release(cp_model, variables, built, config) -> dict:
         for a_idx, b_idx, qty, cutting in pairs:
             a = variables.task_vars[a_idx]
             b = variables.task_vars[b_idx]
-            setup = _setup_charged(variables, built, a_idx, setup_min)
-            cp_model.add(qty * b.start >= qty * (a.start + setup) + k * cutting)
             cp_model.add(qty * b.start >= qty * a.end - (qty - k) * cutting)
     return out
 
@@ -466,36 +469,6 @@ def _overlaps(prev, nxt) -> bool:
     if prev.kind not in _INHOUSE or nxt.kind not in _INHOUSE:
         return False
     return prev.cycle_min > 0.0
-
-
-def _setup_charged(variables, built, task_idx: int, setup_min: int):
-    """The setup minutes this task will really pay, as a linear expression.
-
-    The head bound has to know when the predecessor's FIRST piece cleared, and
-    that is ``setup + cycle`` into it — but only if it landed on a machine that
-    has a fixture to change. Which machine is a decision, so the setup is a
-    decision too, and writing it as ``setup_min if op.kind == MACHINING else 0``
-    would be the same kind-vs-machine confusion Rule 4 itself has to avoid: a
-    ``MD1/CNC1`` step is manual-kind and pays 90 on CNC1, a ``CNC1/MD1`` step is
-    machining-kind and pays nothing on MD1.
-
-    So it is read off the MODEL: one term per candidate machining machine's
-    assignment, minus any setup-free mode this task selected (Rule 4's credit —
-    a task that inherits a warm fixture pays no setup, and its successor is
-    released that much earlier). Both sums are 0/1 and a setup-free mode implies
-    its machine's assignment, so the expression is exactly the minutes charged.
-    """
-    if setup_min <= 0:
-        return 0
-    on_machining = [variables.assign_vars[(task_idx, res_idx)].present
-                    for res_idx in sorted(built.machining_res_idcs)
-                    if (task_idx, res_idx) in variables.assign_vars]
-    if not on_machining:
-        return 0
-    credited = [variables.mode_vars[mode_idx]
-                for (t_idx, _res), mode_idx in sorted(built.setup_free_modes.items())
-                if t_idx == task_idx]
-    return setup_min * (sum(on_machining) - sum(credited))
 
 
 # --------------------------------------------------------------------------- #

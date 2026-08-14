@@ -371,3 +371,32 @@ def test_no_pins_is_byte_identical_to_no_frozen_argument():
     b = _solve([_B("B1", "A", 10)], frozen=None)
     assert a.genome == b.genome
     assert a.stats["frozen_applied"] == b.stats["frozen_applied"] == 0
+
+
+def test_a_resumed_ops_successor_is_not_held_back_by_a_setup_it_did_not_pay():
+    """Regression for a REAL interaction between the two halves of this task.
+
+    Rule 3 used to carry a HEAD release bound as well as the tail one —
+    ``b.start >= a.start + setup + k x cycle`` — kept because the tail provably
+    dominated it (``interval >= processing = setup + cutting``, so
+    ``tail - head = breaks + idle >= 0``). Pinning a resumed op breaks that
+    premise: its mode carries NO setup, so ``processing`` is the cutting time
+    alone while the head bound still charged the predecessor 90 minutes it never
+    paid, and the successor was held back by exactly that. MEASURED on a tardy
+    12-order book: 140 late-days with the head bound, 139 without, and the ONLY
+    leg of six that moved was a frozen one.
+
+    So the head bound is gone (owner-authorized 2026-08-14) and this pins the
+    behaviour: the successor of a resumed op is released off its predecessor's
+    real end, not off a setup that was credited away.
+    """
+    masters = _masters()
+    masters.routings["A"] = Routing("A", "a", "cust", "rm", None, [
+        Process(1, "CNC FIRST SIDE", 5.0, None, None, PINNED),
+        Process(2, "CNC SECOND SIDE", 5.0, None, None, FREE_MACHINE)])
+    res = _solve([_B("B1", "A", 10, due=_URGENT)], frozen=_pin(), masters=masters)
+    assert res.status_ok
+    assert res.machine_busy_minutes(PINNED) == 10 * 5        # resumed, no setup
+    # Step 1 runs 0..50. The head bound would have demanded step 2 start no
+    # earlier than 0 + 90 + one piece; the tail bound demands only 50 - 9 x 5.
+    assert res.task_window("B1", 2)[0] < 90
