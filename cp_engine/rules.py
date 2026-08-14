@@ -21,9 +21,14 @@ deliberately absent on Render — nothing in the replay path (``__init__``,
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from cp_engine import windows
+# ONE definition of how a frozen row is read and which of two rows for one
+# operation wins. ``decode`` is a replay-path module (no pyjobshop at any depth),
+# so importing it here is safe in the direction that matters — and its own
+# docstring says a later layer must import these rather than keep a third copy.
+from cp_engine.decode import pin_rank, prev_start_key, row_value  # noqa: F401
 from cp_engine.domain import INSPECTION, MACHINING, MANUAL
 
 # pyjobshop's own ceiling for a time variable. Imported rather than restated so
@@ -587,6 +592,298 @@ def _directly_after(cp_model, variables, res_idx: int, a_idx: int, b_idx: int):
         variables.task_vars[b_idx].start == variables.task_vars[a_idx].end
     ).only_enforce_if(adjacent)
     return adjacent
+
+
+# --------------------------------------------------------------------------- #
+# Frozen in-progress work (spec §5.5)
+#
+# A FROZEN ROW PINS WHERE AND WHEN, NEVER HOW MUCH. That sentence is the whole
+# of this section and it is written from a live escalation: on 2026-08-11 a
+# director opened the Gantt for two clubbed SOs and found CNC FIRST SIDE running
+# 88 pieces — ONE SO line's own remainder — while the other line's 281 were in no
+# plan at all, though every later step still showed the full 535. It hit 4 of 58
+# batches on the owner's real book. ``remaining_qty`` is therefore never read
+# here; the quantity comes from ``Job.qty_for``, at BATCH level, which is the same
+# expression ``model.build`` charges the duration from and ``Solved.op_qty``
+# publishes. One definition, one quantity.
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class Pin:
+    """One in-progress operation, already resolved against TODAY's book.
+
+    ``resume_shift`` is the index of the first shift in which the pinned machine
+    could pick the part back up — the shift the roster force below is written
+    for. ``rank`` is ``decode.pin_rank``, so this layer and the replay decoder
+    can never disagree about which of two rows for one operation wins.
+    """
+
+    job_key: str
+    op_seq: int
+    machine: str
+    operator: str | None
+    earliest_start: int
+    resume_shift: int | None
+    rank: tuple
+
+
+def resolve_pins(frozen, jobs, shop, shifts, plan_start) -> tuple:
+    """Frozen rows -> ``({(job key, op seq): Pin}, [reason])``, before the model.
+
+    PURE, and deliberately run BEFORE ``model.build``: two of the four things a
+    pin does — the resumed op's missing setup and its ``earliest_start`` — are
+    per-MODE and per-TASK facts, frozen into ``ProblemData`` when the task is
+    created. Nothing added to the raw CpModel afterwards can relax a duration.
+
+    THE ACCOUNTING CLOSES. Every row that arrives is either a ``Pin`` or a
+    reason, mirroring ``decode._apply_frozen``. A silently dropped constraint is
+    a named recurring defect class in this repo: the plan looks perfectly
+    well-formed while the part is planned on a machine it is not physically on.
+
+    A pin the current book cannot honour is DROPPED, never forced. The
+    alternative is a machine list of exactly one impossible machine, which takes
+    the whole book out of the plan at the horizon — and the app's rule is that a
+    live plan must never simply fail. Dropped rows fall through to ordinary
+    scheduling and are reported.
+
+    Rows are collapsed to ONE pin per (job, op): several clubbed SO lines can each
+    be in progress on the same step, and an operation runs once, on one machine.
+    """
+    by_key = {job.key: job for job in jobs}
+    horizon = shifts[-1].end if shifts else 0
+    best: dict = {}
+    reasons: list = []
+
+    for row in frozen or ():
+        key = row_value(row, "order_key", "job_key", "batch_id")
+        seq = row_value(row, "op_seq", "process_seq")
+        mid = row_value(row, "machine_id", "machine")
+        if key is None or seq is None or mid is None:
+            reasons.append(f"{_describe(row)}: the row names no job, step or "
+                           "machine")
+            continue
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError):
+            reasons.append(f"{_describe(row)}: step {seq!r} is not a number")
+            continue
+        key, mid = str(key), str(mid)
+        job = by_key.get(key)
+        if job is None:
+            reasons.append(f"{_describe(row)}: no job {key!r} in this plan")
+            continue
+        op = next((o for o in job.ops if o.seq == seq), None)
+        if op is None:
+            reasons.append(f"{_describe(row)}: {key} has no step {seq} in its "
+                           "routing")
+            continue
+        if mid not in op.machine_options:
+            reasons.append(f"{_describe(row)}: {key} step {seq} no longer runs "
+                           f"on {mid}")
+            continue
+        if job.qty_for(seq) <= 0:
+            # No task is built for a step with nothing left to make, so there is
+            # nothing to pin — and the quantity that decides that is the BATCH's.
+            reasons.append(f"{_describe(row)}: {key} step {seq} has nothing left "
+                           "to make")
+            continue
+        if not _staffable(shop, mid):
+            reasons.append(f"{_describe(row)}: no operator in Settings is "
+                           f"qualified for {mid}")
+            continue
+        floor = _earliest_start(row, plan_start)
+        if horizon and floor >= horizon:
+            reasons.append(f"{_describe(row)}: the previous plan starts it past "
+                           "this horizon")
+            continue
+
+        who = row_value(row, "operator")
+        pin = Pin(job_key=key, op_seq=seq, machine=mid,
+                  operator=str(who) if who else None,
+                  earliest_start=floor,
+                  resume_shift=_resume_shift(shop, mid, floor, shifts),
+                  rank=pin_rank(row, mid))
+        current = best.get((key, seq))
+        if current is None or pin.rank < current.rank:
+            if current is not None:
+                reasons.append(_supersede(current, pin))
+            best[(key, seq)] = pin
+        else:
+            reasons.append(_supersede(pin, current))
+
+    return best, reasons
+
+
+def pin_frozen(cp_model, variables, built, roster, pins) -> tuple:
+    """Force the model onto the pins: the MACHINE, and the PERSON for the shift
+    the part is picked back up in. Returns ``(applied, [reason])``.
+
+    The other two halves of §5.5 — ``earliest_start`` and no setup on resume —
+    were built into ``ProblemData`` by ``model.build``; see ``resolve_pins``.
+
+    **The machine is forced, the person is not always.** ``roster.x`` holds a
+    variable only for a pairing that is PHYSICALLY POSSIBLE today — the machine
+    is on that operator's SETTINGS list, it is his shift, and he is not away —
+    so a pinned operator who has since had the machine taken off him has no
+    variable to force at all. Forcing one would mean inventing it, and the model
+    would come back INFEASIBLE for a book the shop can plainly run. That is
+    exactly the live 2026-08-03 / 2026-08-07 defect from the other direction
+    ("Sidhu Singe on CNC5"): re-pinning a planned operator without re-checking
+    qualification froze him straight back onto a machine an admin had just taken
+    away. So the MACHINE PIN IS PHYSICS AND STAYS; the PERSON is re-staffed from
+    today's Settings and the row is reported.
+
+    Two stale rows can also disagree about who is on one machine in one shift, or
+    put one person on two machines at once. Rule 1 forbids both, so forcing both
+    would be INFEASIBLE — a live plan must never simply fail. The earliest-started
+    row wins (``decode.pin_rank``, the decoder's own tie-break, so the two can
+    never disagree) and the loser's PERSON is reported, keeping its machine.
+
+    **Only the resume shift is forced, not every shift the op may span.** Which
+    shifts an operation really occupies is a decision — the model has no variable
+    for it under E1 at all — and forcing the pinned person across a span the
+    solver has not chosen would both over-book him and forbid the shift handoff
+    the shop actually runs (RULES.md: a man may change machine at the next shift).
+    So the force is written for the ONE shift in which the machine can pick the
+    part back up, which is the shift the pin is a physical statement about.
+    """
+    if dict(pins or {}) != built.pins:
+        # Same guard, same reason, as add_roster's hold_across_unmanned_shift
+        # check nine lines up: model.build baked the setup credit and the
+        # earliest_start of ONE pin set into ProblemData, and a second set forced
+        # here would pin a machine whose mode still carries 90 minutes it does
+        # not owe, or float a start the previous plan fixed.
+        raise ValueError(
+            "pin_frozen was given a different pin set from the one model.build "
+            "was built for — the resumed setup and earliest_start are frozen "
+            "into ProblemData and cannot be changed here. Pass the same dict.")
+
+    applied = 0
+    reasons: list = []
+    on_machine: dict = {}        # (machine, shift) -> operator forced there
+    on_operator: dict = {}       # (operator, shift) -> machine he was forced to
+
+    for _key, pin in sorted(pins.items(), key=lambda kv: kv[1].rank):
+        task_idx = built.task_of.get((pin.job_key, pin.op_seq))
+        if task_idx is None:
+            reasons.append(f"{_name(pin)}: this plan has no task for that step")
+            continue
+        res_idx = built.machine_res_order.get(pin.machine)
+        assign = (variables.assign_vars.get((task_idx, res_idx))
+                  if res_idx is not None else None)
+        if assign is None:
+            reasons.append(f"{_name(pin)}: {pin.machine} has no mode for that "
+                           "step in this model")
+            continue
+        # A task selects exactly one mode and every mode names exactly one
+        # machine, so forcing this assignment present forbids every other machine
+        # without a constraint per alternative.
+        cp_model.add(assign.present == 1)
+        applied += 1
+
+        if pin.operator is None or pin.resume_shift is None:
+            continue
+        var = roster.x.get((pin.operator, pin.machine, pin.resume_shift))
+        if var is None:
+            reasons.append(
+                f"{_name(pin)}: {pin.operator} is not on {pin.machine} for that "
+                "shift under today's Settings — the machine pin stands and the "
+                "person is re-staffed")
+            continue
+        held = on_machine.get((pin.machine, pin.resume_shift))
+        if held is not None and held != pin.operator:
+            reasons.append(
+                f"{_name(pin)}: another in-progress row already puts {held} on "
+                f"{pin.machine} that shift, and one machine has one operator — "
+                f"{pin.operator} is re-staffed")
+            continue
+        elsewhere = on_operator.get((pin.operator, pin.resume_shift))
+        if elsewhere is not None and elsewhere != pin.machine:
+            reasons.append(
+                f"{_name(pin)}: {pin.operator} is already pinned to {elsewhere} "
+                "that shift, and nobody mans two machines in one shift — he is "
+                f"re-staffed off {pin.machine}")
+            continue
+        if held is None:
+            cp_model.add(var == 1)
+        on_machine[(pin.machine, pin.resume_shift)] = pin.operator
+        on_operator[(pin.operator, pin.resume_shift)] = pin.machine
+
+    return applied, reasons
+
+
+def _earliest_start(row, plan_start) -> int:
+    """The previous plan's start, in minutes from the plan clock, floored at 0.
+
+    The past is past: an operation started yesterday resumes no earlier than the
+    plan clock, never at a negative minute. Both spellings and both types —
+    ``engine.freeze.compute_frozen_set`` emits an ISO STRING while an adapter may
+    hand over a datetime. A row with no readable previous start gets NO floor
+    rather than a guessed one; it still pins WHERE.
+    """
+    value = row_value(row, "prev_start", "start")
+    when = value if isinstance(value, datetime) else None
+    if when is None and value is not None:
+        try:
+            when = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            when = None
+    if when is None or plan_start is None:
+        return 0
+    return max(0, int((when - plan_start).total_seconds() // 60))
+
+
+def _resume_shift(shop, mid: str, floor: int, shifts) -> int | None:
+    """The first shift at or after the floor in which this machine is open.
+
+    Not "the shift the op runs in" — that is a decision. It is the earliest shift
+    the shop could pick the part back up in, which is the shift a pin makes a
+    physical statement about.
+    """
+    machine = (shop.machines or {}).get(mid)
+    for shift in shifts or ():
+        if shift.end <= floor:
+            continue
+        if machine is not None and not _machine_runs(machine, shift):
+            continue
+        return shift.index
+    return None
+
+
+def _staffable(shop, mid: str) -> bool:
+    """Can anybody in Settings run this machine at all?
+
+    A machining machine nobody can man is BLOCKED by Rule 1 (``staffed == 0``),
+    and a bench nobody can man has no mode at all — forcing a pin onto either is
+    an infeasible model rather than a plan. Qualification is EXACTLY the Settings
+    machine list (2026-08-07: role is not a gate).
+    """
+    return any(mid in (getattr(o, "machines", None) or ())
+               for o in shop.operators)
+
+
+def _supersede(loser: Pin, kept: Pin) -> str:
+    """Why a second row for ONE operation was not applied. CHECKED, not assumed:
+    the same machine is a duplicate — the ordinary clubbed-SO-lines case — while a
+    different machine is a real data conflict, and calling that "superseded"
+    attributes a cause nobody checked (2026-08-09)."""
+    if loser.machine == kept.machine:
+        return (f"{_name(loser)}: another in-progress row already covers that "
+                f"operation ON THE SAME MACHINE (clubbed SO lines on one batch "
+                f"step); an operation runs once")
+    return (f"{_name(loser)}: this row says {loser.machine} for an operation "
+            f"another row puts on {kept.machine}, which one operation cannot be "
+            f"— the earlier-started row ({kept.machine}) was kept")
+
+
+def _name(pin: Pin) -> str:
+    return f"{pin.job_key} step {pin.op_seq}"
+
+
+def _describe(row) -> str:
+    key = row_value(row, "order_key", "job_key", "batch_id", "so_no") or "?"
+    seq = row_value(row, "op_seq", "process_seq")
+    return f"{key} step {seq if seq is not None else '?'}"
 
 
 # --------------------------------------------------------------------------- #

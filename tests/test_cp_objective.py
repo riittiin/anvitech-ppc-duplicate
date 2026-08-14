@@ -519,12 +519,22 @@ def test_the_same_inputs_and_seed_give_the_same_genome():
                                                      second.spread)
 
 
-def test_frozen_work_is_refused_rather_than_silently_ignored():
-    """Task 9 owns the frozen set. Until it lands, a caller that passes one must
-    be told — a frozen op quietly dropped is the 2026-08-11 class of bug."""
+def test_frozen_work_is_never_silently_ignored():
+    """A frozen row this book cannot honour is REPORTED, never dropped in
+    silence — a quietly discarded pin plans work that is physically running on
+    another machine, and the plan looks perfectly well-formed while it does it.
+
+    This assertion replaces a ``pytest.raises(NotImplementedError)`` that pinned
+    ``solve_book``'s fail-loud placeholder. Task 9 implemented the frozen path, so
+    the behaviour change is deliberate; what the test protects — a caller is
+    always told — is unchanged. The row below names no job key spelling the
+    engine knows and no machine, which is the worst-case unusable row.
+    """
     masters, batches = _forced_choice()
-    with pytest.raises(NotImplementedError):
-        _solve(masters, batches, frozen=[{"job": "LATE", "op_seq": 1}])
+    res = _solve(masters, batches, frozen=[{"job": "LATE", "op_seq": 1}])
+    assert res.status_ok
+    assert res.stats["frozen_applied"] == 0
+    assert len(res.stats["frozen_unpinned"]) == 1
 
 
 def test_the_stats_carry_the_model_size_the_spike_measures():

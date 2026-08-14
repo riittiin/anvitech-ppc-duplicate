@@ -74,6 +74,14 @@ class Built:
     # silently building E2 constraints on a model that cannot satisfy them.
     hold_across_unmanned_shift: bool = True
 
+    # The frozen in-progress pins this data was built FOR — {(job key, op seq):
+    # rules.Pin}. Two of the four things a pin does are baked in HERE and cannot
+    # be relaxed later: a resumed op's mode carries NO setup, and its task carries
+    # the previous plan's start as ``earliest_start``. Recorded so
+    # ``rules.pin_frozen`` can refuse a caller that forces a DIFFERENT set,
+    # exactly as ``add_roster`` refuses a mismatched hold flag.
+    pins: dict = field(default_factory=dict)
+
     # Rule 4's credit, as a SECOND mode. (task idx, machine res idx) -> mode idx
     # of a duplicate mode carrying the cutting time with NO setup, built only
     # where some other task of the same (item, process) can run on that same
@@ -127,9 +135,15 @@ class Built:
 
 def build(jobs, shop, config, plan_start: datetime, shifts,
           *, setup_mode: str = "credit",
-          hold_across_unmanned_shift: bool = True) -> Built:
+          hold_across_unmanned_shift: bool = True, pins=None) -> Built:
+    """``pins`` is ``rules.resolve_pins``'s output — already resolved against
+    this book, so nothing here re-validates one. It changes exactly two things,
+    both of which are frozen into ProblemData and unreachable afterwards: the
+    resumed task's ``earliest_start``, and the absence of a setup on the machine
+    the part is already in. It NEVER changes a quantity (2026-08-11)."""
     from pyjobshop import Model
 
+    pins = dict(pins or {})
     horizon_min = shifts[-1].end if shifts else 0
     setup_min = int(getattr(config, "setup_time_min", 90) or 0)
     m = Model()
@@ -190,7 +204,13 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
             # is to make such a plan possible — would return no plan at all.
             hold = hold_across_unmanned_shift and any(
                 mid in shop.machining_ids for mid in op.machine_options)
+            # A frozen op resumes no earlier than the previous plan started it —
+            # the WHEN half of a pin (spec §5.5). ``earliest_start`` is a task
+            # field, so it has to be set at creation; it is also what makes
+            # ``rules._shifts_in_window`` tighten E2 for exactly this work.
+            pin = pins.get((job.key, op.seq))
             task = m.add_task(job=cp_job, allow_breaks=True, allow_idle=hold,
+                              earliest_start=(pin.earliest_start if pin else 0),
                               name=f"{job.key}/{op.seq}")
             idx = len(task_of)
             task_of[(job.key, op.seq)] = idx
@@ -198,11 +218,28 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
             if op.kind == OUTSOURCED:
                 m.add_mode(task, os_res, int(max(1, op.cycle_min)), demands=1)
             else:
+                # The quantity is the BATCH's, pin or no pin. A frozen row's own
+                # ``remaining_qty`` is one clubbed SO LINE's remainder and is
+                # never read here — reading it planned 88 pieces of a 242-piece
+                # step and left the rest in no plan at all (live 2026-08-11).
                 cutting = max(1, int(round(qty * op.cycle_min)))
                 for mid in op.machine_options:
-                    _add_modes(m, task, mid, cutting, setup_min, shop,
+                    # NO SETUP ON RESUME: the part is already in this chuck and
+                    # the fixture is already on. Charged per MODE, so it is
+                    # credited only on the machine the part is physically on —
+                    # if the pin is later dropped the step pays setup wherever it
+                    # does land.
+                    resuming = pin is not None and mid == pin.machine
+                    _add_modes(m, task, mid, cutting,
+                               0 if resuming else setup_min, shop,
                                machine_res, operator_res)
-                    if setup_min > 0 and mid in shop.machining_ids:
+                    # A pinned task is deliberately kept OUT of Rule 4's
+                    # same-part groups: it already pays nothing, so it needs no
+                    # credit, and it is not offered as a warm predecessor either.
+                    # That over-charges at most one changeover behind a resumed
+                    # op — the conservative direction, and the plan stays
+                    # runnable.
+                    if setup_min > 0 and pin is None and mid in shop.machining_ids:
                         same_part.setdefault(
                             (mid, job.item_code, op.seq), []).append(
                                 (task, idx, cutting))
@@ -240,7 +277,7 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
                  setup_mode=setup_mode, machine_res_order=order,
                  operator_res_order=op_order,
                  job_by_key={j.key: j for j in jobs},
-                 plan_start=plan_start,
+                 plan_start=plan_start, pins=pins,
                  hold_across_unmanned_shift=hold_across_unmanned_shift)
 
 

@@ -126,8 +126,14 @@ def solve_book(batches, masters, config, plan_start: datetime, *,
             may run. A book that does not fit returns ``status_ok=False``.
         num_workers: pinned by callers that need determinism.
         absent: ``{operator name: [(from, to)]}`` wall-clock absence blocks.
-        frozen: in-progress work pinned to its last-applied machine/operator.
-            NOT IMPLEMENTED — raises rather than silently dropping it.
+        frozen: in-progress work pinned to its last-applied machine/operator —
+            the rows ``engine.freeze.compute_frozen_set`` produces, already
+            collapsed to one per (batch, op). A pin says WHERE and WHEN, never
+            HOW MUCH; see ``rules.resolve_pins``. Empty or None leaves the model
+            byte-identical to a book with nothing in progress. Rows this book
+            cannot honour are REPORTED in ``stats["frozen_unpinned"]`` and fall
+            through to ordinary scheduling — never silently dropped, and never
+            forced into an infeasible model.
         hold_across_unmanned_shift: Rule 2's "may span an unmanned shift" clause;
             see ``rules._link_work_to_roster``.
         setup_mode: ``"credit"`` (Rule 4 as written) or ``"always"``.
@@ -136,12 +142,6 @@ def solve_book(batches, masters, config, plan_start: datetime, *,
         should_cancel: polled on every improved solution; a true answer stops the
             search and keeps the best found so far.
     """
-    if frozen:
-        raise NotImplementedError(
-            "solve_book does not honour a frozen set yet. Silently ignoring one "
-            "would replan work that is physically running on another machine — "
-            "pass frozen=None until that lands.")
-
     from ortools.sat.python import cp_model as cp_sat
     from pyjobshop.solvers.ortools.CPModel import CPModel
 
@@ -149,8 +149,12 @@ def solve_book(batches, masters, config, plan_start: datetime, *,
     shop = domain.build_shop(masters, absent or {})
     shifts = windows.build_shifts(plan_start, masters.calendar, config,
                                   horizon_days)
+    # Resolved BEFORE the model, because two of the four things a pin does — the
+    # resumed op's missing setup and its earliest_start — are per-mode and
+    # per-task facts that ProblemData freezes at creation (spec §5.5).
+    pins, unpinned = rules.resolve_pins(frozen, jobs, shop, shifts, plan_start)
     built = model.build(jobs, shop, config, plan_start, shifts,
-                        setup_mode=setup_mode,
+                        setup_mode=setup_mode, pins=pins,
                         hold_across_unmanned_shift=hold_across_unmanned_shift)
 
     cp = CPModel(built.data)
@@ -168,6 +172,9 @@ def solve_book(batches, masters, config, plan_start: datetime, *,
 
     roster = rules.add_roster(cp.model, cp.variables, built, shop,
                               hold_across_unmanned_shift=hold_across_unmanned_shift)
+    # After the roster, because the machine pin's other half is a roster boolean.
+    applied, more = rules.pin_frozen(cp.model, cp.variables, built, roster, pins)
+    unpinned = list(unpinned) + list(more)
     released = rules.add_release(cp.model, cp.variables, built, config)
     rules.add_setup_credit(cp.model, cp.variables, built, config)
     if not built.setup_credit_linked:
@@ -187,6 +194,11 @@ def solve_book(batches, masters, config, plan_start: datetime, *,
     # ---- phase 1: total late-days ------------------------------------------
     objective.phase_one(cp.model, days)
     stats = _base_stats(cp.model, built, shifts, days, skipped)
+    # THE FROZEN ACCOUNTING CLOSES: every row handed in is either one of
+    # ``frozen_applied`` pins or one of ``frozen_unpinned``'s reasons. Plain
+    # strings, so the pair survives the cloud worker's JSON payload intact.
+    stats["frozen_applied"] = applied
+    stats["frozen_unpinned"] = unpinned
     solver, status = _run(cp.model, time_limit * _PHASE_ONE_SHARE, num_workers,
                           seed, on_progress, should_cancel, phase=1)
     stats["phase_one_status"] = solver.status_name(status)
