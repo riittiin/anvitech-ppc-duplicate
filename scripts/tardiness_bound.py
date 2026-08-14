@@ -6,9 +6,9 @@ found", is that because the plan is near-optimal, or because a greedy dispatcher
 a local search cannot see the better plan?
 
 The engine is a heuristic. It reports how good a plan is RELATIVE to other plans it
-tried. It has no idea how far it sits from the best plan that exists. This builds a
-constraint-programming model of the same book and asks a solver (OR-Tools CP-SAT, via
-PyJobShop) for a proven floor: **no schedule of this book can beat N late-days.**
+tried. It has no idea how far it sits from the best plan that exists. This asks a
+solver (OR-Tools CP-SAT, via PyJobShop) for a proven floor: **no schedule of this
+book can beat N late-days.**
 
     bound 380 against a live plan of 406  ->  within 7%. Stop optimising; the four
                                               20+ day orders need outsourcing, a
@@ -16,25 +16,41 @@ PyJobShop) for a proven floor: **no schedule of this book can beat N late-days.*
     bound 200 against a live plan of 406  ->  half the loss is reachable and the
                                               engine cannot see it. Worth real work.
 
-WHY A RELAXATION IS STILL A VALID ANSWER
-----------------------------------------
-The model deliberately DROPS one of the shop's four rules: Rule 1, one operator mans
-one machine for a whole shift. PyJobShop cannot express "this person may not be on a
-different machine within the same shift" — that needs raw CP-SAT booleans per
-(operator, machine, shift).
+TWO MODELS, AND WHICH NUMBER EACH ONE GIVES YOU
+-----------------------------------------------
+``--model cp`` (the DEFAULT since 2026-08-14) builds through **``cp_engine.solve``**
+— the same model the CP scheduler itself plans with, under **all four shop rules**,
+including Rule 1's per-shift roster. The floor it prints is therefore a floor on the
+problem the shop actually has, so ``best found`` minus ``PROVEN FLOOR`` is the
+**TRUE optimality gap**, not a gap against an easier problem. That is the number to
+quote.
 
-Dropping a constraint can only make the problem EASIER, so the optimum of this model
-is less than or equal to the true optimum under all four rules:
+    Read it honestly: at the owner's scale that gap is about **2x and does not
+    close**. Measured (docs/superpowers/plans/2026-08-14-cp-tractability-findings.md
+    §1) at 61 batches: 300 s -> 454 late-days / floor 168; 1800 s -> 409 / 170. Six
+    times the wall clock bought 10% off the incumbent and TWO DAYS of floor. Proven
+    optimality survives to about 10 batches and no further. **Cores, not time, buy
+    the bound**: 2 -> 4 solver workers at the same 30 minutes moved the floor
+    170 -> 215, so run this with ``--workers 4`` on a 4+ core box or the number
+    understates what is provable. This tool measures a gap; it does not close one.
+
+``--model relaxed`` is the ORIGINAL model kept for contrast, and it is a different
+claim. It builds its own PyJobShop model from ``roster_engine.domain`` and
+deliberately DROPS Rule 1 — one operator mans one machine for a whole shift — which
+the public PyJobShop API cannot express. Dropping a constraint can only make the
+problem easier, so:
 
     bound(relaxed)  <=  bound(all four rules)  <=  the best real schedule  <=  406
 
-So the number this prints is a floor on the floor. If it comes back close to 406,
-that is conclusive — no amount of engine work can help. If it comes back far below,
-the answer is "maybe", not "definitely", because part of the gap may be Rule 1 itself
-rather than the search. That asymmetry is the whole reason the tool is worth running:
-the CHEAP direction is the one that ends the investigation.
+which makes it a **floor on the floor**: conclusive when it lands close to the live
+number, only suggestive when it lands far below, because part of that distance may
+be Rule 1 itself rather than the search. It is far cheaper and far faster than the
+cp model, and its ``RULE 1 AUDIT`` block prices exactly how much of its answer was
+bought with the dropped rule. Under ``--model cp`` that audit is not printed,
+because there is nothing to audit: the rule is encoded, and a CP plan is checked
+against the shop's own four rule checks by ``tests/test_cp_end_to_end.py``.
 
-Everything else IS modelled, exactly as the engine does it:
+``--model relaxed`` models everything else exactly as the engine does it:
   * machine calendars, shifts, weekly off and holidays  -> per-machine breaks
   * an operation runs to completion, never interrupted  -> free; a CP interval is
     contiguous by construction (that is Rule 2)
@@ -59,23 +75,37 @@ It prints three rows so the question has an answer rather than a hope:
 
     engine alone        the engine's own Rule 1-3 order, no seed
     engine + CP seed    the same engine, replaying the solver's job order
-    CP target           the solver's own objective, under its relaxed model
+    CP target           the solver's own objective
 
-The gap between rows 1 and 2 is how much of the solver's advantage SURVIVES the
-real rules. The gap between rows 2 and 3 is what the relaxation was worth. A
-result where row 2 lands back on row 1 is a real finding, not a failure: this repo
-already recorded it once ("CP-SAT-as-sequence-oracle: idealized 44-45 d, greedy
-replay loses it all"), and it must be reported plainly if it happens again.
+The gap between rows 1 and 2 is how much of the solver's advantage SURVIVES a
+re-plan. A result where row 2 lands back on row 1 is a real finding, not a failure:
+this repo already recorded it once ("CP-SAT-as-sequence-oracle: idealized 44-45 d,
+greedy replay loses it all"), and it must be reported plainly if it happens again.
+
+Under ``--model cp`` the seed is the solver's own ``genome["ranks"]`` — the app's
+priority-rank map, produced by the model rather than reconstructed from task start
+times — and a FOURTH row is printed: the **CP plan itself**, replayed through
+``scheduler="cp"`` with its genome. That row is the one the shop would actually
+see, and the distance between it and the CP target is the model/decoder drift
+``cp_engine.report.completion_drift`` exists to catch (0 on contended books, a day
+or more on a single-shift-bench shop — see ``tests/test_cp_end_to_end.py``).
 
 Usage
 -----
-    pip install pyjobshop
-    python scripts/tardiness_bound.py --level operators --time-limit 900
-    python scripts/tardiness_bound.py --level operators --seed-engine
+    pip install pyjobshop==0.0.9
+    python scripts/tardiness_bound.py --time-limit 900 --workers 4
+    python scripts/tardiness_bound.py --seed-engine --workers 4
+    python scripts/tardiness_bound.py --model relaxed --level operators
 
 Reads the SAME book the app plans — same store, same Rule 1 consolidation — so the
 number is comparable to what the Schedule tab shows. Needs the store env the app
 uses (MONGODB_URI, or the local file store). It only ever reads.
+
+A CHEAPER PRE-GO-LIVE CHECK: ``scripts/cp_tractability_spike.py --real --mode
+variants`` re-runs the whole encoding comparison against the owner's ACTUAL book
+without a long solve. Every published number so far is on a proxy — 14 machines
+against the real ~26, and its delivery dates had to be pulled 10 days earlier
+before the book was tardy at all — so run it before the cutover.
 """
 from __future__ import annotations
 
@@ -446,6 +476,23 @@ def _solution(res):
 RULE_CHECKS = ("OPERATOR_SPLIT_SHIFT", "OPERATION_SEGMENTED",
                "MACHINE_DOUBLE_BOOKED", "IDLE_CAPACITY")
 
+# ...but under the CP engine ``IDLE_CAPACITY`` IS NOT A BREACH, and printing it as
+# one is not a cosmetic difference: a first run of --model cp on the demo book
+# reported "!! RULE VIOLATIONS: {'IDLE_CAPACITY': 47}" against a plan that breaks
+# no rule at all. Two things make idle capacity legitimate here and only here: E1
+# forbids an operation spanning an unmanned shift (the owner-authorized Rule 2
+# trim), and the decoder defers a pool-staffed machine's fallback work by one
+# shift on purpose. ``cp_engine.report.RULE_KINDS`` is the same three names and is
+# the definition the app's own banner partitions on
+# (``cp_adapter.plan_violations``), so this must not become a second one.
+CP_RULE_CHECKS = ("OPERATOR_SPLIT_SHIFT", "OPERATION_SEGMENTED",
+                  "MACHINE_DOUBLE_BOOKED")
+
+
+def _breach_kinds(row) -> tuple:
+    """Which kinds count as a RULE BREACH for the plan this row describes."""
+    return CP_RULE_CHECKS if row.get("scheduler") == "cp" else RULE_CHECKS
+
 
 def _cp_job_windows(res, decode):
     """job key -> (earliest task start, latest task end) in the solved schedule.
@@ -492,13 +539,19 @@ def _cp_order(windows, by_key, mode):
     return [by_key[k] for k in keys if k in by_key]
 
 
-def _replay(book, ranks, label):
+def _replay(book, ranks, label, *, scheduler="roster", genome=None):
     """Plan the book through the UNCHANGED engine, optionally seeded with ``ranks``.
 
     ``ranks`` is the app's own artifact — ``optimizer.ranks_for``'s output, keyed
     "<so>\\x1f<item>" — and it is handed to ``pipeline.run_forward``'s
     ``priority_rank``, the same parameter the app uses when it replays a saved
     optimization. Nothing here is a special path: this is the live plan code.
+
+    ``scheduler``/``genome`` exist for ONE caller: ``--model cp``, which also
+    replays the CP plan through ``scheduler="cp"`` with the solver's own genome.
+    That row is what the shop would actually SEE, as against the target the model
+    reports — and the two are not always the same number (``cp_engine.report.
+    completion_drift``). Every other caller gets today's behaviour untouched.
     """
     import dataclasses
     import time
@@ -507,7 +560,9 @@ def _replay(book, ranks, label):
     from engine.models import PlanRun
     from roster_engine import report as rr
 
-    config = dataclasses.replace(book.config, scheduler="roster")
+    config = dataclasses.replace(book.config, scheduler=scheduler)
+    if genome is not None:
+        config = dataclasses.replace(config, cp_genome=genome)
     run = PlanRun(so_lines=list(book.so_lines))
     started = time.perf_counter()
     trace = pipeline.run_forward(run, config, book.masters,
@@ -527,7 +582,11 @@ def _replay(book, ranks, label):
         counts[row["kind"]] = counts.get(row["kind"], 0) + 1
     return {"label": label, "metrics": metrics, "counts": counts,
             "rows": rows, "entries": len(entries), "secs": elapsed,
-            "score": optimizer.score(metrics), "ranked": len(ranks or {})}
+            "score": optimizer.score(metrics), "ranked": len(ranks or {}),
+            # Which engine planned this row — it decides which kinds count as a
+            # BREACH below (``_breach_kinds``), and mixing the two definitions is
+            # how a clean CP plan got printed as 47 rule violations.
+            "scheduler": scheduler}
 
 
 def _search_from_seed(book, ordered, evals):
@@ -566,15 +625,19 @@ def _row(r):
     if r.get("error"):
         return f"  {r['label']:<30s}  PLAN FAILED: {r['error'][:60]}"
     m = r["metrics"]
-    bad = sum(r["counts"].get(k, 0) for k in RULE_CHECKS)
+    bad = sum(r["counts"].get(k, 0) for k in _breach_kinds(r))
     return (f"  {r['label']:<30s} {m['total_late_days']:>10d} {m['late_orders']:>8d} "
             f"{m['max_late_days']:>7d} {m['makespan_days']:>10.2f} "
             f"{r['score']:>10.1f} {bad:>6d} {r['secs']:>7.1f}")
 
 
 def seed_engine(res, decode, book, search_evals=0):
-    """Derive a sequence from the CP solution, replay it through the real engine,
-    and print the three-row comparison. Read-only from end to end."""
+    """--model relaxed: derive a sequence from the CP solution's task windows.
+
+    The relaxed model returns a SCHEDULE, not a rank map, so the job order has to
+    be read back out of task start/end times — hence the two variants (release
+    order and completion order), neither of which is obviously right.
+    """
     windows = _cp_job_windows(res, decode)
     if not windows:
         print("\n(no CP schedule to derive a sequence from — nothing to seed)")
@@ -583,12 +646,31 @@ def seed_engine(res, decode, book, search_evals=0):
     from engine import optimizer
 
     by_key = decode.get("by_key") or {}
-    print(f"\nSEEDING THE ENGINE FROM THE CP SOLUTION")
+    print("\nSEEDING THE ENGINE FROM THE CP SOLUTION")
     print(f"  CP jobs with a solved window : {len(windows)} "
           f"(of {len(book.batches)} batches)")
+    variants = [(mode, _cp_order(windows, by_key, mode))
+                for mode in ("start", "end")]
+    obj = getattr(res, "objective", None)
+    _seed_engine_core(book, variants, search_evals=search_evals,
+                      target_days=(None if obj is None
+                                   else obj / MINUTES_PER_DAY),
+                      target_label="CP target (relaxed model)")
 
+
+def _seed_engine_core(book, variants, *, search_evals=0, target_days=None,
+                      target_label="CP target", extra_rows=()):
+    """Replay each seed variant through the real engine and print the comparison.
+
+    Shared by both models on purpose: the whole value of this table is that every
+    row is measured by the SAME yardstick, and two printers would eventually
+    disagree about what "score" or "VIOL" means.
+    """
+    from engine import optimizer
+
+    rows = list(extra_rows)
     bare = _replay(book, None, "engine alone (no seed)")
-    rows = [bare]
+    rows.append(bare)
     live = None
     if book.applied_ranks:
         # The live plan's own sequence, replayed here so it is measured by the
@@ -599,8 +681,7 @@ def seed_engine(res, decode, book, search_evals=0):
         rows.append(live)
 
     seeded = []
-    for mode in ("start", "end"):
-        ordered = _cp_order(windows, by_key, mode)
+    for mode, ordered in variants:
         r = _replay(book, optimizer.ranks_for(ordered), f"engine + CP seed ({mode})")
         r["ordered"] = ordered
         seeded.append(r)
@@ -623,9 +704,8 @@ def seed_engine(res, decode, book, search_evals=0):
     for r in rows:
         print(_row(r))
 
-    obj = getattr(res, "objective", None)
-    if obj is not None:
-        print(f"  {'CP target (relaxed model)':<30s} {obj / MINUTES_PER_DAY:>10.1f} "
+    if target_days is not None:
+        print(f"  {target_label:<30s} {target_days:>10.1f} "
               f"{'-':>8s} {'-':>7s} {'-':>10s} {'-':>10s} {'n/a':>6s} {'-':>7s}")
     print("  score = engine.optimizer.score, the objective the app's own search "
           "MINIMISES.\n  It is symmetric — finishing far EARLY is penalised like "
@@ -638,19 +718,23 @@ def seed_engine(res, decode, book, search_evals=0):
     for r in rows:
         if r.get("error"):
             continue
-        bad = {k: v for k, v in r["counts"].items() if k in RULE_CHECKS and v}
+        kinds = _breach_kinds(r)
+        bad = {k: v for k, v in r["counts"].items() if k in kinds and v}
         if bad:
             dirty = True
             print(f"\n  !! RULE VIOLATIONS in '{r['label']}': {bad}")
             for row in r["rows"][:3]:
-                if row["kind"] in RULE_CHECKS:
+                if row["kind"] in kinds:
                     print(f"       - {row['kind']}: {row['message'][:96]}")
     if not dirty:
-        print(f"\n  rule checks ({', '.join(RULE_CHECKS)}): 0 on every plan above.")
+        print(f"\n  rule checks ({', '.join(RULE_CHECKS)}): 0 on every plan\n"
+              f"  above (IDLE_CAPACITY is a capacity MEASUREMENT under cp, not a\n"
+              f"  breach — see CP_RULE_CHECKS).")
     for r in rows:
         if r.get("error"):
             continue
-        extra = {k: v for k, v in r["counts"].items() if k not in RULE_CHECKS and v}
+        extra = {k: v for k, v in r["counts"].items()
+                 if k not in _breach_kinds(r) and v}
         if extra:
             print(f"  note — '{r['label']}' reports {extra} "
                   f"(not rule breaches; see roster_engine/report.py)")
@@ -658,7 +742,10 @@ def seed_engine(res, decode, book, search_evals=0):
     # The incumbent is what the shop is RUNNING, so when an applied optimization
     # exists that is the row to beat — measuring the seed against the unoptimized
     # engine would credit it with everything the owner's own optimizer already won.
-    base = live if (live and not live.get("error")) else rows[0]
+    # ``bare``, never ``rows[0]``: under --model cp the first row is the CP plan
+    # itself, and calling that "the incumbent" would compare the seed against the
+    # very thing it came from and label the difference a recovery.
+    base = live if (live and not live.get("error")) else bare
     best = min((r for r in seeded if not r.get("error")),
                key=lambda r: r["metrics"]["total_late_days"], default=None)
     if base.get("error") or best is None:
@@ -669,9 +756,9 @@ DID THE SEED HELP?
   incumbent         {base['metrics']['total_late_days']} late-days ({base['label']})
   best CP-seeded    {best['metrics']['total_late_days']} late-days ({best['label']})
   recovered         {gained:+d} late-days""")
-    if not rows[0].get("error"):
+    if not bare.get("error"):
         print(f"  (engine with no seed at all: "
-              f"{rows[0]['metrics']['total_late_days']} late-days)")
+              f"{bare['metrics']['total_late_days']} late-days)")
 
     # The two halves of this tool do not optimise the same thing, and pretending
     # otherwise is the easiest way to read a win into this table that is not there.
@@ -708,6 +795,146 @@ DID THE SEED HELP?
   Caveat before acting on it: this replay carries NO frozen (in-progress) pins,
   while the live plan does. Re-measure through the app's own Optimize panel — that
   path pins in-progress work — before treating the gain as bankable.""")
+
+
+# --------------------------------------------------------------------------- #
+# --model cp: the SHIPPING model, all four rules encoded
+# --------------------------------------------------------------------------- #
+
+def run_cp_model(book, args):
+    """Solve through ``cp_engine.solve`` — the model the CP scheduler plans with.
+
+    Rule 1's per-shift roster is ENCODED here, so the floor is a floor on the
+    shop's real problem and ``best found - PROVEN FLOOR`` is the TRUE optimality
+    gap. Nothing is written: this calls the pure solver, never the app's Apply.
+
+    The E1/E2 default is read off the config exactly as the app reads it, so this
+    measures the encoding that ships rather than a second opinion about it.
+    """
+    import dataclasses
+
+    from cp_engine import solve as cp_solve
+    from engine import cp_adapter
+
+    hold = bool(getattr(book.config, "cp_hold_across_unmanned_shift",
+                        cp_adapter.CP_HOLD_ACROSS_UNMANNED_SHIFT))
+    print(f"Solving through cp_engine (all four rules; "
+          f"{'E2 hold-across-unmanned' if hold else 'E1 no-hold'}, "
+          f"limit {args.time_limit:.0f}s, {max(1, args.workers)} worker(s), "
+          f"horizon {args.horizon_days}d)...")
+    if max(1, args.workers) < 4:
+        print("  !! fewer than 4 workers. CORES BUY THE BOUND: 2 -> 4 workers at "
+              "the same\n     30 minutes moved the proven floor 170 -> 215 "
+              "late-days at the owner's scale.\n     This run will UNDERSTATE what "
+              "is provable. (findings §1)")
+
+    solved = cp_solve.solve_book(
+        book.batches, book.masters, book.config, book.plan_start,
+        time_limit=float(args.time_limit), horizon_days=int(args.horizon_days),
+        num_workers=max(1, args.workers), hold_across_unmanned_shift=hold,
+        seed=42)
+
+    print("\n" + "=" * 68)
+    print(f"status               : {solved.status}")
+    if not solved.status_ok:
+        print("  no plan at all. Widen --horizon-days or raise --time-limit.")
+        print("=" * 68)
+        return
+    print(f"best found           : {solved.total_late_days:>9.1f} late-days")
+    if solved.lower_bound_days is not None:
+        print(f"PROVEN FLOOR         : {solved.lower_bound_days:>9.1f} late-days")
+        if solved.lower_bound_days > 0:
+            print(f"TRUE optimality gap  : "
+                  f"{solved.total_late_days / solved.lower_bound_days:>9.2f}x "
+                  f"(all four rules encoded — this is not a floor on a floor)")
+    print("=" * 68)
+    print("  This engine ships FEASIBLE-WITH-A-BOUND, never proved optimal at this\n"
+          "  shop's scale: a ~2x gap that six times the wall clock does not close.\n"
+          "  Do not publish 'CP-proven optimal' from this number.")
+
+    if not args.seed_engine:
+        return
+
+    # The CP plan AS THE SHOP WOULD SEE IT: the genome replayed through the app's
+    # own cp seam. The model and the decoder are two definitions of one schedule,
+    # so the published row and the target row are not guaranteed equal — that is
+    # exactly what cp_engine.report.completion_drift measures.
+    print("\nSEEDING THE ENGINE FROM THE CP SOLUTION")
+    cp_row = _replay(book, None, "CP plan (replayed, scheduler=cp)",
+                     scheduler="cp", genome=solved.genome)
+    _report_drift(book, cp_row, solved)
+    # The genome's ``ranks`` ARE the app's own artifact — keyed "<so>\x1f<item>",
+    # exactly what ``optimizer.ranks_for`` produces — so the solver's job order
+    # goes to the engine verbatim. The relaxed model has to RECONSTRUCT an order
+    # from task start times because it returns a schedule and not a rank map; this
+    # one does not, which removes that whole class of guesswork.
+    ranks = dict((solved.genome or {}).get("ranks") or {})
+    if not ranks:
+        print("  (the genome carried no job order — nothing to seed)")
+        return
+    print(f"  CP job order: {len(ranks)} ranked SO lines "
+          f"(of {len(book.so_lines)})")
+    # ``ranks_for`` gives every member of the i-th batch rank i+1, so inverting it
+    # is min-rank per batch — the same rule ``apply_priority_rank`` replays by.
+    order_of = {}
+    for b in book.batches:
+        got = [ranks[f"{so}{optimizer_key_sep()}{b.item_code}"]
+               for so in (b.source_so_refs or [])
+               if f"{so}{optimizer_key_sep()}{b.item_code}" in ranks]
+        if got:
+            order_of[str(b.batch_id)] = min(got)
+    ordered = [b for b in sorted(book.batches,
+                                 key=lambda b: (order_of.get(str(b.batch_id),
+                                                             1 << 30),
+                                                str(b.batch_id)))
+               if str(b.batch_id) in order_of]
+    _seed_engine_core(book, [("genome ranks", ordered)],
+                      search_evals=args.seed_search_evals,
+                      target_days=solved.total_late_days,
+                      target_label="CP target (all four rules)",
+                      extra_rows=[cp_row])
+
+
+def optimizer_key_sep():
+    from engine.optimizer import KEY_SEP
+    return KEY_SEP
+
+
+def _report_drift(book, cp_row, solved):
+    """Does the plan the shop would SEE match the plan that was solved?
+
+    The model computes times and the decoder recomputes them, so they are two
+    definitions of one schedule. Where they disagree, the late-days above are not
+    the late-days the published plan realises — and the gap between the "CP plan
+    (replayed)" row and the "CP target" row in the table below is exactly that.
+    Printing it as a number rather than leaving it to be spotted between two rows
+    is the difference between a report and a puzzle.
+    """
+    if cp_row.get("error"):
+        return
+    from cp_engine import report as cp_report
+    from engine import pipeline
+    from engine.models import PlanRun
+    import dataclasses
+
+    cfg = dataclasses.replace(book.config, scheduler="cp",
+                              cp_genome=solved.genome)
+    run = PlanRun(so_lines=list(book.so_lines))
+    pipeline.run_forward(run, cfg, book.masters, reserved=book.reserved)
+    rows = cp_report.completion_drift(run.schedule, solved.genome)
+    if not rows:
+        print("  replay vs solve: completion DATES agree exactly on every batch.")
+        return
+    worst = max(r["days"] for r in rows)
+    print(f"  !! REPLAY DRIFT: {len(rows)} of {len(book.batches)} batches finish on "
+          f"a DIFFERENT DATE\n     from the one solved (worst {worst:+d} days). The "
+          f"published plan is not the plan\n     the search scored. Expect this on "
+          f"a single-shift-bench shop — the decoder\n     cannot release a bench "
+          f"step until its feeder leaves the chuck, by which time\n     the bench "
+          f"has closed. Never widen the drift check to hide it.")
+    for r in rows[:4]:
+        print(f"       - {r['batch_id']}: solved {r['solved']} -> "
+              f"published {r['replayed']}")
 
 
 def _audit_rule1(res, decode, plan_start, config):
@@ -771,9 +998,16 @@ def _audit_rule1(res, decode, plan_start, config):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--model", choices=["cp", "relaxed"], default="cp",
+                    help="cp (default): build through cp_engine.solve, ALL FOUR "
+                         "rules encoded — the number is the TRUE optimality gap. "
+                         "relaxed: the original model, which drops Rule 1 and "
+                         "gives a cheaper floor-on-a-floor plus a Rule 1 audit.")
     ap.add_argument("--level", choices=["machines", "operators"], default="operators",
-                    help="machines: machines only (loosest, fastest). "
-                         "operators: + nobody in two places at once (tighter).")
+                    help="--model relaxed ONLY. machines: machines only (loosest, "
+                         "fastest). operators: + nobody in two places at once "
+                         "(tighter). Ignored under --model cp, where Rule 1 is "
+                         "encoded and there is no level to choose.")
     ap.add_argument("--time-limit", type=float, default=600.0, help="seconds")
     ap.add_argument("--horizon-days", type=int, default=70)
     ap.add_argument("--workers", type=int, default=2,
@@ -815,7 +1049,29 @@ def main():
           f"{plan_start:%d-%m-%Y %H:%M}, overlap "
           f"{getattr(config, 'overlap_percent', '?')}%")
 
-    print(f"Building the CP model at level '{args.level}'...")
+    if args.model == "cp":
+        run_cp_model(book, args)
+        print("""
+HOW TO READ THIS
+  Compare the floor against the late-days on your Schedule tab.
+
+  floor close to the live number  -> the plan is near the best that exists. No
+      engine work will help; the remaining lateness needs outsourcing, another
+      shift, or renegotiated dates.
+
+  floor far below it              -> some of the gap is genuinely reachable.
+      Nothing is relaxed in this model, so unlike --model relaxed there is no
+      "part of it may be Rule 1" caveat to apply. What there IS: the solver's own
+      gap to its floor is ~2x at this scale and does not close with time, so a
+      wide gap here is partly the SOLVER's, not only the engine's.
+
+  Both halves are honest only if the book is genuinely tardy. A book that
+  finishes entirely on time makes the objective hit its own lower bound at the
+  first feasible schedule, and this tool would report FEASIBILITY as if it were
+  optimisation (findings §5).""")
+        return
+
+    print(f"Building the relaxed CP model at level '{args.level}'...")
     model, decode = build(batches, masters, config, plan_start, args.level,
                           args.horizon_days)
 

@@ -185,6 +185,19 @@ class Config:
     # FEASIBLE-WITH-A-BOUND, not proved-optimal (a 2.4x gap that 6x the budget
     # does not close) — cores buy the bound, not wall clock.
     cp_time_limit_sec: int = 900
+    # Solver threads for ONE solve. **CORES BUY THE BOUND; WALL CLOCK BUYS THE
+    # PLAN.** Measured at the owner's scale (findings §1): 2 → 4 workers at the
+    # same 30 minutes moved the PROVEN FLOOR 170 → 215 late-days and cut the
+    # optimality gap 2.41× → 1.99×, while six times the clock at 2 workers moved
+    # the floor by two days. 4 is therefore the shipping default and the reason
+    # **the solve worker must be pinned at 4+ cores** — a GitHub Actions runner
+    # and the Oracle free-tier VM (4 OCPU) both clear it. On a smaller box
+    # CP-SAT simply oversubscribes: no error, a worse bound, silently. That is a
+    # deployment requirement, not a knob, which is why it is not in Settings.
+    # NOTE: >1 worker makes the search PARALLEL, so an identical book can return
+    # a different (equally legal) plan run to run even at a fixed seed — see
+    # ``cp_time_limit_sec`` above; the limit is wall clock either way.
+    cp_num_workers: int = 4
     # The solved DECISION GENOME (job order, machine per operation, crew roster,
     # released pieces, solved completions, the book it was solved against). It
     # rides on the config into the seam because ``/run`` has no genome argument,
@@ -268,6 +281,8 @@ class Config:
             errs.append("cp_fairness_slack_days must be >= 0")
         if int(self.cp_time_limit_sec) <= 0:
             errs.append("cp_time_limit_sec must be > 0")
+        if int(self.cp_num_workers) < 1:
+            errs.append("cp_num_workers must be >= 1")
         if self.cp_genome is not None and not isinstance(self.cp_genome, dict):
             errs.append("cp_genome must be a decision-genome mapping or null")
         if errs:

@@ -197,20 +197,49 @@ def solve(so_lines, config, masters, *, reserved=None, budget_evals=150,
         seen["n"] += 1
         on_progress(seen["n"], None)
 
-    solved = cp_solve.solve_book(
-        batches, masters, config, plan_start,
-        time_limit=float(getattr(config, "cp_time_limit_sec", None)
-                         or CP_TIME_LIMIT_SEC),
-        horizon_days=int(getattr(config, "cp_horizon_days", None)
-                         or CP_HORIZON_DAYS),
-        num_workers=int(getattr(config, "cp_num_workers", None) or 1),
-        absent=absent, frozen=pins,
-        hold_across_unmanned_shift=bool(getattr(
-            config, "cp_hold_across_unmanned_shift",
-            CP_HOLD_ACROSS_UNMANNED_SHIFT)),
-        seed=int(seed),
-        on_progress=_tick if on_progress is not None else None,
-        should_cancel=should_cancel)
+    try:
+        solved = cp_solve.solve_book(
+            batches, masters, config, plan_start,
+            time_limit=float(getattr(config, "cp_time_limit_sec", None)
+                             or CP_TIME_LIMIT_SEC),
+            horizon_days=int(getattr(config, "cp_horizon_days", None)
+                             or CP_HORIZON_DAYS),
+            num_workers=int(getattr(config, "cp_num_workers", None) or 1),
+            absent=absent, frozen=pins,
+            hold_across_unmanned_shift=bool(getattr(
+                config, "cp_hold_across_unmanned_shift",
+                CP_HOLD_ACROSS_UNMANNED_SHIFT)),
+            seed=int(seed),
+            on_progress=_tick if on_progress is not None else None,
+            should_cancel=should_cancel)
+    except ImportError as err:
+        # THERE IS NO LOCAL FALLBACK HERE, and the owner must be told that in his
+        # own words rather than shown "No module named 'ortools'".
+        #
+        # Every other engine answers a deep search locally when the worker is
+        # down. This one structurally cannot: the solver is deliberately absent
+        # from requirements.txt so it can never reach the app server (which only
+        # replays a finished plan), and a 15-minute CP solve on a 0.1-CPU free
+        # instance would be a fallback nobody wants even if it were installed —
+        # the measurement is that CORES buy the bound and that box has a fraction
+        # of one. So the honest outcome is a failed search with the plan on screen
+        # untouched, and the message has to say which of those two things
+        # happened and what to do next.
+        #
+        # WRAPPED AROUND THE CALL, NOT THE IMPORT, and that distinction was
+        # measured rather than assumed: ``cp_engine.solve`` imports pyjobshop and
+        # ortools INSIDE its own functions, so ``from cp_engine import solve``
+        # succeeds on a box with neither and the real ImportError surfaces from
+        # deep inside ``_run``. A guard on the import line would never fire.
+        #
+        # It surfaces verbatim: ``api._start_optimize``'s handler puts ``str(e)``
+        # into ``_OPTIMIZE["error"]`` and into the Done button's durable note.
+        raise RuntimeError(
+            "This deep search needs the solve worker, and it is not reachable "
+            "(the app server cannot solve — it only replays a finished plan). "
+            "The plan you have now is unchanged. Try again when the worker is "
+            "back: see docs/ORACLE_WORKER.md section 8."
+        ) from err
 
     cancelled = bool(should_cancel is not None and should_cancel())
     if not solved.status_ok:

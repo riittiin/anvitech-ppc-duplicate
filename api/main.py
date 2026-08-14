@@ -1717,12 +1717,18 @@ def _start_optimize(budget_evals: int, label: str, background: bool = True,
         # branch are indistinguishable at runtime.
         #
         # The LOCAL fallback under cp is a known, accepted limitation rather than
-        # an oversight: Render has no pyjobshop, so `cp_adapter.solve`'s lazy
-        # import raises and `local_job` reports state="failed" carrying that
-        # message. That is the honest outcome — a 15-minute CP solve on a 0.1-CPU
-        # free instance is not a fallback anybody wants — and the solve must run
-        # on the 4+-core worker (tractability findings: CORES, not wall clock, buy
-        # the bound).
+        # an oversight: Render has neither pyjobshop nor ortools, so
+        # `cp_adapter.solve` raises and `local_job` reports state="failed"
+        # carrying that message. That is the honest outcome — a 15-minute CP solve
+        # on a 0.1-CPU free instance is not a fallback anybody wants — and the
+        # solve must run on the 4+-core worker (tractability findings: CORES, not
+        # wall clock, buy the bound). The message is NOT the raw ImportError:
+        # `cp_adapter.solve` translates it into the owner's words (the search
+        # failed, the plan is unchanged, try again when the worker is back),
+        # because this note is the only thing the floor ever sees. NB the guard
+        # sits around the solve CALL, not the import — `cp_engine.solve` imports
+        # the solver inside its own functions, so importing that module succeeds
+        # on a box that has none of it.
         if getattr(base_config, "scheduler", "classic") == "cp":
             budget_evals = 0
         config = _resolve_config(config)   # None -> today (IST) for the engine/contest

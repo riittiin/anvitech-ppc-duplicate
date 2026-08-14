@@ -81,6 +81,19 @@
 >   minute residual below, amplified across a day boundary. **The published plan can
 >   therefore be a day later per order than the number the search optimised, on
 >   precisely this shop's shape. NEVER "fix" this by loosening the drift check.**
+>   **Task 13 reproduced it end to end on the repo's OWN generated book** (whose
+>   benches are single-shift, like his) and found a SECOND, larger amplifier:
+>   **the ROSTER GAP.** An op that slips past the shift the solve rostered its
+>   machine for lands in a shift `cp_roster` deliberately left dark
+>   (`decode._Crew.staff`'s fourth case) and waits for that machine's NEXT rostered
+>   shift — read off the genome, VMC1's rostered shifts ran `[… 14, 15, 50, 96 …]`,
+>   so one overrun cost **20 days**; +17, +59 and +5 have also been observed.
+>   `decode._assign` documents this for a NEW order arriving after the solve; that
+>   it also catches a SOLVED order whose replay slipped was not known. Magnitudes
+>   are budget-dependent (the same book at a 12 s budget drifts +1/+1/+2), so
+>   `tests/test_cp_end_to_end.py` asserts only what is true: drift EXISTS on that
+>   shape and is one-sided LATE, with the numbers printed. On a CONTENDED book with
+>   two-shift benches it is exactly 0, asserted with no epsilon.
 >   A one-sided **LATE** residual remains
 >   at MINUTE resolution — **+83 min and +191 min are OBSERVED VALUES, not a proven
 >   bound; nothing establishes a ceiling** — because the decoder's `_JobState` tracks
@@ -116,8 +129,70 @@
 >   **counts** the sites: a new one fails as `extra`, and any site branching on an
 >   engine name must contain the literal `"cp"`. **Never add a
 >   `config.scheduler` branch without running that test.**
->   **Still to do:** the end-to-end run, the worker, and the deployment notes
->   (Task 13). Until `DEFAULT_SCHEDULER=cp` is set, NOTHING about the live plan
+>   **THE FROZEN CONTRACT UNDER CP IS NARROWER THAN UNDER EVERY OTHER ENGINE, ON
+>   PURPOSE: WHERE ALWAYS, WHO ON MACHINING MACHINES ONLY.** Rule 1 rosters CNC/VMC
+>   and does not roster benches, and the decoder re-staffs a bench per operation —
+>   so a model-side bench pin would be overruled at replay, which is the "model and
+>   decoder are two definitions of the schedule" class the drift check exists to
+>   catch. A bench pin therefore fixes the MACHINE and deliberately drops the
+>   person, silently and scoped (a MACHINING pin whose operator Settings no longer
+>   qualifies is still reported, pinned by its own test). Consequence to expect
+>   live: the floor may see a different person at the same bench between plans,
+>   which is what the incumbent engine already does.
+>   **BEFORE THE CUTOVER, RUN `scripts/cp_tractability_spike.py --real --mode
+>   variants`.** It is cheap — the whole encoding comparison against the owner's
+>   ACTUAL book with no long solve — and every number above is on a proxy with **14
+>   machines against the real ~26**, whose delivery dates had to be pulled 10 days
+>   earlier before the book was tardy at all.
+>   **🔴 CP'S OBJECTIVE HAS NO MAKESPAN TERM AT ALL, and among equally-tardy plans
+>   it is INDIFFERENT.** Phase 1 is total late-days, phase 2 is Σ(days late)²;
+>   `optimizer.score`'s 0.1 makespan tie-break has no counterpart here. Found by
+>   `Config.cp_num_workers` destabilising an existing test: on a two-line book that
+>   is entirely on time, 15 solves at 4 workers returned makespans of **2.46, 2.47
+>   and 39.33 days — all equally optimal by the model's own objective**. It is the
+>   same class as the roster-gap drift above (the solve will happily leave a
+>   machine unrostered for 35 shifts, because nothing charges it for the span) and
+>   the same class as the 2026-08-14 method finding: on a book with slack this
+>   engine is measuring FEASIBILITY. Consequence for tests: **a test that asserts
+>   a property of one PARTICULAR solved genome must pin `cp_num_workers=1`**;
+>   assert properties of the REPLAY otherwise. Consequence for the shop: if a
+>   spread-out plan is ever unacceptable on a slack book, the remedy is a makespan
+>   term in `cp_engine/objective.py`, which is an owner decision, not a patch.
+>   **DETERMINISM IS WITHIN A PROCESS ONLY, and that is accepted, not fixed.** The
+>   solve's budget is WALL CLOCK (`solver.parameters.max_time_in_seconds`), so an
+>   identical book can return a different, equally legal genome run to run —
+>   measured: 49 / 67 / 58 late-days on three consecutive identical 15 s runs;
+>   43 five times out of five at 20 s. `max_deterministic_time` is the lever if a
+>   genome ever must reproduce across runs (a bug report, an A/B); it is NOT set,
+>   because a deterministic budget is measured in solver work units, not seconds,
+>   so it cannot honour "finish before Render's 20-minute timeout" — which is the
+>   constraint that actually binds. **Nothing may assert a solved OBJECTIVE**;
+>   assert properties of the REPLAY, which hold for whichever plan comes back.
+>   **Task 13 found three go-live defects by running the thing** (all fixed):
+>   (1) **`cp_adapter.solve` read the worker count off a Config field that did not
+>   exist**, so `or 1` won and EVERY solve ran single-threaded — the one measured
+>   lever, off, silently. `Config.cp_num_workers` now exists and defaults to **4**.
+>   (2) **`.github/workflows/optimize.yml` never installed pyjobshop**, so the
+>   GitHub tier — the fallback the whole design leans on — would have failed every
+>   cp contest. (3) **`scripts/oracle_worker_setup.sh` did not either**; a box built
+>   before 2026-08-14 needs `pip install --user pyjobshop==0.0.9` by hand
+>   (`docs/ORACLE_WORKER.md` §8). Also: `scripts/tardiness_bound.py`'s docstring
+>   described a relaxation the plan had superseded — it now defaults to
+>   `--model cp` (all four rules, the TRUE optimality gap, plus a printed
+>   replay-vs-solve drift line) and keeps `--model relaxed` for the cheaper
+>   floor-on-a-floor and its Rule 1 audit. Its violation printer counted
+>   `IDLE_CAPACITY` as a rule breach and labelled a clean CP plan "47 RULE
+>   VIOLATIONS"; it now partitions per row (`CP_RULE_CHECKS`).
+>   **The end-to-end run is done** (`tests/test_cp_end_to_end.py`, 9 tests): a plan
+>   through the REAL seam — `load_all` → `run_forward(scheduler="cp")` → the
+>   `ScheduleEntry` list every surface publishes — audited by `roster_engine.
+>   report`'s four checks, 0 breaches, with drift 0 on a contended book. **The
+>   cloud worker path is now DRIVEN, not just wired**: `build_payload` → JSON →
+>   `parse_payload` → `run_candidate` (a real solve) → `merge_shard_rows` →
+>   `genome_of_winner` → replay, drift 0. **Still NOT verified end to end:** the
+>   GitHub Actions dispatch itself, the Oracle claim window, and the HTTP hop —
+>   code path only, no live run.
+>   Until `DEFAULT_SCHEDULER=cp` is set, NOTHING about the live plan
 >   changes; rollback is that one env var, and the genome lives under its own store
 >   key (`anvitech:cp_genome`) that no other engine reads, so there is no migration
 >   to undo. **The Apply gate under cp ranks on total late-days then spread

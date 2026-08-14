@@ -5,6 +5,28 @@
 #
 # Repo secrets required: APP_URL, OPTIMIZE_WORKER_SECRET (must equal the
 # Render env var of the same name).
+#
+# UNDER DEFAULT_SCHEDULER=cp THIS RUNNER IS THE SOLVER. Two things follow, and
+# both are deployment facts rather than preferences:
+#
+#   1. pyjobshop must be installed HERE. It is deliberately absent from
+#      requirements.txt (Render runs only the replay path and has neither
+#      pyjobshop nor ortools; a test pins that), so without the extra install
+#      below every cloud contest under cp fails at the first candidate.
+#   2. THE RUNNER NEEDS 4+ CORES. Measured
+#      (docs/superpowers/plans/2026-08-14-cp-tractability-findings.md §1): at the
+#      owner's scale, 2 → 4 solver workers at the same 30 minutes moved the
+#      PROVEN LOWER BOUND on late-days from 170 to 215 and cut the optimality gap
+#      from 2.41x to 1.99x, while six times the wall clock at 2 workers moved it
+#      by two days. **Cores buy the bound; time buys the plan.** GitHub's
+#      standard ubuntu-latest clears this; a smaller runner does not error, it
+#      just returns a worse plan with a weaker bound and says nothing. The count
+#      itself is Config.cp_num_workers (default 4).
+#
+# A cp contest is ONE solve, not a sweep (optimize_service.contest_jobs returns a
+# single job), so 19 of the 20 shards below find nothing to do and exit. That is
+# harmless and deliberate: the matrix is shared with the other engines, whose
+# contests really are 20-way.
 name: optimize
 
 on:
@@ -33,6 +55,19 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Install the solver (cp engine only)
+        # PINNED, deliberately, and NEVER added to requirements.txt. The
+        # cp_engine design reaches pyjobshop's internal API — CPModel(data).model
+        # / .variables / assign_vars — because Rule 1's per-shift roster and the
+        # fairness objective cannot be expressed in the public one. Verified
+        # against 0.0.9; tests/test_cp_escape_hatch.py is the canary that fails
+        # loudly if an upgrade moves it.
+        #
+        # Installed unconditionally rather than behind a "is this a cp contest?"
+        # test: the payload is fetched by the script below, so the answer is not
+        # known at this step, and an unused wheel costs ~15 s while a missing one
+        # loses the whole contest.
+        run: pip install pyjobshop==0.0.9
       - name: Run the contest shard and post the result back
         env:
           APP_URL: ${{ secrets.APP_URL }}

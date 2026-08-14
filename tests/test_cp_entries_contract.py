@@ -448,10 +448,24 @@ def test_solve_produces_a_genome_the_replay_reproduces_exactly():
 def test_solve_publishes_the_metrics_of_the_plan_the_app_will_actually_build():
     """The panel's number must be measured on the REPLAY, not on the solve. The
     model and the decoder are two definitions of one schedule, so a metric taken
-    anywhere else promises a plan the apply does not reproduce."""
+    anywhere else promises a plan the apply does not reproduce.
+
+    ``cp_num_workers=1`` is REQUIRED here, and the reason is a finding rather
+    than housekeeping (2026-08-14, Task 13). The shipping default is 4 because
+    cores are the only measured lever on the proven bound — but a parallel search
+    returns whichever tied optimum a worker reaches first, and **cp's objective
+    contains no makespan term at all** (tardiness, then squared spread; unlike
+    ``optimizer.score``'s 0.1 makespan tie-break). On this two-line book every
+    schedule is on time, so the model is INDIFFERENT: 15 solves at 4 workers
+    returned makespans of 2.46, 2.47 and **39.33** days, all equally optimal by
+    its own objective. The non-vacuity assertion below compares one particular
+    genome's makespan against the genome-less replay's, so it needs a
+    deterministic solve; the flake it caused is what surfaced the finding.
+    """
     pytest.importorskip("pyjobshop")
     from engine.optimizer import plan_metrics
-    masters, cfg, so_lines = _masters(), _cfg(), _so_lines()
+    masters, so_lines = _masters(), _so_lines()
+    cfg = _cfg(cp_num_workers=1)
     result = cp_adapter.solve(so_lines, cfg, masters, budget_evals=0, seed=42)
     batches = _batches()
 

@@ -5,6 +5,22 @@
 # we can tell whether the plan is near-optimal or whether the engine simply
 # cannot see a better one.
 #
+# TWO MODELS since 2026-08-14 (see the script's own docstring):
+#   model=cp       (default) builds through cp_engine.solve with ALL FOUR shop
+#                  rules encoded, so best-found vs floor is the TRUE optimality
+#                  gap. At the owner's scale that gap is ~2x and does NOT close
+#                  with more time — this engine is FEASIBLE-WITH-A-BOUND, never
+#                  provably optimal, and nothing downstream may say otherwise.
+#   model=relaxed  the original model, which DROPS Rule 1 and prints a cheaper
+#                  floor-on-a-floor plus a Rule 1 audit of how much the dropped
+#                  rule was worth.
+#
+# CORES BUY THE BOUND. Measured (findings §1): 2 -> 4 solver workers at the same
+# 30 minutes moved the proven floor 170 -> 215 late-days and cut the gap from
+# 2.41x to 1.99x, while six times the wall clock at 2 workers moved it by two
+# days. --workers is therefore 4 below, and a runner with fewer cores gives a
+# weaker bound with no error and nothing on screen to say so.
+#
 # With seed_engine on (the default) it goes one step further: it hands the
 # solver's JOB ORDER to the real engine as a starting sequence, re-plans under all
 # four shop rules, and prints engine-alone vs engine-seeded vs the CP target — so
@@ -26,8 +42,14 @@ name: Tardiness lower bound
 on:
   workflow_dispatch:
     inputs:
+      model:
+        description: "cp = all four rules, the TRUE gap (default) | relaxed = drops Rule 1, cheaper floor-on-a-floor + Rule 1 audit"
+        required: true
+        default: cp
+        type: choice
+        options: [cp, relaxed]
       level:
-        description: "machines = loosest+fastest | operators = tighter (nobody in two places at once)"
+        description: "relaxed ONLY: machines = loosest+fastest | operators = tighter (nobody in two places at once). Ignored under cp."
         required: true
         default: machines
         type: choice
@@ -88,9 +110,11 @@ jobs:
           UPSTREAM_CACHE_TTL: "3600"
         run: |
           python scripts/tardiness_bound.py \
+            --model "${{ inputs.model || 'cp' }}" \
             --level "${{ inputs.level }}" \
             --time-limit "${{ inputs.time_limit }}" \
             --horizon-days "${{ inputs.horizon_days }}" \
+            --workers 4 \
             ${{ inputs.seed_engine && '--seed-engine' || '' }} \
             --seed-search-evals "${{ inputs.seed_search_evals || 0 }}" \
             2>&1 | tee bound.txt
