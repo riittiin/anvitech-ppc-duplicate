@@ -33,20 +33,31 @@ up into it. That matches this repo's own 2026-08-09 finding — pulling work ear
 is not monotonically good, and gap backfill cost the owner ~40 late-days. Orders
 the solve never saw carry no floor and place freely.
 
-MEASURED RESIDUAL, and its cause, so nobody has to rediscover it. Over 40 solved
-books (280 orders) every completion replays to the SAME DATE — the unit
-``cp_completion`` stores and the objective is scored in. At MINUTE resolution the
-residual is one-sided LATE. It is NOT bounded here: the largest value OBSERVED is
-+83 min on that harness and +191 min on an OS-blocks + scarce-crew shape, and the
-drift check is what derives the number for a given book. It has ONE cause: **this
-loop cannot release a successor while its predecessor is still in the chuck.**
-``_JobState`` tracks one op at a time, and ``_release_successor`` runs when the
-operation is finally placed — so an operation that SPANS A SHIFT BOUNDARY defers
-its successor's release from the true release moment to its own completion, and a
-single-shift bench that has closed in between waits for the next window. The CP
-model has no such restriction: its release is a linear bound on start variables
-and can fire mid-operation. Fixing it means letting two ops of one job be in
-flight at once, which is a change to this loop's concurrency model, not a tweak.
+**TWO OPS OF ONE JOB MAY BE IN FLIGHT AT ONCE, and that is the point** (fixed
+2026-08-14; before that this loop could not release a successor while its
+predecessor was still in the chuck). ``_JobState`` used to track ONE op at a
+time, and the release ran only when the operation was finally placed — so an
+operation that SPANS A SHIFT BOUNDARY deferred its successor's release from the
+true release moment to its own completion, and a single-shift bench that had
+closed in between waited for the next window, or for the next working day across
+the weekly off. The CP model has no such restriction: its release is a linear
+bound on start variables (``rules.add_release``) that fires mid-operation. The
+decoder therefore SERIALISED what the model had OVERLAPPED, and the published
+plan was later than the plan the search scored — 210 late-days on the owner's
+real book (455 solved, 665 published). Reproduced on three solved same-shape
+books of 57-59 batches: 285 -> 310, 416 -> 463 and 446 -> 481 late-days, always
+LATE, never early; after this fix 285, 418 and 446.
+
+``_JobState`` now carries per-op state (``ready_of`` / ``running`` / ``done``)
+and ``_release`` is called after EVERY work slice, so the successor opens on the
+slice that cleared the pieces and can be picked up by another machine in the same
+shift. Rule 2 is untouched — an operation still runs to completion on ONE
+machine, uninterrupted, and no machine runs two things at once; what is now
+allowed is two ops of one JOB on two DIFFERENT machines, which is what the model
+always allowed. Rule 1 is untouched: staffing is still whole-shift.
+
+The residual that remains is one-sided LATE and is measured, never asserted away,
+by ``cp_engine.report.completion_drift``.
 
 Two things the genome still does NOT carry, and what happens to each — stated
 here because a replay that silently invents an answer is worse than one that
@@ -175,29 +186,48 @@ class Plan:
 
 
 class _JobState:
-    __slots__ = ("job", "idx", "ready", "prev_end", "worked", "on_machine",
-                 "released_at", "pinned", "pin_rank")
+    """One job, with AS MANY OPERATIONS IN FLIGHT AS THE RELEASE ALLOWS.
+
+    This used to track one op at a time — a single ``idx`` cursor, a single
+    ``ready`` and a single ``on_machine`` claim — and that was the largest single
+    source of model-vs-decoder drift (see the module docstring). A job now
+    carries per-op state, so a successor released mid-operation can be picked up
+    by ANOTHER machine while its predecessor is still in the chuck, which is
+    exactly what ``rules.add_release`` permits.
+
+    Rule 2 is untouched: an operation still runs to completion on ONE machine,
+    uninterrupted (``_MachineState`` holds it), and no machine runs two things at
+    once. What is now allowed is two ops of one JOB on two DIFFERENT machines.
+
+    ``ready_of`` is the whole mechanism: an op index appears in it exactly when
+    it has been RELEASED, and its value is the earliest instant it may start.
+    Absent means "not released yet" — never "ready at plan_start" — so an op can
+    no more be picked up early than it could when the cursor guarded it.
+    """
+
+    __slots__ = ("job", "idx", "ready_of", "running", "done", "prev_end",
+                 "pinned", "pin_rank")
 
     def __init__(self, job, plan_start):
         self.job = job
-        self.idx = 0
-        self.ready = plan_start        # when the CURRENT op may start
-        self.prev_end = plan_start     # latest end across every op done so far
-        self.worked = 0.0              # worked minutes on the op in progress
-        self.on_machine = None         # machine that has CLAIMED the current op
-        self.released_at = None        # overlap release moment for the NEXT op
+        self.idx = 0                   # earliest op NOT yet finished
+        self.ready_of = {0: plan_start}  # op index -> when it may start
+        self.running = {}              # op index -> machine holding it
+        self.done = set()              # op indices finished
+        self.prev_end = plan_start     # latest end across every op FINISHED
         self.pinned = {}               # op_seq -> machine the part is PHYSICALLY on
         self.pin_rank = {}             # op_seq -> previous-plan resume order
 
 
 class _MachineState:
-    __slots__ = ("job_key", "op_seq", "remaining", "last_key", "segments",
-                 "started", "pace_floor", "busy_until", "setup_charged",
-                 "pinned_jobs")
+    __slots__ = ("job_key", "op_seq", "op_idx", "remaining", "last_key",
+                 "segments", "started", "pace_floor", "busy_until",
+                 "setup_charged", "pinned_jobs")
 
     def __init__(self):
         self.job_key = None
         self.op_seq = None
+        self.op_idx = None             # index into job.ops of the op in the chuck
         self.remaining = 0.0
         self.last_key = None           # (item_code, op_seq) of the last job run
         self.segments = []
@@ -376,13 +406,35 @@ def _floor_for(js, op, floors):
     return floors.get((js.job.key, op.seq))
 
 
-def _ready_at(js, op, floors):
+def _ready_at(js, idx, op, floors):
     """When this op may start: its routing/overlap readiness, floored by the
     solved start. This is THE one definition — every place that asks "can it go
     yet" goes through it, or the floor would hold in one branch and not another."""
-    ready = js.ready
+    ready = js.ready_of[idx]
     floor = _floor_for(js, op, floors)
     return ready if floor is None else max(ready, floor)
+
+
+def _startable(js):
+    """``(index, op)`` for every op of this job a machine may pick up NOW —
+    released, not finished, and not already in some machine's chuck.
+
+    Yielded in routing order, so a machine offered two ops of one job takes the
+    earlier step first. Nothing here is a CHOICE: an op is startable iff the
+    genome's release said so.
+
+    ``js.running`` is belt-and-braces and is measured as such: every op has
+    exactly ONE machine in ``assigned``, and that machine holds it in
+    ``_MachineState.job_key`` until it is finished, so no second machine can
+    reach it anyway (dropping this clause kills no test and moves nothing on
+    three shop-sized books). It is kept because the claim used to be per-JOB and
+    is now per-OP; leaving the concept out entirely would make the next reader
+    believe an op in a chuck is still on offer.
+    """
+    for idx in sorted(js.ready_of):
+        if idx in js.done or idx in js.running:
+            continue
+        yield idx, js.job.ops[idx]
 
 
 def _assign(order, state, machine_of, rostered_machines) -> tuple:
@@ -605,22 +657,43 @@ def _settle_milestones(state, now, completion, floors) -> list:
     immediate predecessor's release point — an order is dispatched only once
     every piece has cleared every process (RULES.md:305). ``js.prev_end`` is
     exactly that running maximum.
+
+    **A milestone is settled ONLY at the front of its routing** (``js.idx`` — the
+    earliest op not yet finished), never off the concurrency the rest of this
+    module now allows. At the front every earlier step is FINISHED, so
+    ``prev_end`` really is the batch's latest end and a milestone cannot be
+    stamped before the work it follows.
+
+    Its REDUNDANCY is measured, not assumed, exactly as ``_pace``'s is: letting a
+    milestone settle off any released op instead kills no test AND moves nothing
+    on three shop-sized solved books (57-59 batches; identical late-days, drift
+    rows and rule checks). ``_pace`` repairs the published dates afterwards
+    either way. It is kept because it is the direct statement of the rule — a
+    milestone belongs after the work it marks — and because ``_pace`` is a
+    reporting sweep, not a scheduling one: the moment anything reads
+    ``prev_end`` for a DECISION rather than a date, the front rule is what makes
+    that read correct.
     """
     out = []
     progressed = True
     while progressed:
         progressed = False
         for js in state.values():
-            op = _current_op(js)
-            if op is None:
+            idx = js.idx
+            if idx >= len(js.job.ops) or idx in js.running:
                 continue
+            if idx not in js.ready_of:
+                continue          # not released yet
+            op = js.job.ops[idx]
             qty = js.job.qty_for(op.seq)
             if op.kind == OUTSOURCED:
-                # Fully sequential both sides: nothing overlaps INTO a vendor
-                # block and js.ready is its predecessor's end. An OS step IS a
+                # Fully sequential both sides: ``_overlaps`` is false whenever
+                # either side is OUTSOURCED, so nothing ever releases INTO a
+                # vendor block and ``ready_of`` here is its predecessor's end —
+                # set by ``_seal``, not by ``_release``. An OS step IS a
                 # task in the model (a mode on the OS pool), so it carries a
                 # solved start and is floored like any other.
-                start = _ready_at(js, op, floors)
+                start = _ready_at(js, idx, op, floors)
                 if start > now:
                     continue
                 lead = float(op.cycle_min or 0.0)
@@ -628,55 +701,78 @@ def _settle_milestones(state, now, completion, floors) -> list:
                 out.append(Placement(js.job.key, op.seq, op.name, OUTSOURCED,
                                      None, int(max(qty, 0)), start, end, lead,
                                      ()))
-                _advance(js, end, completion)
+                _seal(js, idx, end, completion)
             elif op.kind == DISPATCH:
-                # ``prev_end`` is the running maximum, ``ready`` the release
-                # moment. They are provably equal here — ``_release_successor``
-                # only sets a release when ``_overlaps(op, nxt)``, and a DISPATCH
-                # successor is never in ``_INHOUSE`` — so this is belt-and-braces
-                # (measured: mutating it to ``js.ready`` kills no test). It is
-                # kept because it is the direct statement of RULES.md:305, and
-                # the equality stops holding the moment anything releases past a
+                # ``prev_end`` is the running maximum, ``ready_of`` the release
+                # moment. They are provably equal here — ``_release`` only sets a
+                # release when ``_overlaps(op, nxt)``, and a DISPATCH successor is
+                # never in ``_INHOUSE`` — so this is belt-and-braces (measured:
+                # mutating it to the release moment kills no test). It is kept
+                # because it is the direct statement of RULES.md:305, and the
+                # equality stops holding the moment anything releases past a
                 # milestone.
                 at = js.prev_end
                 if at > now:
                     continue
                 out.append(Placement(js.job.key, op.seq, op.name, DISPATCH, None,
                                      int(max(qty, 0)), at, at, 0.0, ()))
-                _advance(js, at, completion)
+                _seal(js, idx, at, completion)
             elif qty <= 0 or not op.machine_options:
                 # Nothing left to make at this step (a re-plan's already-finished
                 # process): a visible zero-duration milestone, never a silent skip.
-                at = max(js.ready, js.prev_end)
+                at = max(js.ready_of[idx], js.prev_end)
                 if at > now:
                     continue
                 out.append(Placement(js.job.key, op.seq, op.name, op.kind, None,
                                      0, at, at, 0.0, ()))
-                _advance(js, at, completion)
+                _seal(js, idx, at, completion)
             else:
                 continue                  # needs a machine; the shift loop has it
             progressed = True
     return out
 
 
-def _advance(js, end_at, completion):
-    """Record that the current op finished at ``end_at`` and open the next one."""
+def _seal(js, idx, end_at, completion):
+    """Record that op ``idx`` finished at ``end_at``.
+
+    The successor is normally already open by now — ``_release`` fires the
+    instant the pieces clear, in the middle of the operation. This is the
+    FALLBACK for the pairs that do not pipeline at all (OS on either side, a
+    milestone, a zero-cycle step): they wait for the whole batch, which is
+    ``prev_end``, the running maximum across every op finished so far.
+    """
+    js.done.add(idx)
+    js.running.pop(idx, None)
     js.prev_end = max(js.prev_end, end_at)
-    js.idx += 1
-    js.worked = 0.0
-    js.on_machine = None
-    if _current_op(js) is None:
+    while js.idx < len(js.job.ops) and js.idx in js.done:
+        js.idx += 1
+    nxt = idx + 1
+    if nxt < len(js.job.ops) and nxt not in js.ready_of:
+        js.ready_of[nxt] = js.prev_end
+    if len(js.done) == len(js.job.ops):
         completion[js.job.key] = js.prev_end
-    else:
-        # THE overlap rule, in one line: the next step opens at the moment whole
-        # pieces cleared this one, and only falls back to "when it finished" when
-        # nothing pipelines (OS, a milestone, a zero-cycle step, k == qty).
-        js.ready = js.released_at if js.released_at is not None else js.prev_end
-    js.released_at = None
 
 
-def _release_successor(js, op, segments, overlap_of, config, setup_charged):
+def _release(js, idx, op, segments, overlap_of, config, setup_charged):
     """Open the next operation once ``k`` whole pieces have cleared this one.
+
+    **Called after EVERY work slice, not once the machine finally lets go.** That
+    is the whole of the concurrency fix: ``rules.add_release`` bounds the
+    successor's START against a linear expression that fires mid-operation, and a
+    decoder that waited for the predecessor to leave the chuck published a
+    different plan from the one that was solved — a single-shift bench released
+    at 19:30 has closed, and the next window is a day or two away over the weekly
+    off. It is now released at 19:30 minus the tail, while the bench is open.
+
+    Idempotent: once an op is in ``ready_of`` it is never re-opened, so the
+    release moment is the FIRST slice that covered the pieces and can never slide
+    later as more slices are laid. That guard is a STATEMENT, not a fix —
+    ``_release_moment`` walks the segments from the beginning every time and is
+    a pure function of them, so recomputing gives the same answer (measured:
+    dropping the guard kills no test and moves nothing on three shop-sized
+    books). It stays because "the release is the moment the pieces cleared" must
+    be true by construction and not by an accident of how the walk happens to be
+    written.
 
     ``setup_charged`` is the setup this machine ACTUALLY put in the segments, not
     the nominal ``config.setup_time_min``: a repeat of the same (item, process)
@@ -684,26 +780,34 @@ def _release_successor(js, op, segments, overlap_of, config, setup_charged):
     same expression ``rules._setup_charged`` reads off the model — one setup, two
     layers, never two definitions.
     """
-    js.released_at = None
-    if js.idx + 1 >= len(js.job.ops):
+    nxt = idx + 1
+    if nxt >= len(js.job.ops) or nxt in js.ready_of:
         return
-    nxt = js.job.ops[js.idx + 1]
-    if not _overlaps(op, nxt):
+    if not _overlaps(op, js.job.ops[nxt]):
         return
     pieces = _released_pieces(js.job, op, overlap_of, config)
     need = setup_charged + pieces * float(op.cycle_min or 0.0)
-    js.released_at = _release_moment(segments, need)
+    when = _release_moment(segments, need)
+    if when is not None:
+        js.ready_of[nxt] = when
 
 
 def _release_moment(segments, need: float):
     """The wall-clock instant at which the machine had done ``need`` minutes of
-    WORK on this operation.
+    WORK on this operation, or None if it has not done that much YET.
 
     Worked minutes, not elapsed — this is the exact half of the pair. An
     operation held overnight, or over the weekly off, cuts nothing in the gap;
     measuring from the operation's start would release pieces in the middle of a
     dark shop, and the CP model's own bounds are wall-clock precisely because a
     linear constraint cannot express this walk (spec §5.3).
+
+    **None, never the last segment's end.** This is asked after every slice now,
+    so "the segments so far do not add up to ``need``" is the ordinary mid-
+    operation answer and must not be rounded up into a release. By the time the
+    operation completes the walk always finds the moment — ``need`` is
+    ``setup + k x cycle`` and the segments total ``setup + qty x cycle`` with
+    ``k <= qty`` — so nothing is lost by refusing to guess.
     """
     done = 0.0
     for seg_start, seg_end, _who in segments:
@@ -711,7 +815,7 @@ def _release_moment(segments, need: float):
         if done + span >= need - _EPS:
             return seg_start + timedelta(minutes=max(0.0, need - done))
         done += span
-    return segments[-1][1] if segments else None
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -730,7 +834,9 @@ def _pending_escape_machines(order, state, assigned, fallback_ops) -> set:
     out = set()
     for key in order:
         js = state[key]
-        for op in js.job.ops[js.idx:]:
+        for idx, op in enumerate(js.job.ops):
+            if idx in js.done:
+                continue
             if (key, op.seq) in fallback_ops:
                 mid = assigned.get((key, op.seq))
                 if mid is not None:
@@ -784,20 +890,18 @@ def _first_work_moment(mid, ms, order, state, assigned, floors, cursor, window,
     best = None
     for rank, key in enumerate(order):
         js = state[key]
-        if js.on_machine is not None:
-            continue
-        op = _current_op(js)
-        if op is None or assigned.get((key, op.seq)) != mid:
-            continue
-        if only is not None and (key, op.seq) not in only:
-            continue
-        if js.job.qty_for(op.seq) <= 0:
-            continue
-        when = max(cursor, _ready_at(js, op, floors))
-        if when >= window.end:
-            continue
-        if best is None or (when, rank) < best:
-            best = (when, rank)
+        for idx, op in _startable(js):
+            if assigned.get((key, op.seq)) != mid:
+                continue
+            if only is not None and (key, op.seq) not in only:
+                continue
+            if js.job.qty_for(op.seq) <= 0:
+                continue
+            when = max(cursor, _ready_at(js, idx, op, floors))
+            if when >= window.end:
+                continue
+            if best is None or (when, rank) < best:
+                best = (when, rank)
     return best
 
 
@@ -1007,7 +1111,7 @@ def _bench_run_minutes(mid, ms, order, state, assigned, floors, shop, window,
                                   start, only)
         if picked is None:
             return None
-        js, op = picked
+        js, _idx, op = picked
         setup = _setup_for(js, op, ms, mid, shop, setup_min)
         remaining = setup + js.job.qty_for(op.seq) * float(op.cycle_min or 0.0)
         task_key = (js.job.key, op.seq)
@@ -1021,34 +1125,34 @@ def _next_on_machine(mid, ms, order, state, assigned, floors, now, only=None):
     A part the machine is already physically holding goes first, in previous-plan
     start order (the shop cannot start a new part in a chuck that already holds a
     half-finished one); everything else follows the genome's job order. The claim
-    (``js.on_machine``) is what stops one batch being built twice; here it can
-    only ever be this machine, because the assignment is fixed before the walk
-    starts, but it still guards a job from being picked up twice within a shift.
+    (``_JobState.running``) is what stops one OPERATION being built twice; it is
+    per-op, not per-job, because a job may now legitimately have two ops in flight
+    on two different machines. Within a job the earlier routing step is offered
+    first (``_startable`` yields in routing order).
+
+    Returns ``(job state, op index, op)``. The index is carried because the op's
+    position in the routing is no longer recoverable from a single cursor.
     """
     for _rank, _pos, key in ms.pinned_jobs:
         js = state[key]
-        if js.on_machine is not None:
-            continue
-        op = _current_op(js)
-        if op is None or js.pinned.get(op.seq) != mid:
-            continue          # that part has moved on; this pin is spent
-        if only is not None and (key, op.seq) not in only:
-            continue
-        if _ready_at(js, op, floors) > now or js.job.qty_for(op.seq) <= 0:
-            continue
-        return js, op
+        for idx, op in _startable(js):
+            if js.pinned.get(op.seq) != mid:
+                continue          # that part has moved on; this pin is spent
+            if only is not None and (key, op.seq) not in only:
+                continue
+            if _ready_at(js, idx, op, floors) > now or js.job.qty_for(op.seq) <= 0:
+                continue
+            return js, idx, op
     for key in order:
         js = state[key]
-        if js.on_machine is not None:
-            continue
-        op = _current_op(js)
-        if op is None or assigned.get((key, op.seq)) != mid:
-            continue
-        if only is not None and (key, op.seq) not in only:
-            continue          # an ESCAPE-staffed shift runs only what it was opened for
-        if _ready_at(js, op, floors) > now or js.job.qty_for(op.seq) <= 0:
-            continue
-        return js, op
+        for idx, op in _startable(js):
+            if assigned.get((key, op.seq)) != mid:
+                continue
+            if only is not None and (key, op.seq) not in only:
+                continue      # an ESCAPE-staffed shift runs only what it was opened for
+            if _ready_at(js, idx, op, floors) > now or js.job.qty_for(op.seq) <= 0:
+                continue
+            return js, idx, op
     return None
 
 
@@ -1059,20 +1163,18 @@ def _earliest_ready(mid, order, state, assigned, floors, after, before,
     best = None
     for key in order:
         js = state[key]
-        if js.on_machine is not None:
-            continue
-        op = _current_op(js)
-        if op is None or assigned.get((key, op.seq)) != mid:
-            continue
-        if only is not None and (key, op.seq) not in only:
-            continue
-        if js.job.qty_for(op.seq) <= 0:
-            continue
-        ready = _ready_at(js, op, floors)
-        if ready <= after or ready >= before:
-            continue
-        if best is None or ready < best:
-            best = ready
+        for idx, op in _startable(js):
+            if assigned.get((key, op.seq)) != mid:
+                continue
+            if only is not None and (key, op.seq) not in only:
+                continue
+            if js.job.qty_for(op.seq) <= 0:
+                continue
+            ready = _ready_at(js, idx, op, floors)
+            if ready <= after or ready >= before:
+                continue
+            if best is None or ready < best:
+                best = ready
     return best
 
 
@@ -1090,21 +1192,29 @@ def _work(mid, ms, order, state, assigned, floors, shop, window, start,
                                   start, only)
         if picked is None:
             return window.end                     # nothing to do; park it
-        js, op = picked
+        js, idx, op = picked
         setup = _setup_for(js, op, ms, mid, shop, setup_min)
-        ms.job_key, ms.op_seq = js.job.key, op.seq
+        ms.job_key, ms.op_seq, ms.op_idx = js.job.key, op.seq, idx
         ms.remaining = setup + js.job.qty_for(op.seq) * float(op.cycle_min or 0.0)
         ms.setup_charged = setup
         ms.segments, ms.started = [], None
         # This step may not END before the steps feeding it did: it cannot finish
-        # pieces its predecessor has not delivered. Captured at claim time, when
-        # the predecessor is by construction already finished.
+        # pieces its predecessor has not delivered.
+        #
+        # It is the ends of the FINISHED steps, and since a predecessor may now
+        # still be in a chuck when this one is claimed, that is a floor rather
+        # than the final answer. The published plan is repaired by ``_pace``,
+        # which sweeps the whole routing once every end is known and is exactly
+        # why that sweep is kept. What this floor still buys is machine OCCUPANCY:
+        # where the predecessor IS finished (every non-overlapping pair, and every
+        # overlap whose feeder happened to finish first) the machine is held to
+        # the paced end and nothing is dropped into the tail.
         ms.pace_floor = js.prev_end
-        js.on_machine = mid
-        js.worked = 0.0
+        js.running[idx] = mid
 
     js = state[ms.job_key]
-    op = js.job.ops[js.idx]
+    idx = ms.op_idx
+    op = js.job.ops[idx]
 
     if ms.remaining > _EPS:
         take = min(ms.remaining, (window.end - start).total_seconds() / 60.0)
@@ -1115,7 +1225,12 @@ def _work(mid, ms, order, state, assigned, floors, shop, window, start,
         if ms.started is None:
             ms.started = start
         ms.remaining -= take
-        js.worked += take
+        # THE CONCURRENCY FIX. The successor opens the instant the pieces cleared
+        # — mid-operation, on the slice that cleared them — not when the machine
+        # finally lets go. It can then be picked up by ANOTHER machine in this
+        # same shift, which is what ``rules.add_release`` always permitted and
+        # what this loop used to make impossible.
+        _release(js, idx, op, ms.segments, overlap_of, config, ms.setup_charged)
         if ms.remaining > _EPS:
             return seg_end                        # still in the chuck next step
     else:
@@ -1135,10 +1250,9 @@ def _work(mid, ms, order, state, assigned, floors, shop, window, start,
                                 work, tuple(ms.segments)))
     ms.last_key = (js.job.item_code, op.seq)
     ms.busy_until = end
-    _release_successor(js, op, ms.segments, overlap_of, config, ms.setup_charged)
-    ms.job_key = ms.op_seq = ms.pace_floor = None
+    ms.job_key = ms.op_seq = ms.op_idx = ms.pace_floor = None
     ms.segments, ms.started, ms.setup_charged = [], None, 0.0
-    _advance(js, end, completion)
+    _seal(js, idx, end, completion)
     placements.extend(_settle_milestones(state, window.end, completion, floors))
     return end
 
@@ -1188,10 +1302,6 @@ def _pace(placements, completion) -> list:
 
 def _outstanding(state) -> bool:
     return any(js.idx < len(js.job.ops) for js in state.values())
-
-
-def _current_op(js):
-    return js.job.ops[js.idx] if js.idx < len(js.job.ops) else None
 
 
 def _blocked_row(js, shop, assigned):

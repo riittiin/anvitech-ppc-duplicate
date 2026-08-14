@@ -598,20 +598,27 @@ def test_a_solved_book_replays_with_ZERO_date_drift(hold):
     assert report.genome_stale(batches, masters, solved.genome) == []
 
 
-def test_the_minute_level_residual_is_one_sided_LATE(capsys):
-    """The residual the DATE check cannot see, asserted as what was MEASURED.
+def test_the_minute_level_residual_is_ZERO_and_never_EARLY(capsys):
+    """The residual the DATE check cannot see, asserted as what is MEASURED.
 
-    A LATE residual has ONE known cause (``decode._JobState`` tracks one op at a
-    time, so a successor cannot be released while its predecessor is still in the
-    chuck, while the model's release is a linear bound on start vars that fires
-    mid-operation) and it is conservative for the floor: work arrives earlier than
-    the sheet says. An EARLY one would mean the decoder handed itself capacity the
-    solver withheld — a defect — and this is the assertion that makes it fail
-    loudly rather than pass as "within tolerance".
+    It used to be one-sided LATE — up to +83 min on a generated harness and
+    +191 on an OS-blocks + scarce-crew shape — with ONE cause: ``decode``
+    tracked one op at a time, so a successor could not be released while its
+    predecessor was still in the chuck, while the model's release is a linear
+    bound on start vars that fires mid-operation. **That was fixed on
+    2026-08-14** (``decode._JobState`` now carries per-op state and ``_release``
+    runs after every work slice), and on this fixture — the single-shift-bench
+    shape that produced the worst of it — the residual is now exactly 0 under
+    BOTH encodings.
 
-    The worst value is DERIVED and REPORTED, never hardcoded: +83 and +191
-    minutes have both been observed on other books, and nothing establishes a
-    ceiling. A number that reads as a bound and is not one is worse than none.
+    Asserted at 0 rather than "<= something": a tolerance here is how an epsilon
+    creeps back in, and this repo's rule is to tighten the model, never loosen
+    the decoder. If a future change makes it non-zero, the number is the finding
+    — do not widen this.
+
+    EARLY is asserted separately and stays the louder failure: it would mean the
+    decoder handed itself capacity the solver withheld, which is a defect in a
+    direction no amount of conservatism excuses.
     """
     pytest.importorskip("pyjobshop")
     _m, _b, solved, plan = _solved_and_replayed(_single_shift_bench_book(),
@@ -622,49 +629,72 @@ def test_the_minute_level_residual_is_one_sided_LATE(capsys):
     assert len(residuals) == len(solved.completion)
     early = {k: v for k, v in residuals.items() if v < 0}
     assert not early, f"the replay finished EARLIER than the solve: {early}"
-    # NON-VACUITY, and the reason this fixture exists: it really does exercise the
-    # mechanism. If this ever fails because the decoder's concurrency was fixed,
-    # that is good news — drop this line, keep the one-sided assertion above.
-    assert max(residuals.values()) > 0, residuals
+    assert max(residuals.values()) == 0, residuals
     with capsys.disabled():
-        print(f"\n  minute-level residual over {len(residuals)} orders: worst "
-              f"+{max(residuals.values()):.0f} min (OBSERVED on this book; NOT a "
-              f"proven bound)")
+        print(f"\n  minute-level residual over {len(residuals)} orders: "
+              f"{max(residuals.values()):+.0f} min")
+
+
+def test_the_single_shift_bench_shape_replays_with_ZERO_date_drift():
+    """THE REGRESSION for the 2026-08-14 concurrency fix, on the shape that
+    exposed the defect.
+
+    This book is the owner's own: benches on the day shift only, one helper
+    covering them all, CNC batches long enough to span the 19:00 change. Under
+    the shipping E1 default, on a solve the solver calls OPTIMAL, it used to
+    drift **a full day on every order** — the decoder could not release DEBURING
+    until its CNC feeder left the chuck at 19:30, by which time the single-shift
+    bench had closed, and the next window was two days out across the weekly off.
+
+    It is now exactly 0, with no epsilon. Reverting the fix in ``decode.py``
+    brings the rows straight back, which is what makes this test worth its run
+    time rather than a tautology.
+    """
+    pytest.importorskip("pyjobshop")
+    masters, batches, solved, plan = _solved_and_replayed(
+        _single_shift_bench_book(), hold=False)
+    assert report.genome_stale(batches, masters, solved.genome) == []   # not stale
+    assert report.completion_drift(_entries(plan), solved.genome) == []
+    # Non-vacuous: every batch really was compared, and the shape really is the
+    # one described (a bench step whose feeder runs past the bench's close).
+    assert len(solved.genome["cp_completion"]) == len(batches)
+    feeders = {(p.job_key, p.op_seq): p for p in plan.placements}
+    assert any(feeders[(key, 2)].start < feeders[(key, 1)].end
+               for key in {p.job_key for p in plan.placements}), \
+        "no bench step overlaps its feeder — this book no longer tests the fix"
 
 
 def test_a_real_disagreement_between_solve_and_replay_is_CAUGHT(capsys):
     """The check earning its keep against a REAL solve, not a hand-made dict.
 
-    ⚠ AND A FINDING: completion-DATE drift is NOT universally 0. It is 0 across
-    every book measured so far (40 generated books / 280 orders, plus an
-    independent re-measurement, plus the contended fixture above under BOTH
-    encodings) — but on a single-shift-bench shop it is a FULL DAY, under the
-    shipping E1 default, on a book the solver calls OPTIMAL.
+    The disagreement is manufactured the one way that is honest: the replay is
+    given a DIFFERENT plan clock from the solve. Nothing in the genome survives
+    that — ``cp_roster`` is keyed on a shift index counted from ``plan_start``,
+    ``decode._windows`` rebuilds the calendar from it, and every solved-start
+    floor is clamped up to it — so the replay really is a different plan, and
+    ``completion_drift`` is what has to say so.
 
-    Cause, checked and not assumed, by reading both schedules op by op: the solve
-    starts DEBURING on MD1 while its CNC feeder is still cutting; the decoder
-    cannot release it until the feeder leaves the chuck at 19:30, by which time
-    the single-shift bench has closed — and the next window is two days out
-    across the weekly off. That is the documented one-op-at-a-time limitation,
-    amplified over a day boundary, not a new defect. Fixing it is a change to the
-    decoder's concurrency model, which this plan deliberately did not take on.
-
-    So the row this produces is the plan working as designed: loud, non-blocking,
-    and pointed at exactly the orders whose published dates are not the ones the
-    search optimised.
+    This is the state a stale genome reaches in production (a plan clock that
+    moved between the solve and the replay), so it is worth pinning against a
+    real solve rather than against a dict of dates somebody typed.
     """
     pytest.importorskip("pyjobshop")
-    masters, batches, solved, plan = _solved_and_replayed(
+    masters, batches, solved, _plan = _solved_and_replayed(
         _single_shift_bench_book(), hold=False)
-    rows = report.completion_drift(_entries(plan), solved.genome)
-    assert rows, "the fixture no longer drifts — see the docstring before editing"
-    assert report.genome_stale(batches, masters, solved.genome) == []   # not stale
+    jobs, _by_key, _skipped = domain.build_jobs(batches, masters)
+    shop = domain.build_shop(masters, {})
+    moved = decode.lay_out(jobs, shop, _cfg(), PLAN_START + timedelta(days=2),
+                           solved.genome)
+
+    rows = report.completion_drift(_entries(moved), solved.genome)
+    assert rows, "a two-day clock shift produced no disagreement at all"
+    assert report.genome_stale(batches, masters, solved.genome) == []   # book same
     for row in rows:
-        assert row["days"] > 0                       # late, never early
+        assert row["days"] > 0                       # later clock, later plan
         assert row["solved"] in row["message"]
         assert row["replayed"] in row["message"]
     with capsys.disabled():
-        print("\n  date drift on the single-shift-bench book: "
+        print("\n  date drift from a replay clock 2 days off the solve's: "
               + ", ".join(f"{r['batch_id']} {r['solved']}->{r['replayed']} "
                           f"(+{r['days']}d)" for r in rows))
 

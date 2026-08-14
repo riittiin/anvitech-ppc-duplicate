@@ -1012,6 +1012,178 @@ def test_no_op_in_a_replayed_solve_starts_before_the_solver_put_it():
 
 
 # --------------------------------------------------------------------------- #
+# Concurrency — two ops of ONE job, in flight at once (2026-08-14)
+#
+# THE DEFECT THESE PIN. The decoder used to track one op at a time, so a
+# successor could not be released while its predecessor was still in the chuck.
+# The CP model's release (``rules.add_release``) is a linear bound on start
+# variables that fires MID-OPERATION, so the model overlapped and the decoder
+# serialised — and a single-shift bench whose feeder finished after 19:00 lost
+# the whole day, or two days across the weekly off. Measured on a 58-batch
+# same-shape proxy of the owner's book: the solve reported 285 late-days and the
+# published replay 310, drifting on 11 of 57 batches, worst +8 days. After the
+# fix: 285 and 285, 0 batches, 0 rule breaches.
+#
+# Every case below is SOLVER-LESS on purpose — this is the replay path, and it
+# runs on a box with neither pyjobshop nor ortools.
+# --------------------------------------------------------------------------- #
+
+def _bench_after_a_spanning_cnc(k):
+    """150 pieces of turning on a two-shift CNC feeding a single-shift bench.
+
+    The CNC runs 08:00-19:00 on Wed 12-08 and 19:00-22:00 that night — 90 minutes
+    of setup plus 750 of cutting. MD1 closes at 19:00 and 13-08 is the weekly
+    off, so a successor that has to wait for the CNC to leave the chuck does not
+    get a bench until **Fri 14-08 08:00**. ``k`` is the release: at 1 piece the
+    bench is owed work from 09:35 that same morning.
+    """
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None, [
+            Process(1, "CNC FIRST SIDE", 5.0, None, None, "CNC1"),
+            Process(2, "DEBURING", 1.0, None, None, "MD1")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("S", "CNC1", ["CNC1"], "2nd shift"),
+         Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC1", i): ("N" if i % 2 == 0 else "S")
+                       for i in range(20)},
+         "cp_overlap_of": {"B1": k}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    return _lay(masters, [_B("B1", "A", 150)], g)
+
+
+def test_a_successor_starts_while_its_predecessor_is_still_in_the_chuck():
+    """THE FIX. The bench runs on the morning the pieces were cut, not two days
+    later once the CNC finally lets go.
+
+    Every number here is derived from the fixture, not tuned to the answer:
+    setup 90 + one piece at 5.0 = 95 minutes of WORK after 08:00, which is 09:35
+    because the shop is open right through it. The CNC does not finish until
+    22:00 that night — after the bench has closed — so before this fix the
+    deburring landed 14-08 08:00 and the order completed two days later than the
+    plan the search scored.
+    """
+    plan = _bench_after_a_spanning_cnc(k=1)
+    turning, bench = _op(plan, 1), _op(plan, 2)
+
+    assert turning.end == datetime(2026, 8, 12, 22, 0)     # spans the 19:00 change
+    assert bench.start == datetime(2026, 8, 12, 9, 35)     # setup + one piece
+    assert bench.start < turning.end                       # genuinely concurrent
+    # The bench really did its work inside its OWN single-shift window; the
+    # published end is paced out to the feeder's, which is a different thing.
+    assert all(e <= datetime(2026, 8, 12, 19, 0) for _s, e, _w in bench.segments)
+    assert bench.end >= turning.end                        # RULES.md:132 still holds
+    assert plan.completion["B1"] == datetime(2026, 8, 12, 22, 0)
+
+
+def test_the_mid_operation_release_still_waits_for_the_pieces_to_be_CUT():
+    """The guard on the fix, and the case that separates it from "release early".
+
+    At k = 120 the bench is owed 90 + 600 = 690 worked minutes. The first shift
+    delivers only 660 of them, so the release falls at 19:30 that night — after
+    MD1 has closed — and the bench correctly waits for Friday. A decoder that
+    released on the predecessor's START, or on wall clock, or on the first slice
+    regardless of how much of it was cut, gives an earlier answer here and is
+    wrong: it would deburr pieces nobody had turned.
+    """
+    plan = _bench_after_a_spanning_cnc(k=120)
+    bench = _op(plan, 2)
+    assert bench.start == datetime(2026, 8, 14, 8, 0)      # 13-08 is the weekly off
+
+
+def test_two_ops_of_one_job_in_flight_never_break_rule_2():
+    """Concurrency is per JOB, never per MACHINE. Rule 2 is untouched: an
+    operation runs to completion on one machine, uninterrupted, and no machine
+    runs two things at once.
+
+    Two jobs contend for the one bench while both their feeders are still
+    cutting, which is precisely the state the old one-op-at-a-time cursor made
+    unreachable — so this is the shape a concurrency bug would show up in.
+    """
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None, [
+            Process(1, "CNC FIRST SIDE", 5.0, None, None, "CNC1"),
+            Process(2, "DEBURING", 1.0, None, None, "MD1")]),
+         "B": Routing("B", "b", "cust", "rm", None, [
+             Process(1, "CNC FIRST SIDE", 5.0, None, None, "CNC4"),
+             Process(2, "DEBURING", 1.0, None, None, "MD1")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("S", "CNC1", ["CNC1"], "2nd shift"),
+         Operator("P", "CNC4", ["CNC4"], "First shift"),
+         Operator("Q", "CNC4", ["CNC4"], "2nd shift"),
+         Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 2): "MD1",
+                           ("B2", 1): "CNC4", ("B2", 2): "MD1"},
+         "cp_roster": {**{("CNC1", i): ("N" if i % 2 == 0 else "S")
+                          for i in range(20)},
+                       **{("CNC4", i): ("P" if i % 2 == 0 else "Q")
+                          for i in range(20)}},
+         "cp_overlap_of": {"B1": 1, "B2": 1},
+         "ranks": {"SO-B1\x1fA": 1, "SO-B2\x1fB": 2},
+         "cp_completion": {}, "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 150), _B("B2", "B", 150)], g)
+
+    # Non-vacuous: both benches really did start before their own feeder ended.
+    for key in ("B1", "B2"):
+        feeder = [p for p in plan.placements
+                  if p.job_key == key and p.op_seq == 1][0]
+        bench = [p for p in plan.placements
+                 if p.job_key == key and p.op_seq == 2][0]
+        assert bench.start < feeder.end, key
+
+    by_machine: dict = {}
+    for p in plan.placements:
+        if p.machine is None:
+            continue
+        # Rule 2: one operation, one machine, never sliced into pieces some
+        # other job was squeezed between.
+        for (s1, e1, _w1), (s2, e2, _w2) in zip(p.segments, p.segments[1:]):
+            assert e1 == s2, p
+        by_machine.setdefault(p.machine, []).extend(
+            (s, e, p) for s, e, _w in p.segments)
+    for mid, spans in by_machine.items():
+        spans.sort()
+        for (s1, e1, p1), (s2, _e2, p2) in zip(spans, spans[1:]):
+            assert s2 >= e1, f"{mid} runs {p1.job_key}/{p1.op_seq} and " \
+                             f"{p2.job_key}/{p2.op_seq} at once"
+
+
+def test_dispatch_still_waits_for_the_whole_batch_when_steps_overlap():
+    """RULES.md:305 under concurrency. The bench finishes its WORK at 12:05 while
+    the turning runs to 22:00; an order is dispatched only once every piece has
+    cleared every process, so the milestone belongs at 22:00, not at 12:05.
+
+    What this pins is the OUTCOME, and the outcome has two guards: milestones
+    settle only at the front of the routing, and ``_pace`` sweeps the published
+    ends afterwards. Measured: neutering the front rule alone leaves this test
+    green and moves nothing on three shop-sized books — ``_pace`` catches it —
+    so this test credits neither guard individually. It fails when the
+    concurrency itself is reverted, because then the bench never overlaps at all
+    and the first assertion goes.
+    """
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None, [
+            Process(1, "CNC FIRST SIDE", 5.0, None, None, "CNC1"),
+            Process(2, "DEBURING", 1.0, None, None, "MD1"),
+            Process(3, "DISPATCH", 0.0, None, None, "")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("S", "CNC1", ["CNC1"], "2nd shift"),
+         Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC1", i): ("N" if i % 2 == 0 else "S")
+                       for i in range(20)},
+         "cp_overlap_of": {"B1": 1}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 150)], g)
+
+    turning, bench, dispatch = _op(plan, 1), _op(plan, 2), _op(plan, 3)
+    assert bench.start < turning.end                       # concurrency fired
+    assert bench.segments[-1][1] == datetime(2026, 8, 12, 12, 5)   # work done at 12:05
+    assert dispatch.start == dispatch.end == datetime(2026, 8, 12, 22, 0)
+    assert dispatch.end == max(p.end for p in plan.placements)
+
+
+# --------------------------------------------------------------------------- #
 # The replay path runs on Render
 # --------------------------------------------------------------------------- #
 

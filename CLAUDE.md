@@ -70,38 +70,62 @@
 >   left-shifting decoder can never reproduce at any book size (on one book, 17 of
 >   21 ops replayed EARLIER). Fixed by carrying `cp_start_of` (the solved start, a
 >   HARD FLOOR) and `cp_bench_of` (the bench operator, which the genome was
->   discarding because Rule 1 rosters CNC/VMC only). Now: **completion-DATE drift is
->   EXACTLY 0 across 40 books / 280 orders — but that is an EMPIRICAL result on
->   CONTENDED books, NOT an invariant.** Task 10 built the owner's own shape by hand
->   — single-shift benches fed by CNC batches that run past 19:00 — and it drifts
->   **+1 FULL DAY on every order**, under the shipping E1 default, on an OPTIMAL
->   solve: the decoder cannot release the bench step until the feeder leaves the
->   chuck at 19:30, by which time the single-shift bench has closed, and the next
->   window is two days out over the weekly off. Same one-op-at-a-time cause as the
->   minute residual below, amplified across a day boundary. **The published plan can
->   therefore be a day later per order than the number the search optimised, on
->   precisely this shop's shape. NEVER "fix" this by loosening the drift check.**
->   **Task 13 reproduced it end to end on the repo's OWN generated book** (whose
->   benches are single-shift, like his) and found a SECOND, larger amplifier:
->   **the ROSTER GAP.** An op that slips past the shift the solve rostered its
->   machine for lands in a shift `cp_roster` deliberately left dark
->   (`decode._Crew.staff`'s fourth case) and waits for that machine's NEXT rostered
->   shift — read off the genome, VMC1's rostered shifts ran `[… 14, 15, 50, 96 …]`,
->   so one overrun cost **20 days**; +17, +59 and +5 have also been observed.
->   `decode._assign` documents this for a NEW order arriving after the solve; that
->   it also catches a SOLVED order whose replay slipped was not known. Magnitudes
->   are budget-dependent (the same book at a 12 s budget drifts +1/+1/+2), so
->   `tests/test_cp_end_to_end.py` asserts only what is true: drift EXISTS on that
->   shape and is one-sided LATE, with the numbers printed. On a CONTENDED book with
->   two-shift benches it is exactly 0, asserted with no epsilon.
->   A one-sided **LATE** residual remains
->   at MINUTE resolution — **+83 min and +191 min are OBSERVED VALUES, not a proven
->   bound; nothing establishes a ceiling** — because the decoder's `_JobState` tracks
->   one op at a time and cannot release a successor while its predecessor is in the
->   chuck, while the CP release is a linear bound that fires mid-operation. It is
->   INHERITED (the greedy engine has the same job state), it moves no published
->   date, and its remedy is named in `decode.py`'s docstring. **If a shift-wise
->   mismatch is ever reported, look here first.**
+>   discarding because Rule 1 rosters CNC/VMC only).
+>   **🔴 THEN THE DECODER SERIALISED WHAT THE MODEL OVERLAPPED — 210 LATE-DAYS LOST
+>   BETWEEN THE SOLVE AND THE SCREEN, FIXED 2026-08-14
+>   (`.superpowers/sdd/2026-08-14-cp-scheduler-optimizer/drift-fix-report.md`).**
+>   The solver solved the owner's book at **455** total late-days; the published
+>   replay measured **665**. Cause, single: `decode._JobState` tracked **one op at a
+>   time**, so a successor could not be released while its predecessor was still in
+>   the chuck — while `rules.add_release` is a linear bound on start variables that
+>   fires **mid-operation** (k ≡ 1, maximum overlap, always). Invisible inside one
+>   shift (the decoder could place the successor retroactively); ruinous the moment
+>   the feeder **spans a shift boundary**, which is this shop's shape: CNC batches
+>   run past 19:00 and the benches that eat their output (MD/MW/MPK/MI/CMM/DTC) close
+>   at 19:00. The CNC finished at 22:00, the deburring was not offered until then,
+>   the bench had shut, and the next window was the next day — or **two days across
+>   the weekly off**. The **ROSTER GAP** (Task 13's second amplifier, +17/+20/+59
+>   days: an op that slipped past the shift `cp_roster` reserved its machine for
+>   landed in a deliberately dark shift and waited for that machine's NEXT rostered
+>   shift) was the SAME cause one step downstream and needed no separate fix — an op
+>   that no longer slips does not miss its rostered shift.
+>   **The fix, in `cp_engine/decode.py` alone:** `_JobState` carries per-op state
+>   (`ready_of` / `running` / `done` / `ends`) instead of one cursor, and `_release`
+>   is called **after every work slice**, so a successor opens on the slice that
+>   cleared the pieces and another machine can pick it up in the same shift.
+>   `_release_moment` returns **None** rather than guessing when the pieces are not
+>   yet cut (its old "last segment end" fallback would release work nobody had made).
+>   **Rule 2 and Rule 1 are untouched** — an operation still runs to completion on
+>   ONE machine, uninterrupted, no machine runs two things at once, staffing is
+>   whole-shift; what is now allowed is two ops of one **job** on two **different**
+>   machines, which is what the model always allowed. The release is still **exact
+>   worked minutes**, never wall clock. `cp_start_of` floors are untouched.
+>   **Measured on three frozen genomes at his scale and shape** (57-59 batches, 71 SO
+>   lines, 26 machines, single-shift benches, genuinely tardy; solve once, replay
+>   before/after so the nondeterministic solver is not what is being measured):
+>   gap **+25 / +47 / +35 → 0 / +2 / 0 late-days**, i.e. **107 → 2, 98% closed**;
+>   batches drifting **58 → 1**; **0 EARLY drift** and **0 rule breaches**
+>   throughout. Minute-level residual on the fixtures that first exposed it: was up
+>   to +83 / +191 min, now **exactly 0** under both E1 and E2. Suite 1734 → **1739**.
+>   Mutation table in the report: 6 killed, 2 survivors (`_settle_milestones`'
+>   front-of-routing rule and the per-op `running` claim), both re-measured on three
+>   shop-sized books and **plan-neutral** — genuinely redundant, and their docstrings
+>   now say so rather than claiming to be load-bearing.
+>   **Still open, deliberately: +2 late-days on ONE batch**, and it is a DIFFERENT
+>   mechanism — `INSP` starts inside its bench window at 18:37, needs 30 min, and the
+>   bench closes at 19:00, so the decoder **holds the part across the dark shift**
+>   (Rule 2 as written) while the shipping **E1** model forbids an operation spanning
+>   one at all. Closing it means shipping E2 (measured unusable at his scale) or
+>   letting the decoder refuse a start it cannot finish — a scheduling DECISION the
+>   decoder must not make. **NEVER "fix" any of this by loosening the drift check:
+>   there is no epsilon in `report.completion_drift` and there must never be one.**
+>   **NOT YET RUN ON HIS REAL BOOK** — everything above is a same-shape proxy with no
+>   work in progress. Run `scripts/tardiness_bound.py --model cp --seed-engine`
+>   against the live store before quoting a number to him; it prints the
+>   replay-vs-solve drift line directly. **If a shift-wise mismatch is ever reported,
+>   look here first.** The sibling greedy engine (`roster_engine/scheduler.py`) still
+>   has the identical one-op-at-a-time job state; it is not on the CP path and was
+>   not touched.
 >   **Rules this cost us, each paid for twice:** (1) **a modelling decision must be
 >   keyed on the MACHINE a step lands on, never on the step's `op.kind`** — kind is
 >   read from the FIRST machine option and Allotted sorts first, so an Allotted

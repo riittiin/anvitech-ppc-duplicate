@@ -400,39 +400,51 @@ _TIGHTNESS = {
 
 
 @pytest.mark.parametrize("bench_shape", [10, 0], indirect=True)
-def test_the_owners_single_shift_bench_shape_DRIFTS_and_it_is_recorded(
+def test_the_owners_single_shift_bench_shape_REPLAYS_WITH_ZERO_DRIFT(
         bench_shape, capsys):
-    """Completion-DATE drift is 0 on a contended book and NOT an invariant.
+    """Completion-DATE drift on the owner's own shop shape, end to end.
 
-    This is the owner's own shop shape — benches on the day shift only, fed by
-    CNC batches that run past 19:00 — on the repo's own generated book, so it is
-    not a fixture built to fail. What is asserted is what is TRUE and what
-    matters: drift exists, and it is one-sided **LATE**. Late is conservative
-    for the floor (work arrives earlier than the sheet says). EARLY would mean
-    the decoder handed itself capacity the solver withheld, which is a defect,
-    and that is the direction this test makes fail loudly.
+    Benches on the day shift only, fed by CNC batches that run past 19:00, on
+    the repo's own generated book — not a fixture built to pass. Until
+    2026-08-14 this book DRIFTED, always LATE: +1 day on 2-8 of 13 batches with
+    the dates pulled in, and +17 / +20 / +59 days on a batch or two with them
+    left loose (the second magnitude was the ROSTER GAP — an op that slipped past
+    the shift the solve rostered its machine for landed in a shift ``cp_roster``
+    had deliberately left dark and waited for that machine's next rostered
+    shift). Both amplifiers sat on top of one cause: the decoder could not
+    release a successor while its predecessor was still in the chuck.
 
-    The magnitudes are PRINTED, never asserted: they are wall-clock dependent
-    and nothing establishes a ceiling. Observed 2026-08-14 on this book: +1 day
-    on 2-8 of 13 batches with the dates pulled in, and +17 / +20 days on two
-    batches with them left loose.
+    With that fixed it is **0, exactly, with no epsilon**, at both tightnesses.
+    The roster gap went with it: an op that no longer slips does not miss the
+    shift it was rostered for.
+
+    ⚠ **THIS CASE SOLVES, under a WALL-CLOCK budget, so its genome is not
+    byte-stable between runs.** Measured over ~24 solves against the fixed
+    decoder: 23 gave zero drift and one gave a row (observed while mutating an
+    unrelated, provably no-op guard, which is what identified it as solve
+    variance rather than a decoder defect). So a rare failure here is NOT
+    automatically a regression — and it is NOT a reason to widen this assertion
+    either (spec §5.3: tighten the model, never loosen the decoder).
+
+    **If it fails, run the four solver-less cases in ``tests/test_cp_decode.py``
+    first** (``test_a_successor_starts_while_its_predecessor_is_still_in_the_chuck``
+    and its neighbours). Those are deterministic and are what actually pin the
+    concurrency contract; if they are green, the row printed below is a property
+    of that particular solve and belongs in the ledger as a number, not in this
+    file as a tolerance.
     """
     rows = cp_report.completion_drift(bench_shape.entries, bench_shape.genome)
-    assert rows, ("this book no longer drifts. That is GOOD NEWS, not a broken "
-                  "test — read this file's module docstring, confirm the "
-                  "decoder's concurrency was fixed, and delete this case rather "
-                  "than weakening the zero-drift assertion above.")
-    for row in rows:
-        assert row["days"] > 0, row          # LATE, never EARLY
-        assert row["solved"] in row["message"]
-        assert row["replayed"] in row["message"]
-    # The genome is not stale — the drift is the replay's, not a moved book.
+    # The genome is not stale — any drift would be the replay's, not a moved book.
     assert cp_report.genome_stale(bench_shape.batches, bench_shape.masters,
                                   bench_shape.genome) == []
+    assert rows == [], (
+        "the owner's bench shape drifts again: "
+        + ", ".join(f"{r['batch_id']} {r['solved']}->{r['replayed']} "
+                    f"({r['days']:+d}d)" for r in rows[:8])
+        + " — read this test's docstring before touching the assertion")
     with capsys.disabled():
-        print(f"\n  scaled book, {_TIGHTNESS[bench_shape.due_shift]}:\n    "
-              + ", ".join(f"{r['batch_id']} {r['solved']}->{r['replayed']} "
-                          f"(+{r['days']}d)" for r in rows[:8]))
+        print(f"\n  scaled book, {_TIGHTNESS[bench_shape.due_shift]}: "
+              f"0 batches drifted of {len({e.batch_id for e in bench_shape.entries})}")
 
 
 # --------------------------------------------------------------------------- #
