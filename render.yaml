@@ -62,8 +62,23 @@ services:
       # box, so waiting would just add 3 idle minutes to every run.
       - key: ORACLE_CLAIM_TIMEOUT_MIN
         value: "0"
-      # Run the new operator-stable engine in production. The code default is 'classic'
-      # (kept for the test suite that validates that engine); this makes the deployed app
-      # use the new engine unless an admin explicitly picks another in Settings.
+      # Run the CP (constraint-programming) engine in production. The code default is
+      # 'classic' (kept for the test suite that validates that engine); this makes the
+      # deployed app use CP unless an admin explicitly picks another in Settings.
+      #
+      # ROLLBACK IS THIS ONE VALUE: set it back to `new` (the roster/operator-stable
+      # engine) and redeploy. The CP genome lives under its own store key that no other
+      # engine reads, so there is nothing to migrate or undo.
+      #
+      # ⚠️ CP HAS NO LOCAL SOLVE FALLBACK. Render deliberately has neither pyjobshop nor
+      # ortools — it runs only the millisecond REPLAY path. The solve happens on a
+      # worker (GitHub Actions here; ORACLE_CLAIM_TIMEOUT_MIN is 0 because this
+      # duplicate has no always-on box). So GITHUB_DISPATCH_TOKEN and
+      # OPTIMIZE_WORKER_SECRET must be set on this service or "Start deep search"
+      # cannot succeed — every other engine would quietly compute locally instead.
+      #
+      # ⚠️ UNTIL THE FIRST DEEP SEARCH SUCCEEDS THERE IS NO GENOME, and the decoder
+      # falls back for every operation — a well-formed plan that nobody solved. The
+      # first deep search after this switch is part of the cutover, not a later step.
       - key: DEFAULT_SCHEDULER
-        value: new
+        value: cp
