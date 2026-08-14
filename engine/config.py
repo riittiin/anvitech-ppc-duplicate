@@ -184,7 +184,21 @@ class Config:
     # waiting for it is a budget nobody collects. This engine ships time-boxed and
     # FEASIBLE-WITH-A-BOUND, not proved-optimal (a 2.4x gap that 6x the budget
     # does not close) — cores buy the bound, not wall clock.
-    cp_time_limit_sec: int = 900
+    # 1800, NOT 900 — raised after the FIRST LIVE RUN failed on the owner's book
+    # (2026-08-14, runs 31815811927 / 31816888792). 900 s split by
+    # ``cp_engine.solve._PHASE_ONE_SHARE`` (0.6) gives PHASE 1 only 540 s, and on
+    # this book phase 1 found NO FEASIBLE SOLUTION AT ALL in that time: the worker
+    # stopped at 9 m 10 s — 540 s exactly — and reported "1 candidates, 0 plans",
+    # which the app surfaced as an opaque "could not finalize the cloud result".
+    # The tractability measurement that set every other default here ran at
+    # **1800 s** (phase 1 = 1080 s) and DID reach FEASIBLE on the same book, so
+    # the shipped default was half the budget its own evidence required. Phase 1's
+    # first feasible solution costs somewhere between 9 and 18 minutes here.
+    # Headroom checked: api's OPTIMIZE_CLOUD_TIMEOUT_MIN default is 40 min and the
+    # workflow's timeout-minutes is 60, so 1800 s of solving fits both.
+    # If a future book fails the same way, RAISE THIS rather than relaxing
+    # ``status_ok`` — a solve with no feasible schedule has nothing to publish.
+    cp_time_limit_sec: int = 1800
     # Solver threads for ONE solve. **CORES BUY THE BOUND; WALL CLOCK BUYS THE
     # PLAN.** Measured at the owner's scale (findings §1): 2 → 4 workers at the
     # same 30 minutes moved the PROVEN FLOOR 170 → 215 late-days and cut the

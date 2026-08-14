@@ -81,7 +81,14 @@ OFF_LANE = "Off-machine"
 # budget on a 4+ core worker; 15 minutes is the low end, chosen because Render's
 # own OPTIMIZE_CLOUD_TIMEOUT_MIN is 20 and a budget that outlives the caller
 # waiting for it is a budget nobody collects.
-CP_TIME_LIMIT_SEC = 900
+# Must match Config.cp_time_limit_sec — this is only the fallback for a config
+# that predates the field, and two different answers to "how long may a solve
+# take" is how the seam and the config drift apart. Raised 900 -> 1800 after the
+# first live run on the owner's book returned NO PLAN: 900 s gives phase 1 just
+# 540 s (_PHASE_ONE_SHARE = 0.6) and it found no feasible schedule at all in
+# that time, while the measurement that set these defaults ran at 1800 s and
+# did. See engine/config.py's note for the full arithmetic.
+CP_TIME_LIMIT_SEC = 1800
 
 # How far the working calendar is built, and therefore how far a task may run. A
 # book that genuinely does not fit comes back ``status_ok=False`` — widen this,
