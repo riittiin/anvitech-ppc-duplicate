@@ -89,9 +89,10 @@ def completion_drift(entries, g) -> list:
     ``days`` is SIGNED — replayed minus solved, positive meaning the published
     plan finishes LATER than the solve promised. The sign is the finding, not
     noise: late is the search over-promising, early means the decoder found
-    capacity the solver withheld (2026-08-14: a pool escape keyed on the machine
-    for the whole horizon pulled a solved order 1 day 13 h forward through night
-    shifts the solve had deliberately left dark).
+    capacity the solver withheld (2026-08-14: neutering the guard that keeps a
+    pool escape restricted to the fallback op that earned it — ``decode.py``'s
+    mutation D1 — let a solved order use it too, pulling it 1 day 13 h forward
+    through night shifts the solve had deliberately left dark).
 
     Two things this deliberately does NOT report, because a banner that cries
     wolf teaches the directors to ignore the one row that is real:
@@ -129,6 +130,7 @@ def completion_drift(entries, g) -> list:
         direction = "LATER" if days > 0 else "EARLIER"
         rows.append({
             "kind": KIND_DRIFT,
+            "breach": True,           # a disagreement with the solve, not a measurement
             "ref": key,
             "batch_id": key,
             "solved": want.isoformat(),
@@ -196,6 +198,7 @@ def genome_stale(batches, masters, g) -> list:
         return []
     return [{
         "kind": KIND_STALE,
+        "breach": True,            # the genome no longer describes today's book
         "ref": "cp_solved_book_sig",
         "message": (
             "the stored CP plan was solved against a DIFFERENT order book — "
@@ -209,6 +212,18 @@ def genome_stale(batches, masters, g) -> list:
 # Everything, in one list
 # --------------------------------------------------------------------------- #
 
+def _tagged(rows, breach) -> list:
+    """Stamp ``breach`` onto every row from an external check.
+
+    The four ``roster_engine.report`` functions are reused UNCHANGED (that is
+    the point — see the module docstring) and know nothing of this module's
+    vocabulary, so the tag is applied here, once, rather than trusted to be
+    remembered at every call site downstream."""
+    for row in rows:
+        row["breach"] = breach
+    return rows
+
+
 def all_violations(entries, masters, config, batches=None, genome=None,
                    absent=None) -> list:
     """The four ``roster_engine.report`` checks plus drift, in a fixed order —
@@ -217,17 +232,24 @@ def all_violations(entries, masters, config, batches=None, genome=None,
     Non-blocking by construction: it returns rows, it never raises on a plan it
     dislikes. A live plan must never break because a self-check is unhappy.
 
-    ``IDLE_CAPACITY`` IS INCLUDED BUT IS NOT A BREACH. The other three answer
-    "did the plan break a rule?" and must read 0. Idle capacity answers "what did
-    this plan leave on the table?" — a dark machine with ready work and a free
-    qualified operator. Under this engine the roster's job is to make that small,
-    but it is legitimately non-zero: E1 forbids an operation spanning an unmanned
-    shift (the owner-authorized Rule 2 trim), and the decoder defers a
-    pool-staffed machine's fallback work by one shift on purpose. So it is
-    reported as a measurement and must not be asserted to zero. ``absent`` is
-    passed through for the same reason the check takes it: without leave data a
-    person on holiday reads as spare capacity and the row accuses the plan of
-    wasting a machine nobody could have run.
+    EVERY ROW CARRIES A ``breach`` BOOLEAN — put on the row itself, not left to
+    an out-of-band lookup against ``RULE_KINDS``, so a downstream consumer (the
+    validation banner Tasks 11/12 build over this) cannot partition breaches
+    from measurements wrongly by omission: ``row["breach"]`` is the one thing to
+    read, always present, never optional.
+
+    ``IDLE_CAPACITY`` IS THE ONLY ROW WITH ``breach: False``. The other kinds —
+    the three ``RULE_KINDS`` plus drift and staleness — all answer "did the plan
+    break a rule, or disagree with the solve?" and must read 0. Idle capacity
+    answers "what did this plan leave on the table?" — a dark machine with ready
+    work and a free qualified operator. Under this engine the roster's job is to
+    make that small, but it is legitimately non-zero: E1 forbids an operation
+    spanning an unmanned shift (the owner-authorized Rule 2 trim), and the
+    decoder defers a pool-staffed machine's fallback work by one shift on
+    purpose. So it is reported as a measurement and must not be asserted to
+    zero. ``absent`` is passed through for the same reason the check takes it:
+    without leave data a person on holiday reads as spare capacity and the row
+    accuses the plan of wasting a machine nobody could have run.
 
     ``batches`` (today's book, Rule 1's output) turns the staleness check on. It
     matters for more than one extra row: once the book has MOVED, drift is
@@ -245,11 +267,12 @@ def all_violations(entries, masters, config, batches=None, genome=None,
     if not entries:
         return []
     rows = []
-    rows.extend(rules.operator_split_violations(entries, config, masters))
-    rows.extend(rules.segmentation_violations(entries))
-    rows.extend(rules.machine_conflict_violations(entries))
-    rows.extend(rules.idle_capacity_violations(entries, masters, config,
-                                               absent=absent))
+    rows.extend(_tagged(rules.operator_split_violations(entries, config, masters),
+                        True))
+    rows.extend(_tagged(rules.segmentation_violations(entries), True))
+    rows.extend(_tagged(rules.machine_conflict_violations(entries), True))
+    rows.extend(_tagged(rules.idle_capacity_violations(entries, masters, config,
+                                                        absent=absent), False))
     stale = genome_stale(batches, masters, genome)
     rows.extend(stale)
     if not stale:

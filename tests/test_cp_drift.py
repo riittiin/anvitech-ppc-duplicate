@@ -131,6 +131,24 @@ def test_drift_is_reported_with_both_dates_and_the_gap():
     assert rows[0]["replayed"] == "2026-09-07"
 
 
+def test_a_one_day_gap_is_reported_with_no_epsilon_PURE_UNIT():
+    """Every other drift case in this file uses a 3-day gap, so a mutation of
+    the comparison to ``abs(days) <= 1`` is killed ONLY by
+    ``test_a_real_disagreement_between_solve_and_replay_is_CAUGHT`` below, which
+    sits behind ``pytest.importorskip("pyjobshop")``. Production and any CI
+    mirroring it have no solver, so on those boxes that whole test SKIPS and a
+    1-day tolerance could be reintroduced with the suite still green. This case
+    needs no solver — it closes the hole exactly where it exists: a ONE-day gap
+    must still be reported, not rounded away as "close enough"."""
+    g = {"cp_completion": {"B1": "2026-09-04"}}
+    rows = report.completion_drift([_entry("B1", datetime(2026, 9, 5, 17, 0))], g)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == report.KIND_DRIFT
+    assert rows[0]["days"] == 1
+    assert rows[0]["solved"] == "2026-09-04"
+    assert rows[0]["replayed"] == "2026-09-05"
+
+
 def test_an_earlier_replay_is_reported_as_early_not_as_a_distance():
     """The SIGN is the finding. Late means the published plan realises worse
     late-days than the search optimised; EARLY means the decoder handed itself
@@ -297,8 +315,11 @@ def test_a_rule_breach_in_the_plan_is_reported():
     at = datetime(2026, 8, 12, 9, 0)
     entries = [_entry("B9", at + timedelta(minutes=30), machine="CNC1", start=at),
                _entry("B8", at + timedelta(minutes=30), machine="MD1", start=at)]
-    kinds = [r["kind"] for r in report.all_violations(entries, masters, _cfg())]
-    assert "OPERATOR_SPLIT_SHIFT" in kinds
+    rows = report.all_violations(entries, masters, _cfg())
+    assert "OPERATOR_SPLIT_SHIFT" in [r["kind"] for r in rows]
+    # On the row, not only findable through the out-of-band RULE_KINDS tuple.
+    row = next(r for r in rows if r["kind"] == "OPERATOR_SPLIT_SHIFT")
+    assert row["breach"] is True
 
 
 def _segmented(batch, spans, machine="CNC1", who="N"):
@@ -322,16 +343,21 @@ def test_a_segmented_operation_and_a_double_booked_machine_are_reported():
 
     broken = _segmented("B1", [(at(0), at(30)), (at(90), at(120))])
     intruder = _segmented("B2", [(at(40), at(80))])
-    kinds = [r["kind"] for r in
-             report.all_violations([broken, intruder], masters, _cfg())]
+    rows = report.all_violations([broken, intruder], masters, _cfg())
+    kinds = [r["kind"] for r in rows]
     assert "OPERATION_SEGMENTED" in kinds
     assert "MACHINE_DOUBLE_BOOKED" not in kinds       # nothing sits in a gap twice
+    seg_row = next(r for r in rows if r["kind"] == "OPERATION_SEGMENTED")
+    assert seg_row["breach"] is True
 
     whole = [_segmented("B3", [(at(0), at(60))]),
              _segmented("B4", [(at(10), at(50))])]
-    kinds = [r["kind"] for r in report.all_violations(whole, masters, _cfg())]
+    rows = report.all_violations(whole, masters, _cfg())
+    kinds = [r["kind"] for r in rows]
     assert "MACHINE_DOUBLE_BOOKED" in kinds
     assert "OPERATION_SEGMENTED" not in kinds         # neither entry has a gap
+    conflict_row = next(r for r in rows if r["kind"] == "MACHINE_DOUBLE_BOOKED")
+    assert conflict_row["breach"] is True
 
 
 def test_idle_capacity_is_measured_and_an_absent_operator_is_not_spare_capacity():
@@ -351,11 +377,36 @@ def test_idle_capacity_is_measured_and_an_absent_operator_is_not_spare_capacity(
                start=datetime(2026, 8, 14, 8, 0)),
     ]
     blind = report.all_violations(entries, masters, _cfg())
-    assert any(r["kind"] == "IDLE_CAPACITY" for r in blind)
+    idle_rows = [r for r in blind if r["kind"] == "IDLE_CAPACITY"]
+    assert idle_rows
+    # ON THE ROW, not only inferrable by checking it is absent from RULE_KINDS —
+    # a downstream consumer must not have to know that tuple exists.
+    assert all(r["breach"] is False for r in idle_rows)
     aware = report.all_violations(
         entries, masters, _cfg(),
         absent={"S": [(datetime(2026, 8, 12), datetime(2026, 8, 20))]})
     assert not any(r["kind"] == "IDLE_CAPACITY" for r in aware)
+
+
+def test_breach_is_true_for_a_kind_a_downstream_reader_never_saw_before():
+    """The row key is the belt for kinds beyond the four ``roster_engine``
+    checks too: drift and staleness are not rule breaches in the
+    ``RULE_KINDS`` sense, but they are real disagreements the plan must not
+    bury beside an ``IDLE_CAPACITY`` measurement, so they carry ``breach:
+    True`` exactly like the three ``RULE_KINDS`` rows."""
+    masters, batches = _sig_book()
+    stale_g = {"cp_solved_book_sig": "not-the-real-signature",
+               "cp_completion": {}}
+    stale_rows = report.all_violations(
+        [_entry("B1", datetime(2026, 9, 4, 17, 0))], masters, _cfg(),
+        batches=batches, genome=stale_g)
+    assert stale_rows and all(r["breach"] is True for r in stale_rows)
+
+    drift_g = {"cp_completion": {"B1": "2026-09-04"}, "cp_solved_book_sig": ""}
+    drift_rows = report.all_violations(
+        [_entry("B1", datetime(2026, 9, 7, 17, 0))], masters, _cfg(),
+        genome=drift_g)
+    assert drift_rows and all(r["breach"] is True for r in drift_rows)
 
 
 def test_drift_rows_reach_all_violations():
@@ -431,11 +482,15 @@ def test_a_new_order_never_pulls_a_solved_order_earlier():
     reverted to the broken per-machine form, which is why THIS fixture is
     hand-built and first-shifts-only.
 
-    Measured with the escape keyed on the MACHINE for the whole horizon: B1
-    completed 14-08 15:10 alone and 13-08 02:10 once one unrelated 30-piece order
-    landed on the same CNC — a solved order pulled 1 day 13 h EARLIER through
-    night shifts the solve had left dark. That is EARLY drift, and this check is
-    what names it.
+    Measured with the ``restricted`` guard neutered (``decode.py``'s mutation D1
+    — the escape then opens the dark shift to the SOLVED book too, not only to
+    the fallback op that earned it): B1 completed 14-08 15:10 alone and 13-08
+    02:10 once one unrelated 30-piece order landed on the same CNC — a solved
+    order pulled 1 day 13 h EARLIER through night shifts the solve had left
+    dark. That is EARLY drift, and this check is what names it. (D3 — keying the
+    escape on the machine for the whole horizon instead of re-deriving it
+    per-op — was the original suspect and no longer reproduces this: it now
+    survives this fixture, per the round-1 review's mutation table.)
     """
     masters = _two_item_cnc_masters()
     g = _first_shifts_only_genome()
