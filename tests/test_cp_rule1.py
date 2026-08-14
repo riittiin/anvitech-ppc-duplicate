@@ -103,6 +103,17 @@ def _solve_tiny(masters, batches, *, hold=True, absent=None,
 
     roster = rules.add_roster(cp.model, cp.variables, built, shop,
                               hold_across_unmanned_shift=hold)
+    # ``model.build`` defaults to ``setup_mode="credit"``, which creates
+    # setup-free modes that NOTHING stops the solver selecting until
+    # ``add_setup_credit`` links them. No fixture in this file has two batches of
+    # the same (item, process) on one machine, so today it builds none and the
+    # call is a no-op — but a fixture added later would silently hand a batch 90
+    # minutes of CNC capacity that does not exist, and every makespan below would
+    # quietly shift. Called for the same reason ``solve_book`` asserts the flag:
+    # this harness mirrors the real solve, and an invariant that is CHECKED beats
+    # one that is merely currently true.
+    rules.add_setup_credit(cp.model, cp.variables, built, config)
+    assert built.setup_credit_linked
 
     solver = cp_sat.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit

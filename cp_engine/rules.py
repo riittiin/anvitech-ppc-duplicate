@@ -331,12 +331,36 @@ def add_release(cp_model, variables, built, config) -> dict:
     Returns ``{job key: k IntVar}`` for every job with at least one overlapping
     pair. A job with none — a single step, or nothing but OS — is absent.
 
-    Note what is NOT yet exercised: under the makespan objective PyJobShop
-    installs by default, a later release can never pay, so every test here comes
-    back with ``k == 1``. Its DOMAIN is pinned (widen it to 0 and two tests fail;
-    pin it to qty and one does), but the value only becomes a real choice under
-    Task 6's tardiness objective, where holding a machine back for a more urgent
-    order can win.
+    **k is a variable with no decision in it, and that is now measured rather
+    than suspected** (Task 6, 2026-08-14). k appears ONLY in the two lower bounds
+    below, and the right-hand side of each is monotonically INCREASING in k. A
+    successor is never obliged to start at its lower bound, so every schedule
+    legal at any k is also legal at k = 1: the feasible set at k = 1 contains
+    every other one, and NO objective — makespan, tardiness, or the fairness pair
+    Task 6 ships — can make k > 1 strictly pay. The earlier note here guessed
+    that a tardiness objective might make the value a real choice by letting a
+    job hold a machine back for a more urgent one; it cannot, because holding
+    back is already available for free.
+
+    So under this engine's objective Rule 3 is, in effect, **"release after one
+    piece" — maximum overlap, always**. That is a real statement about the
+    owner's overlap rule, not a defect: this engine does not tune a global
+    overlap percentage the way the incumbent's contest did, it always takes the
+    loosest legal release and lets the machine calendars, Rule 1 and the
+    objective decide the rest.
+
+    Its DOMAIN is still pinned by tests (widen it to 0 and two fail; size it on
+    ``job.qty`` and one does) because the domain is what fixes what k MEANS to a
+    decoder, and because the top of a wrong domain is where the harm is.
+
+    ⚠ **k is UNDER-DETERMINED above its lower bound.** Because it is in no
+    objective, any k consistent with the solved starts is an equally optimal
+    answer — on a schedule with slack, 1 and 100 are both legal. CP-SAT's
+    presolve fixes it to its lower bound today (measured across five seeds), so
+    the genome carries 1, but nothing in this model *requires* that. A decoder
+    must therefore treat ``cp_overlap_of`` as "at least this many pieces had
+    cleared", never as "the release this schedule needs", and a drift check is
+    what proves the replay matches the solve.
 
     **The release is an APPROXIMATION, and knowingly so.** The shop's rule is
     WORKED minutes (the sibling greedy engine's ``release`` module:
