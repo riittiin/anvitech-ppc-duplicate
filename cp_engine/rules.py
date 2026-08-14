@@ -313,13 +313,20 @@ def _overlap_minutes(cp_model, built, task_var, task_idx, shift):
 def add_release(cp_model, variables, built, config) -> dict:
     """Rule 3: the successor starts once ``ceil(p x qty)`` pieces have cleared.
 
-    ``k_j`` is an integer DECISION in ``1..qty`` — the pieces that must clear —
-    so the solver picks the overlap PER JOB instead of the whole book inheriting
-    one tuned number (spec §3). Whole pieces by construction: k is an integer, so
-    a release on 5.6 pieces cannot be expressed. One k per job, not per step
-    boundary: the overlap is a property of how a batch is handed down its
-    routing, and the previous engine's one global percentage is what this
-    replaces.
+    ``k_j`` is an integer DECISION — the pieces that must clear — so the solver
+    picks the overlap PER JOB instead of the whole book inheriting one tuned
+    number (spec §3). Whole pieces by construction: k is an integer, so a release
+    on 5.6 pieces cannot be expressed. One k per job, not per step boundary: the
+    overlap is a property of how a batch is handed down its routing, and the
+    previous engine's one global percentage is what this replaces.
+
+    **Which quantity k is counted in.** Its domain is ``1..min(pieces still owed
+    by any step it governs)`` — ``Job.qty_for``, the per-step WIP remainder, NOT
+    the batch's ordered ``job.qty``. On a clean book the two are equal; on a
+    re-plan with work in progress they are not, and the difference is not
+    cosmetic (see the domain comment below). The contract this buys every later
+    layer: **k never exceeds what any step of its job still owes**, so a decoder
+    can read it straight against a step's remaining qty.
 
     Returns ``{job key: k IntVar}`` for every job with at least one overlapping
     pair. A job with none — a single step, or nothing but OS — is absent.
@@ -366,34 +373,56 @@ def add_release(cp_model, variables, built, config) -> dict:
     setup_min = int(getattr(config, "setup_time_min", 90) or 0)
     out: dict = {}
     for job in built.jobs:
-        prev_op = None
-        for op in job.ops:
-            idx = built.task_of.get((job.key, op.seq))
-            if idx is None:
-                # No task: a DISPATCH milestone, a finished step, or a step with
-                # no machine. ``model.build`` chained the precedence past it, so
-                # this does too — carrying it as ``prev_op`` would look the
-                # missing task up and raise.
-                continue
-            if prev_op is not None and _overlaps(prev_op, op):
-                qty = job.qty_for(prev_op.seq)
-                if qty > 0:
-                    a_idx = built.task_of[(job.key, prev_op.seq)]
-                    cutting = max(1, int(round(qty * prev_op.cycle_min)))
-                    k = out.get(job.key)
-                    if k is None:
-                        k = cp_model.new_int_var(1, max(1, int(job.qty)),
-                                                 f"k_{job.key}")
-                        out[job.key] = k
-                    a = variables.task_vars[a_idx]
-                    b = variables.task_vars[idx]
-                    setup = _setup_charged(variables, built, a_idx, setup_min)
-                    cp_model.add(qty * b.start
-                                 >= qty * (a.start + setup) + k * cutting)
-                    cp_model.add(qty * b.start
-                                 >= qty * a.end - (qty - k) * cutting)
-            prev_op = op
+        pairs = _overlapping_pairs(built, job)
+        if not pairs:
+            continue
+        # k is ONE decision for the whole job, so its domain has to be legal for
+        # every step it governs: the SMALLEST number of pieces any of those steps
+        # still owes. Sizing it on ``job.qty`` instead is wrong the moment a
+        # predecessor is part-finished — ``qty_for`` reads the WIP remainder, so
+        # k could exceed the pieces that step has left, ``(qty - k)`` would go
+        # negative, and the tail bound would demand the successor start LATER
+        # than fully sequential. Rule 3 makes no such statement.
+        #
+        # It also fixes what k MEANS for the decoder: k pieces, never more than
+        # any step of this job owes, so the number can be read against any step's
+        # remaining qty without a second clamp. A quantity that reaches the
+        # scheduler is derived at batch level, and a model and a decoder counting
+        # one number in two different quantities is this project's opening
+        # cautionary tale (2026-08-11).
+        k = cp_model.new_int_var(1, min(qty for _a, _b, qty, _c in pairs),
+                                 f"k_{job.key}")
+        out[job.key] = k
+        for a_idx, b_idx, qty, cutting in pairs:
+            a = variables.task_vars[a_idx]
+            b = variables.task_vars[b_idx]
+            setup = _setup_charged(variables, built, a_idx, setup_min)
+            cp_model.add(qty * b.start >= qty * (a.start + setup) + k * cutting)
+            cp_model.add(qty * b.start >= qty * a.end - (qty - k) * cutting)
     return out
+
+
+def _overlapping_pairs(built, job) -> list:
+    """``[(predecessor task, successor task, pieces owed, cutting minutes)]``.
+
+    A step with no task is stepped OVER, not carried: ``model.build`` skips a
+    DISPATCH milestone, a step already finished (``qty_for`` is 0) and a step
+    with no machine, and chains its precedence past them. Keeping the absent step
+    as the predecessor would look its task up and raise — the brief's version
+    did exactly that, and a mid-routing DISPATCH is enough to reach it.
+    """
+    pairs, prev_op = [], None
+    for op in job.ops:
+        idx = built.task_of.get((job.key, op.seq))
+        if idx is None:
+            continue
+        if prev_op is not None and _overlaps(prev_op, op):
+            qty = job.qty_for(prev_op.seq)
+            if qty > 0:
+                pairs.append((built.task_of[(job.key, prev_op.seq)], idx, qty,
+                              max(1, int(round(qty * prev_op.cycle_min)))))
+        prev_op = op
+    return pairs
 
 
 def _overlaps(prev, nxt) -> bool:
@@ -489,6 +518,14 @@ def add_setup_credit(cp_model, variables, built, config) -> None:
     (durations are over-estimated, so the plan stays runnable) but NOT Rule 4 as
     written; it ships only on the owner's say-so.
     """
+    # Stamped FIRST, and stamped even when there is nothing to link: it records
+    # "these credit modes are constrained", and a model with none is already
+    # safe. An unlinked model is not merely unchecked — every member of every
+    # same-part group may take its setup-free mode unconditionally, so the plan
+    # claims 90 minutes of CNC capacity per affected task with no exception, no
+    # failing test and no report row anywhere. An invariant that is CHECKED beats
+    # one that is merely intended, so the caller gets a boolean to assert on.
+    built.setup_credit_linked = True
     if not built.setup_free_modes:
         return
 

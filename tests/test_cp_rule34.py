@@ -95,7 +95,7 @@ class _Solved:
 
 
 def _solve_tiny(masters, batches, *, hold=True, absent=None, setup_mode="credit",
-                horizon_days=20, time_limit=30):
+                pin_k_max=False, horizon_days=20, time_limit=30):
     """domain -> windows -> model -> CPModel -> the three rules -> solve.
 
     The horizon is CLOSED here for the reason ``test_cp_rule1._solve_tiny``
@@ -122,6 +122,17 @@ def _solve_tiny(masters, batches, *, hold=True, absent=None, setup_mode="credit"
     rules.add_roster(cp.model, cp.variables, built, shop,
                      hold_across_unmanned_shift=hold)
     released = rules.add_release(cp.model, cp.variables, built, config)
+    if pin_k_max:
+        # Force every job to its LATEST legal release. Nothing in a makespan
+        # objective ever wants that, so it is the only way to see what the top of
+        # k's domain means — and the top of a wrong domain is where the harm is.
+        #
+        # ``max(...)``, not ``domain[-1]``: ``proto.domain`` is a protobuf
+        # repeated field, which does NOT index from the end like a list — it
+        # silently returns 0, which pins k outside its own domain and reports
+        # INFEASIBLE with nothing to say why.
+        for var in released.values():
+            cp.model.add(var == max(var.proto.domain))
     rules.add_setup_credit(cp.model, cp.variables, built, config)
 
     solver = cp_sat.CpSolver()
@@ -221,6 +232,41 @@ def test_the_release_is_measured_from_the_tail_when_the_step_spans_a_break():
     assert b_start > a_start + 90 + k
 
 
+def test_k_counts_the_pieces_the_STEP_still_owes_not_the_batch_size():
+    """Which quantity k is counted in, on a re-plan with work in progress.
+
+    The batch is 60 pieces but its first step has only 5 left to cut
+    (``process_remaining``), so 5 is the most that step can ever release. k is
+    ONE decision for the whole job, so its domain has to be legal for every step
+    it governs — sized on the batch's 60 instead, the tail bound at the top of
+    the domain reads ``a.end - (5 - 60) x cycle``, i.e. it demands the successor
+    start 550 minutes AFTER its predecessor finished. Rule 3 makes no such
+    statement; fully sequential is as strict as it gets.
+
+    Pinned at the top of the domain, because that is where a wrong domain shows.
+
+    THREE steps, deliberately: with only one overlapping pair the smallest and
+    the largest remainder are the same number and the rule under test is
+    invisible. Here step 1 owes 5 and step 2 owes 40, so k must take the
+    SMALLEST — the largest is legal for step 2 and nonsense for step 1.
+    """
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None, [
+            _proc("CNC1", cycle=2.0, seq=1),
+            _proc("MD1", cycle=2.0, name="DEBURING", seq=2),
+            _proc("MD1", cycle=2.0, name="INSPECTION", seq=3)])},
+        [_op("Narayan", ["CNC1"]), _op("Anturam", ["MD1"])])
+    batch = _B("B1", "A", 60)
+    batch.process_remaining = {1: 5, 2: 40, 3: 40}
+    res = _solve_tiny(masters, [batch], pin_k_max=True)
+    assert res.ok
+
+    assert res.released["B1"] == 5              # min(5, 40) — not 60, and not 40
+    assert res.span[("B1", 1)] == (0, 100)      # 90 setup + 5 x 2
+    # The whole remainder released == fully sequential, and never stricter.
+    assert res.span[("B1", 2)][0] == res.span[("B1", 1)][1]
+
+
 def test_a_successor_never_finishes_before_the_step_feeding_it():
     """Pacing. The 2026-07-25 lesson: the machine-wise schedule was processing
     pieces before they existed, and the old numbers were infeasible, not
@@ -248,6 +294,53 @@ def test_an_os_step_is_sequential_and_never_overlaps():
     assert res.span[("B1", 2)][0] >= res.span[("B1", 1)][1]
     assert res.span[("B1", 3)][0] >= res.span[("B1", 2)][1]
     assert "B1" not in res.released          # no overlapping pair in this job
+
+
+# --------------------------------------------------------------------------- #
+# Rule 3 — a routing step that has no task at all
+# --------------------------------------------------------------------------- #
+
+def test_a_dispatch_milestone_mid_routing_does_not_break_the_release():
+    """``model.build`` gives a DISPATCH milestone no task and chains the
+    precedence straight past it. The release has to step over it the same way:
+    carrying the milestone as the predecessor looks up a task that does not
+    exist and raises — on a real book, on any routing with a mid-list DISPATCH.
+
+    The two real steps either side must still be linked, or the milestone would
+    quietly delete a release rule as well."""
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None, [
+            _proc("CNC1", cycle=2.0, seq=1),
+            Process(2, "DISPATCH", None, None, None, None),
+            _proc("MD1", cycle=2.0, name="DEBURING", seq=3)])},
+        [_op("Narayan", ["CNC1"]), _op("Anturam", ["MD1"])])
+    res = _solve_tiny(masters, [_B("B1", "A", 20)])
+    assert res.ok
+    assert ("B1", 2) not in res.span             # the milestone really has no task
+    assert res.released["B1"] == 1               # step 1 -> step 3 is still linked
+    assert res.span[("B1", 1)] == (0, 130)
+    assert res.span[("B1", 3)][0] == 92          # 90 setup + one 2-minute piece
+
+
+def test_a_finished_step_mid_routing_does_not_break_the_release():
+    """The same hole reached the other way, and the one that turns up on a
+    re-plan rather than in a routing: step 2 has nothing left to make, so
+    ``model.build`` skips it (``qty_for`` is 0) and the release must chain
+    1 -> 3 without looking for its task."""
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None, [
+            _proc("CNC1", cycle=2.0, seq=1),
+            _proc("MD1", cycle=2.0, name="DEBURING", seq=2),
+            _proc("MD1", cycle=2.0, name="INSPECTION", seq=3)])},
+        [_op("Narayan", ["CNC1"]), _op("Anturam", ["MD1"])])
+    batch = _B("B1", "A", 20)
+    batch.process_remaining = {1: 20, 2: 0, 3: 20}
+    res = _solve_tiny(masters, [batch])
+    assert res.ok
+    assert ("B1", 2) not in res.span             # nothing left to make on it
+    assert res.released["B1"] == 1
+    assert res.span[("B1", 1)] == (0, 130)
+    assert res.span[("B1", 3)][0] == 92
 
 
 # --------------------------------------------------------------------------- #
@@ -348,6 +441,58 @@ def test_a_manual_step_never_pays_setup():
     res = _solve_tiny(masters, [_B("B1", "A", 60)])
     assert res.ok
     assert res.machine_busy_minutes("MD1") == 60
+
+
+def test_a_model_says_whether_its_credit_modes_were_ever_constrained():
+    """The setup-free modes are unsafe until ``add_setup_credit`` links them: an
+    unlinked model lets every member of every same-part group take its
+    setup-free mode unconditionally, inventing 90 minutes of CNC capacity per
+    task — with no exception, no failing test and nothing in any report.
+
+    So the model carries the answer rather than a comment asking callers to
+    remember, exactly as ``add_roster`` checks ``hold_across_unmanned_shift``
+    instead of trusting its caller. This is the half that belongs here; Task 6's
+    ``solve_book`` asserts it before solving.
+    """
+    from pyjobshop.solvers.ortools.CPModel import CPModel
+
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None, [_proc("CNC1", cycle=1.0)])},
+        [_op("Narayan", ["CNC1"])])
+    config = _cfg()
+    jobs, _by_key, _skipped = domain.build_jobs(
+        [_B("B1", "A", 60), _B("B2", "A", 60)], masters)
+    shop = domain.build_shop(masters, {})
+    shifts = windows.build_shifts(PLAN_START, masters.calendar, config, 20)
+    built = model.build(jobs, shop, config, PLAN_START, shifts)
+
+    assert built.setup_free_modes                 # there IS something to link...
+    assert built.setup_credit_linked is False     # ...and it is not linked yet
+
+    cp = CPModel(built.data)
+    rules.add_setup_credit(cp.model, cp.variables, built, config)
+    assert built.setup_credit_linked is True
+
+
+def test_a_model_with_no_credit_modes_is_linked_too():
+    """The flag means "safe to solve", not "did any work" — a book with no
+    sibling batches builds no credit modes and is already safe, and a caller
+    asserting the flag must not have to special-case that."""
+    from pyjobshop.solvers.ortools.CPModel import CPModel
+
+    masters = _masters(
+        {"A": Routing("A", "a", "c", "rm", None, [_proc("CNC1", cycle=1.0)])},
+        [_op("Narayan", ["CNC1"])])
+    config = _cfg()
+    jobs, _by_key, _skipped = domain.build_jobs([_B("B1", "A", 60)], masters)
+    shop = domain.build_shop(masters, {})
+    shifts = windows.build_shifts(PLAN_START, masters.calendar, config, 20)
+    built = model.build(jobs, shop, config, PLAN_START, shifts)
+
+    assert built.setup_free_modes == {}
+    cp = CPModel(built.data)
+    rules.add_setup_credit(cp.model, cp.variables, built, config)
+    assert built.setup_credit_linked is True
 
 
 def test_setup_mode_always_charges_every_changeover():

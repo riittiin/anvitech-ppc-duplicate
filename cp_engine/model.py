@@ -81,10 +81,18 @@ class Built:
     # than the IntVar subtracted from processing time that the plan described.
     #
     # ⚠ These modes are UNSAFE on their own: nothing here stops the solver from
-    # selecting one. ``rules.add_setup_credit`` is what ties each to "the machine's
-    # previous job was the same part", and any caller that builds with
-    # ``setup_mode="credit"`` MUST call it.
+    # selecting one, and an unlinked model silently invents 90 minutes of CNC
+    # capacity per affected task. ``rules.add_setup_credit`` is what ties each to
+    # "the machine's previous job was the same part", and any caller that builds
+    # with ``setup_mode="credit"`` MUST call it — assert ``setup_credit_linked``
+    # before solving, the way ``rules.add_roster`` checks
+    # ``hold_across_unmanned_shift`` rather than trusting its caller.
     setup_free_modes: dict = field(default_factory=dict)
+    # Set by ``rules.add_setup_credit``. False on a freshly built model, so
+    # "were the credit modes constrained?" is one boolean a caller cannot forget
+    # to ask. True even when there were no credit modes to constrain — it means
+    # "safe to solve", not "did any work".
+    setup_credit_linked: bool = False
     # (machine res idx, (item code, op seq)) -> the task indices that share it.
     # The ONE definition of "same part, same side, on a machine that could run
     # both" — rules.py groups the credit off this rather than re-deriving the
