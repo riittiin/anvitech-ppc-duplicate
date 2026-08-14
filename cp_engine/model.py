@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from cp_engine import windows
-from cp_engine.domain import DISPATCH, MACHINING, OUTSOURCED
+from cp_engine.domain import DISPATCH, OUTSOURCED
 
 # Enough parallel capacity that outsourcing never binds: a vendor takes every
 # batch at once. The engine models an OS step as a flat 24x7 block with no
@@ -49,7 +49,14 @@ class Built:
     shifts: list
     jobs: list
     dated_jobs: set                 # job keys that HAVE a delivery date
-    machining_tasks: dict = field(default_factory=dict)   # task idx -> (job_key, op)
+    # Resource indices of the CNC/VMC machines — the ONE machine-keyed answer to
+    # "does this carry a 90-minute setup". It replaces an earlier
+    # ``machining_tasks`` map keyed on the step's KIND, which was read by nothing
+    # and could not have answered the question: a step's kind is taken from its
+    # FIRST machine option (``domain._kind_for_machine_id``) and ``_candidates``
+    # puts Allotted first, so ``MD1/CNC1`` is a manual-kind step that can run on a
+    # CNC and ``CNC1/MD1`` a machining-kind one that can run on a bench.
+    machining_res_idcs: frozenset = frozenset()
     setup_mode: str = "credit"
 
     # The wall clock the shift minutes are measured from. Carried so a later
@@ -67,10 +74,27 @@ class Built:
     # silently building E2 constraints on a model that cannot satisfy them.
     hold_across_unmanned_shift: bool = True
 
+    # Rule 4's credit, as a SECOND mode. (task idx, machine res idx) -> mode idx
+    # of a duplicate mode carrying the cutting time with NO setup, built only
+    # where some other task of the same (item, process) can run on that same
+    # machine. See ``_add_setup_free_modes`` for why the credit is a mode rather
+    # than the IntVar subtracted from processing time that the plan described.
+    #
+    # ⚠ These modes are UNSAFE on their own: nothing here stops the solver from
+    # selecting one. ``rules.add_setup_credit`` is what ties each to "the machine's
+    # previous job was the same part", and any caller that builds with
+    # ``setup_mode="credit"`` MUST call it.
+    setup_free_modes: dict = field(default_factory=dict)
+    # (machine res idx, (item code, op seq)) -> the task indices that share it.
+    # The ONE definition of "same part, same side, on a machine that could run
+    # both" — rules.py groups the credit off this rather than re-deriving the
+    # signature, or the two could drift and the credit would be granted for a
+    # sameness model.py never grouped by. Every group has >= 2 members.
+    setup_groups: dict = field(default_factory=dict)
+
     # Filled by later layers. Declared HERE so there is one definition of this
-    # object's shape: rules.py populates shift_work (E2) and setup_credit
-    # (Rule 4), and both address the model by index through the maps above.
-    setup_credit: dict = field(default_factory=dict)   # task idx -> IntVar (Task 5)
+    # object's shape: rules.py populates shift_work (E2), addressing the model by
+    # index through the maps above.
     shift_work: dict = field(default_factory=dict)     # task idx -> [IntVar] (Task 4)
     # (task idx, shift idx) -> IntVar. The overlap of a task with a shift depends
     # on nothing else, so it is built once and shared by every candidate machine.
@@ -124,7 +148,11 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
 
     os_res = m.add_renewable(capacity=max(1, len(jobs) + _OS_HEADROOM), name="OS")
 
-    task_of, job_of, dated, machining = {}, {}, set(), {}
+    task_of, job_of, dated = {}, {}, set()
+    # (machine id, item code, op seq) -> [(task object, task idx, cutting min)].
+    # Two entries under one key are two sibling batches of the same part and side
+    # that can meet on the same machine — the only shape Rule 4 ever credits.
+    same_part: dict = {}
     for job in jobs:
         due_min = _due_minutes(job, plan_start)
         cp_job = m.add_job(due_date=due_min, name=job.key)
@@ -162,17 +190,14 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
             if op.kind == OUTSOURCED:
                 m.add_mode(task, os_res, int(max(1, op.cycle_min)), demands=1)
             else:
-                if op.kind == MACHINING:
-                    # Rule 4, inverted (§5.4): 90 minutes is ALWAYS in the
-                    # duration and credited back in rules.py only for a same-part
-                    # changeover.
-                    duration = setup_min + max(1, int(round(qty * op.cycle_min)))
-                    machining[idx] = (job.key, op)
-                else:
-                    duration = max(1, int(round(qty * op.cycle_min)))
+                cutting = max(1, int(round(qty * op.cycle_min)))
                 for mid in op.machine_options:
-                    _add_modes(m, task, mid, duration, shop,
+                    _add_modes(m, task, mid, cutting, setup_min, shop,
                                machine_res, operator_res)
+                    if setup_min > 0 and mid in shop.machining_ids:
+                        same_part.setdefault(
+                            (mid, job.item_code, op.seq), []).append(
+                                (task, idx, cutting))
 
             if prev_task is not None:
                 if prev_op.kind == OUTSOURCED or op.kind == OUTSOURCED:
@@ -193,11 +218,17 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
     order = {mid: i for i, mid in enumerate(sorted(shop.machines))}
     op_order = {op.name: len(machine_res) + i
                 for i, op in enumerate(sorted(shop.operators, key=lambda o: o.name))}
+    setup_free, setup_groups = (
+        ({}, {}) if setup_mode != "credit"
+        else _add_setup_free_modes(m, same_part, order, machine_res))
     return Built(m=m, data=m.data(), task_of=task_of, job_of=job_of,
                  machine_res=machine_res, operator_res=operator_res,
                  os_res=len(machine_res) + len(operator_res),
                  shifts=list(shifts), jobs=list(jobs),
-                 dated_jobs=dated, machining_tasks=machining,
+                 dated_jobs=dated, setup_free_modes=setup_free,
+                 setup_groups=setup_groups,
+                 machining_res_idcs=frozenset(
+                     order[mid] for mid in shop.machining_ids if mid in order),
                  setup_mode=setup_mode, machine_res_order=order,
                  operator_res_order=op_order,
                  job_by_key={j.key: j for j in jobs},
@@ -205,32 +236,77 @@ def build(jobs, shop, config, plan_start: datetime, shifts,
                  hold_across_unmanned_shift=hold_across_unmanned_shift)
 
 
-def _add_modes(m, task, mid: str, duration: int, shop,
+def _add_modes(m, task, mid: str, cutting: int, setup_min: int, shop,
                machine_res: dict, operator_res: dict) -> None:
-    """Every way ONE machine can run this step.
+    """Every way ONE machine can run this step, and what it costs there.
 
-    Keyed on the MACHINE, never on the step's kind. Rule 1 is a property of
-    people and the machines they are rostered to, and a step's kind is only ever
-    read off its FIRST machine option (``domain._kind_for_machine_id``), so the
-    two disagree the moment a routing lists ``MD1/CNC1`` or ``CNC1/MD1`` — and
-    real routings do.
+    Keyed on the MACHINE, never on the step's kind — for the crewing AND for the
+    setup. Rule 1 is a property of people and the machines they are rostered to,
+    and Rule 4 is a statement about the machine ("90 minutes on a CNC/VMC"),
+    while a step's kind is only ever read off its FIRST machine option
+    (``domain._kind_for_machine_id``). The two disagree the moment a routing
+    lists ``MD1/CNC1`` or ``CNC1/MD1`` — and real routings do. A duration is per
+    MODE and a mode is (task, machine), so "90 on a CNC, 0 on a bench, for the
+    same step" is the shape PyJobShop already has.
 
-    * A machine the roster covers (CNC/VMC) gets a **machine-only** mode: the man
-      is whoever Rule 1 put on it for the shift. Booking one here as well would
-      charge the same person twice for the same work, and a shop with one
-      qualified operator would come out INFEASIBLE for work it can plainly do.
+    * A machine the roster covers (CNC/VMC) gets a **machine-only** mode carrying
+      the setup: the man is whoever Rule 1 put on it for the shift. Booking one
+      here as well would charge the same person twice for the same work, and a
+      shop with one qualified operator would come out INFEASIBLE for work it can
+      plainly do.
     * Every other machine carries its operator in the mode, because nothing else
-      in the model will.
+      in the model will, and carries no setup, because a bench has no fixture to
+      change.
 
     ``demands=[0, 1]``: a unary Machine takes no capacity and the operator takes
     one. ``[1, 1]`` is rejected as "infeasible demands".
     """
     if mid in shop.machining_ids:
-        m.add_mode(task, machine_res[mid], duration)
+        # Rule 4, inverted (§5.4): 90 minutes is ALWAYS in the duration and
+        # credited back only for a same-part changeover — see
+        # ``_add_setup_free_modes`` and ``rules.add_setup_credit``.
+        m.add_mode(task, machine_res[mid], setup_min + cutting)
         return
     for name in _qualified(shop, mid):
         m.add_mode(task, [machine_res[mid], operator_res[name]],
-                   duration, demands=[0, 1])
+                   cutting, demands=[0, 1])
+
+
+def _add_setup_free_modes(m, same_part: dict, order: dict,
+                          machine_res: dict) -> tuple:
+    """A SECOND mode per (task, machining machine) carrying the cutting time
+    alone — the shape Rule 4's credit takes.
+
+    The plan called for an IntVar credit subtracted from the task's processing
+    time. That cannot be built: PyJobShop already posts
+    ``task.processing == mode.duration`` under the selected mode
+    (``Constraints._select_one_mode``), so ``processing == duration - credit``
+    forces the credit to zero and the model is INFEASIBLE for any other value
+    (measured, not reasoned). A duration is per MODE, so a second mode is where a
+    conditional duration belongs.
+
+    Built ONLY for a (machine, item, process) that at least two tasks share —
+    sibling batches of one item, which are rare — so the model is the same size
+    as before everywhere else. Two batches of different items, the same item on
+    its OTHER SIDE (a different process seq is a different fixture), or the same
+    item on machines that cannot meet, generate nothing at all.
+
+    Returns ``(setup_free_modes, setup_groups)``. The groups go out with the
+    modes because they are the sameness the modes were built FOR; rules.py
+    consumes them rather than re-deriving a signature of its own.
+    """
+    modes: dict = {}
+    groups: dict = {}
+    for (mid, item_code, op_seq) in sorted(same_part):
+        rows = same_part[(mid, item_code, op_seq)]
+        if len(rows) < 2:
+            continue                    # nothing on this machine to change from
+        res_idx = order[mid]
+        groups[(res_idx, (item_code, op_seq))] = [idx for _t, idx, _c in rows]
+        for task, task_idx, cutting in rows:
+            modes[(task_idx, res_idx)] = len(m.modes)
+            m.add_mode(task, machine_res[mid], cutting)
+    return modes, groups
 
 
 def _due_minutes(job, plan_start: datetime):

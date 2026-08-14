@@ -1,8 +1,8 @@
 """The shop rules PyJobShop cannot express, added to the raw CpModel underneath.
 
 Rule 1 needs booleans per (operator, machine, shift). Rule 3 needs a VARIABLE lag
-where StartBeforeStart takes a constant. Rule 4 needs the sequence literal that
-says "t2 runs directly after t1". Only Rule 1 lives here so far.
+where StartBeforeStart takes a constant. Rule 4 needs a literal that says "t2 runs
+directly after t1 on this machine".
 
 Establishing why this file has to exist at all, rather than another few lines of
 model.py: linking the roster to the work means saying "this machine does not work
@@ -24,10 +24,19 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 
 from cp_engine import windows
+from cp_engine.domain import INSPECTION, MACHINING, MANUAL
 
 # pyjobshop's own ceiling for a time variable. Imported rather than restated so
 # an upper bound written here can never sit below one pyjobshop already allowed.
 from pyjobshop.constants import MAX_VALUE
+
+# The kinds that hand pieces over gradually. OS is a vendor block and DISPATCH a
+# milestone; neither releases anything until it is done. Note this reading of
+# ``kind`` is SAFE where the setup's was not: it separates in-house work from
+# OS/DISPATCH, and those two are decided by ``domain._is_os`` / ``is_dispatch``,
+# never off a step's first machine option. All three in-house kinds answer the
+# same way, so a routing written ``MD1/CNC1`` cannot change the answer.
+_INHOUSE = (MACHINING, MANUAL, INSPECTION)
 
 
 @dataclass
@@ -295,6 +304,228 @@ def _overlap_minutes(cp_model, built, task_var, task_idx, shift):
     cp_model.add_max_equality(overlap, [upper - lower, 0])
     built.shift_overlap[(task_idx, shift.index)] = overlap
     return overlap
+
+
+# --------------------------------------------------------------------------- #
+# Rule 3 — the successor starts once k whole pieces have cleared
+# --------------------------------------------------------------------------- #
+
+def add_release(cp_model, variables, built, config) -> dict:
+    """Rule 3: the successor starts once ``ceil(p x qty)`` pieces have cleared.
+
+    ``k_j`` is an integer DECISION in ``1..qty`` — the pieces that must clear —
+    so the solver picks the overlap PER JOB instead of the whole book inheriting
+    one tuned number (spec §3). Whole pieces by construction: k is an integer, so
+    a release on 5.6 pieces cannot be expressed. One k per job, not per step
+    boundary: the overlap is a property of how a batch is handed down its
+    routing, and the previous engine's one global percentage is what this
+    replaces.
+
+    Returns ``{job key: k IntVar}`` for every job with at least one overlapping
+    pair. A job with none — a single step, or nothing but OS — is absent.
+
+    Note what is NOT yet exercised: under the makespan objective PyJobShop
+    installs by default, a later release can never pay, so every test here comes
+    back with ``k == 1``. Its DOMAIN is pinned (widen it to 0 and two tests fail;
+    pin it to qty and one does), but the value only becomes a real choice under
+    Task 6's tardiness objective, where holding a machine back for a more urgent
+    order can win.
+
+    **The release is an APPROXIMATION, and knowingly so.** The shop's rule is
+    WORKED minutes (the sibling greedy engine's ``release`` module:
+    "an overnight gap must not release pieces that were never cut"), while both
+    bounds below are WALL CLOCK. So each is wrong in its own direction:
+
+    * the HEAD bound ``b.start >= a.start + setup + k x cycle`` is optimistic
+      when a break falls early in the predecessor — it counts the break as
+      cutting time;
+    * the TAIL bound ``b.start >= a.end - (qty - k) x cycle`` is pessimistic when
+      one falls late, for the mirror-image reason.
+
+    Both are imposed. Be clear about what that buys, because it is less than it
+    looks: the tail bound PROVABLY DOMINATES the head bound and the head can
+    never bind. ``a.end - a.start >= processing = setup + cutting``, so
+    ``tail - head = (a.end - a.start - setup) - cutting >= 0`` always. The head
+    bound is kept because it is the direct statement of the other side of the
+    rule and costs one linear constraint per pair — measured redundant, not
+    assumed so (see this task's mutation table) — and because it becomes load
+    bearing the moment anything narrows the interval. The model's effective
+    release is therefore the PESSIMISTIC one.
+
+    A later task's decoder computes the exact worked-minute release and a drift
+    check measures what this cost. If the drift is material, tighten these —
+    never loosen the decoder.
+
+    Both bounds are written in SCALED integer arithmetic (multiplied through by
+    ``qty``) rather than with a per-piece minute constant. Rounding a sub-minute
+    cycle to whole minutes would otherwise make the two bounds inconsistent with
+    the duration ``model.build`` charged — ``qty x round(cycle)`` is not
+    ``round(qty x cycle)`` — and could push the head bound above the tail, which
+    is exactly the direction that releases pieces before they exist.
+    """
+    setup_min = int(getattr(config, "setup_time_min", 90) or 0)
+    out: dict = {}
+    for job in built.jobs:
+        prev_op = None
+        for op in job.ops:
+            idx = built.task_of.get((job.key, op.seq))
+            if idx is None:
+                # No task: a DISPATCH milestone, a finished step, or a step with
+                # no machine. ``model.build`` chained the precedence past it, so
+                # this does too — carrying it as ``prev_op`` would look the
+                # missing task up and raise.
+                continue
+            if prev_op is not None and _overlaps(prev_op, op):
+                qty = job.qty_for(prev_op.seq)
+                if qty > 0:
+                    a_idx = built.task_of[(job.key, prev_op.seq)]
+                    cutting = max(1, int(round(qty * prev_op.cycle_min)))
+                    k = out.get(job.key)
+                    if k is None:
+                        k = cp_model.new_int_var(1, max(1, int(job.qty)),
+                                                 f"k_{job.key}")
+                        out[job.key] = k
+                    a = variables.task_vars[a_idx]
+                    b = variables.task_vars[idx]
+                    setup = _setup_charged(variables, built, a_idx, setup_min)
+                    cp_model.add(qty * b.start
+                                 >= qty * (a.start + setup) + k * cutting)
+                    cp_model.add(qty * b.start
+                                 >= qty * a.end - (qty - k) * cutting)
+            prev_op = op
+    return out
+
+
+def _overlaps(prev, nxt) -> bool:
+    """May ``nxt`` start before ``prev`` has finished?
+
+    The same predicate as the sibling greedy engine's ``release.overlaps``,
+    rewritten here because this package stands alone: both steps in-house,
+    and the predecessor
+    actually cutting. A step with no cycle time produces nothing gradually, so
+    its successor waits for it to complete (RULES.md:127).
+    """
+    if prev.kind not in _INHOUSE or nxt.kind not in _INHOUSE:
+        return False
+    return prev.cycle_min > 0.0
+
+
+def _setup_charged(variables, built, task_idx: int, setup_min: int):
+    """The setup minutes this task will really pay, as a linear expression.
+
+    The head bound has to know when the predecessor's FIRST piece cleared, and
+    that is ``setup + cycle`` into it — but only if it landed on a machine that
+    has a fixture to change. Which machine is a decision, so the setup is a
+    decision too, and writing it as ``setup_min if op.kind == MACHINING else 0``
+    would be the same kind-vs-machine confusion Rule 4 itself has to avoid: a
+    ``MD1/CNC1`` step is manual-kind and pays 90 on CNC1, a ``CNC1/MD1`` step is
+    machining-kind and pays nothing on MD1.
+
+    So it is read off the MODEL: one term per candidate machining machine's
+    assignment, minus any setup-free mode this task selected (Rule 4's credit —
+    a task that inherits a warm fixture pays no setup, and its successor is
+    released that much earlier). Both sums are 0/1 and a setup-free mode implies
+    its machine's assignment, so the expression is exactly the minutes charged.
+    """
+    if setup_min <= 0:
+        return 0
+    on_machining = [variables.assign_vars[(task_idx, res_idx)].present
+                    for res_idx in sorted(built.machining_res_idcs)
+                    if (task_idx, res_idx) in variables.assign_vars]
+    if not on_machining:
+        return 0
+    credited = [variables.mode_vars[mode_idx]
+                for (t_idx, _res), mode_idx in sorted(built.setup_free_modes.items())
+                if t_idx == task_idx]
+    return setup_min * (sum(on_machining) - sum(credited))
+
+
+# --------------------------------------------------------------------------- #
+# Rule 4 — 90 minutes on a CNC/VMC whenever the part or the side changes
+# --------------------------------------------------------------------------- #
+
+def add_setup_credit(cp_model, variables, built, config) -> None:
+    """Rule 4: no setup when the machine's previous job was the same
+    (item, process). Same part, same side, back to back — the fixture is already
+    on.
+
+    **The encoding is INVERTED, and that inversion is the whole point.** Charging
+    setup as a sequence-dependent cost needs one entry per ordered pair of tasks
+    per machine — 18,944 of them on the owner's book — encoded as an O(n^2)
+    circuit, which consumed an entire 90-second solve and returned no feasible
+    solution at all (``scripts/tardiness_bound.py`` around line 384). So 90
+    minutes is already IN every machining mode's duration (``model.py``), and
+    this grants the CREDIT only where Rule 4 says none is owed.
+
+    **The credit is a MODE, not a subtracted variable.** PyJobShop posts
+    ``task.processing == mode.duration`` under the selected mode, so the planned
+    ``processing == duration - credit`` is infeasible for any nonzero credit.
+    ``model._add_setup_free_modes`` therefore builds a second mode on the same
+    machine carrying the cutting time alone, and this function is what makes
+    selecting it legal.
+
+    **"Directly after" is NOT read from a sequence-variable arc.** The plan said
+    to activate ``variables.sequence_vars[res]`` and read ``arcs[(a, b)]``. Two
+    things are wrong with that, both verified rather than reasoned: (1)
+    ``Constraints._circuit_constraints`` has ALREADY run by the time this is
+    called (``CPModel.__init__`` builds the constraints eagerly), so a sequence
+    activated now gets its arc literals and no circuit, no arc-to-presence link
+    and no ``end <= start`` — the arcs are FREE BOOLEANS and the solver sets them
+    to whatever wins it a credit; (2) posting the circuit here to fix that
+    reintroduces exactly the O(n^2) structure the inversion exists to avoid.
+
+    Instead: ``b`` runs directly after ``a`` on machine ``m`` if both are on
+    ``m`` and ``b`` starts exactly when ``a`` ends. Every task is at least a
+    minute long, so nothing can hide in a zero-length gap — the condition is
+    SUFFICIENT for adjacency, which is the direction that matters (a credit
+    granted wrongly claims capacity the shop does not have). It is not necessary:
+    ``a`` ending at 19:00 and ``b`` starting at 08:00 leaves the fixture on but
+    earns nothing here, so the model over-estimates a little and stays runnable.
+    The cost is one boolean per same-part pair per machine, not per pair of
+    tasks.
+
+    ``setup_mode != "credit"`` is a no-op by construction: ``model.build`` then
+    creates no setup-free modes, so every changeover pays. Conservative
+    (durations are over-estimated, so the plan stays runnable) but NOT Rule 4 as
+    written; it ships only on the owner's say-so.
+    """
+    if not built.setup_free_modes:
+        return
+
+    # The sameness is model.build's, not a second opinion formed here: it built
+    # one setup-free mode per member of each group, and re-deriving "same part,
+    # same side" would let the two drift — a credit granted for a sameness the
+    # duration was never discounted for is 90 minutes of capacity the shop does
+    # not have.
+    for (res_idx, _sig), members in sorted(built.setup_groups.items()):
+        for b_idx in members:
+            warm = [_directly_after(cp_model, variables, res_idx, a_idx, b_idx)
+                    for a_idx in members if a_idx != b_idx]
+            free = variables.mode_vars[built.setup_free_modes[(b_idx, res_idx)]]
+            cp_model.add(free <= sum(warm) if warm else free == 0)
+
+
+def _directly_after(cp_model, variables, res_idx: int, a_idx: int, b_idx: int):
+    """A literal that, when true, means ``b`` runs on this machine immediately
+    behind ``a``.
+
+    A one-way implication on purpose. The solver may leave it false even when the
+    two do abut — that only forfeits a credit, which is the safe direction — but
+    it can never be true without both tasks really being on this machine with no
+    time between them.
+
+    One warm fixture cannot be spent twice: two tasks credited by the same ``a``
+    would both have to start at ``a.end``, and this machine's no-overlap forbids
+    that for any pair of tasks a minute long or more — which every task is
+    (``model.build`` floors every duration at 1).
+    """
+    adjacent = cp_model.new_bool_var(f"after_{a_idx}_{b_idx}_{res_idx}")
+    cp_model.add(adjacent <= variables.assign_vars[(a_idx, res_idx)].present)
+    cp_model.add(adjacent <= variables.assign_vars[(b_idx, res_idx)].present)
+    cp_model.add(
+        variables.task_vars[b_idx].start == variables.task_vars[a_idx].end
+    ).only_enforce_if(adjacent)
+    return adjacent
 
 
 # --------------------------------------------------------------------------- #

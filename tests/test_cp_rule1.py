@@ -357,7 +357,15 @@ def test_a_step_on_a_cnc_may_be_held_across_a_dark_shift_whatever_its_kind():
     rostered CNC. E2 must hold it across the dark second shift exactly as it does
     for a machining-kind step, and E1 must refuse to span it exactly as it does
     there. Judged by kind instead, this step is roster-covered but forbidden to
-    idle, so the encoding that exists to make a plan possible produces none."""
+    idle, so the encoding that exists to make a plan possible produces none.
+
+    (The span read 5,780 until Task 5 moved the 90-minute setup off the step's
+    KIND and onto the machine it lands on. A manual-kind step running on CNC1
+    changes CNC1's fixture like anything else, so it now costs exactly what the
+    machining-kind step on CNC1 costs in
+    ``test_only_e2_holds_a_part_across_an_unmanned_shift`` — 5,870, the same
+    number from the same 2,000 minutes of cutting. A deliberate behaviour
+    change, not a fudge.)"""
     machines = {"CNC1": Machine("CNC1", "CNC 1", "CNC lathe",
                                 available_hrs_per_day=19.5),
                 "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5)}
@@ -372,7 +380,7 @@ def test_a_step_on_a_cnc_may_be_held_across_a_dark_shift_whatever_its_kind():
     res = _solve_tiny(masters, batches, hold=True)
     assert res.ok
     assert res.machine_of[("B1", 1)] == "CNC1"
-    assert res.span[("B1", 1)] == (0, 5780)     # no setup on a manual step
+    assert res.span[("B1", 1)] == (0, 5870)     # setup, because it ran on a CNC
     dark = [s for s in res.built.shifts
             if _runs_in(res, ("B1", 1), s)
             and ("CNC1", s.index) not in res.manned]
