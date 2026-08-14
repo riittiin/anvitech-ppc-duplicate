@@ -71,7 +71,17 @@
 >   21 ops replayed EARLIER). Fixed by carrying `cp_start_of` (the solved start, a
 >   HARD FLOOR) and `cp_bench_of` (the bench operator, which the genome was
 >   discarding because Rule 1 rosters CNC/VMC only). Now: **completion-DATE drift is
->   EXACTLY 0 across 40 books / 280 orders.** A one-sided **LATE** residual remains
+>   EXACTLY 0 across 40 books / 280 orders — but that is an EMPIRICAL result on
+>   CONTENDED books, NOT an invariant.** Task 10 built the owner's own shape by hand
+>   — single-shift benches fed by CNC batches that run past 19:00 — and it drifts
+>   **+1 FULL DAY on every order**, under the shipping E1 default, on an OPTIMAL
+>   solve: the decoder cannot release the bench step until the feeder leaves the
+>   chuck at 19:30, by which time the single-shift bench has closed, and the next
+>   window is two days out over the weekly off. Same one-op-at-a-time cause as the
+>   minute residual below, amplified across a day boundary. **The published plan can
+>   therefore be a day later per order than the number the search optimised, on
+>   precisely this shop's shape. NEVER "fix" this by loosening the drift check.**
+>   A one-sided **LATE** residual remains
 >   at MINUTE resolution — **+83 min and +191 min are OBSERVED VALUES, not a proven
 >   bound; nothing establishes a ceiling** — because the decoder's `_JobState` tracks
 >   one op at a time and cannot release a successor while its predecessor is in the
