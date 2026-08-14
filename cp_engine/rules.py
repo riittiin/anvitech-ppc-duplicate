@@ -712,6 +712,22 @@ def pin_frozen(cp_model, variables, built, roster, pins) -> tuple:
     row wins (``decode.pin_rank``, the decoder's own tie-break, so the two can
     never disagree) and the loser's PERSON is reported, keeping its machine.
 
+    **A BENCH PIN IS WHERE ONLY — the WHO half is not applied at all.** Rule 1
+    rosters CNC/VMC (``add_roster`` iterates ``shop.machining_ids``) because
+    helpers and inspectors physically walk between manual and inspection
+    stations, so ``roster.x`` holds no entry for MD/MW/MPK/MI/CMM/DTC and there
+    is no boolean here to force. A bench mode carries its own operator
+    (``model._add_modes``) and the solver stays FREE to pick any qualified
+    person for it; the decoder staffs benches per operation for the same reason.
+    That is a property of Rule 1, not a fault in anybody's Settings row, so it is
+    NOT reported: until 2026-08-14 the missing entry fell into the message below
+    and printed "N is not on MD1 for that shift under today's Settings" about a
+    helper who IS on MD1 — a cause nobody checked (CLAUDE.md 2026-08-09), and one
+    that would have DOMINATED the owner-facing list, since ``engine.freeze``
+    freezes every in-progress non-OS step and the owner's routings are largely
+    bench steps. The row is still counted in ``applied``: its machine pin landed,
+    which is the whole of what a bench pin claims.
+
     **Only the resume shift is forced, not every shift the op may span.** Which
     shifts an operation really occupies is a decision — the model has no variable
     for it under E1 at all — and forcing the pinned person across a span the
@@ -735,6 +751,10 @@ def pin_frozen(cp_model, variables, built, roster, pins) -> tuple:
     reasons: list = []
     on_machine: dict = {}        # (machine, shift) -> operator forced there
     on_operator: dict = {}       # (operator, shift) -> machine he was forced to
+    # Which machines Rule 1 rosters at all, read off the roster ITSELF rather
+    # than re-derived from shop.machining_ids — one definition, so the test below
+    # can never disagree with the lookup it guards.
+    rostered = {mid for mid, _shift in roster.staffed}
 
     for _key, pin in sorted(pins.items(), key=lambda kv: kv[1].rank):
         task_idx = built.task_of.get((pin.job_key, pin.op_seq))
@@ -755,6 +775,11 @@ def pin_frozen(cp_model, variables, built, roster, pins) -> tuple:
         applied += 1
 
         if pin.operator is None or pin.resume_shift is None:
+            continue
+        if pin.machine not in rostered:
+            # A BENCH. Rule 1 does not roster it, so the WHO half of this pin is
+            # NOT APPLIED — the mode is free to pick any qualified person — and
+            # that is not a Settings fault to report. See the docstring.
             continue
         var = roster.x.get((pin.operator, pin.machine, pin.resume_shift))
         if var is None:

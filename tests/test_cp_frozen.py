@@ -8,12 +8,27 @@ all.
 
 **This fixture family passes vacuously by default** (CLAUDE.md, 2026-08-09), so
 every pinning assertion here is paired with a NON-VACUITY test that shows what
-the same book does with no pin. ``PINNED`` is deliberately the machine, and
+the same book does with no pin — **parametrized over the same two encodings, so
+the pairing holds leg for leg.** ``PINNED`` is deliberately the machine, and
 ``RESUMING`` the person, that the unpinned solve does NOT pick — both MEASURED,
 not assumed, and both wrong on the first draft of this file (the solver freely
 rosters S on CNC1 and N on CNC4, so pinning S there would have proved nothing).
 If a solver change ever flips a free choice the non-vacuity tests fail loudly
 rather than the pinning tests passing for free.
+
+That claim was FALSE for the E2 legs until 2026-08-14: the partners were not
+parametrized, so they measured E1 only, and under E2 both headline pins passed
+with their force deleted. Two DIFFERENT causes, neither a constant to flip:
+
+* WHERE — a resume credits away 90 minutes on the pinned machine ONLY, so the
+  pin buys its own machine a discount the solver acts on by itself. The pair now
+  charges no setup (``_NO_SETUP``), leaving the force as the only thing that can
+  choose.
+* WHO — this objective scores late days and spread, never people, so on an
+  interchangeable crew the roster is a pure TIE and the free answer is a coin
+  flip that lands on a different person under each encoding. No constant can be
+  right for both; the pair moved to ``_sole_crew_masters``, where the un-forced
+  answer is determined by qualification rather than by a tie.
 
 Run with ``./.venv/bin/python -m pytest`` — homebrew python has no pyjobshop, so
 bare pytest importorskips every test here into a vacuous pass.
@@ -35,9 +50,15 @@ PLAN_START = datetime(2026, 8, 12, 8, 0)      # a Wednesday; Thursday is the off
 # What the unpinned solve picks, MEASURED and pinned by the non-vacuity tests
 # below — never assumed. The pin then names the other machine and the other
 # person, so every assertion in this file has something to discriminate.
-FREE_MACHINE, FREE_OPERATOR = "CNC4", "N"
+FREE_MACHINE = "CNC4"
 PINNED, FREE_ON_PINNED = "CNC1", "S"
 RESUMING = "N"
+
+# The floor tests, and the WHO pair, need work the objective WANTS early — due
+# today, so every day it waits is a late-day. With a comfortable delivery date
+# nothing is ever late, the solver is indifferent about where in a 20-day
+# horizon it puts 20 minutes of work, and "it started late" proves nothing.
+_URGENT = date(2026, 8, 12)
 
 BOTH_ENCODINGS = pytest.mark.parametrize("hold", [False, True],
                                          ids=["E1", "E2"])
@@ -52,6 +73,66 @@ class _B:
         self.batch_id, self.item_code, self.qty = key, item, qty
         self.so_refs, self.delivery_date = [f"SO-{key}"], due
         self.process_remaining = remaining
+
+
+def _bench_masters():
+    """Two DEBURRING benches, two helpers on both.
+
+    Rule 1 rosters CNC/VMC only (``rules.add_roster`` iterates
+    ``shop.machining_ids``) — helpers and inspectors physically walk between
+    manual and inspection stations — so a bench is a different shape of pin: the
+    machine is forced, and the WHO half is not applied at all.
+    """
+    return Masters(
+        machines={
+            "MD1": Machine("MD1", "Deburring 1", "Manual", available_hrs_per_day=11.0),
+            "MD2": Machine("MD2", "Deburring 2", "Manual", available_hrs_per_day=11.0),
+        },
+        routings={"A": Routing("A", "a", "cust", "rm", None, [
+            Process(1, "DEBURING", 5.0, None, None, "MD1/MD2")])},
+        operators=[Operator(n, "MD1/MD2", ["MD1", "MD2"], "First shift")
+                   for n in ("N", "S")],
+        calendar=WorkCalendar())
+
+
+def _sole_crew_masters():
+    """``RESUMING`` is the ONLY person who can run ``FREE_MACHINE``.
+
+    WHO is a pure tie for this objective — it scores late days and spread, never
+    people — so on an interchangeable crew "the free solve rosters the other
+    person" is a COIN FLIP, and it lands differently under each encoding
+    (measured 2026-08-14: with the machine pinned and nobody named, E1 puts S on
+    CNC1 and E2 puts N there). An operator assertion on that book therefore
+    cannot discriminate under both encodings no matter which name it pins.
+
+    This fixture removes the coin instead of betting on it. A second batch runs
+    on CNC4 only, and only ``RESUMING`` is qualified there, so the un-forced
+    answer is ``FREE_ON_PINNED`` on CNC1 under BOTH encodings — and forcing
+    ``RESUMING`` onto CNC1 leaves CNC4 unmanned for that shift, which costs the
+    plan two real late-days. The same shape the floor tests use: the solver
+    demonstrably wanted the other answer.
+    """
+    return Masters(
+        machines={
+            "CNC1": Machine("CNC1", "CNC 1", "CNC lathe", available_hrs_per_day=19.5),
+            "CNC4": Machine("CNC4", "CNC 4", "CNC lathe", available_hrs_per_day=19.5),
+        },
+        routings={
+            "A": Routing("A", "a", "cust", "rm", None, [
+                Process(1, "CNC FIRST SIDE", 5.0, None, None, "CNC1/CNC4")]),
+            "C": Routing("C", "c", "cust", "rm", None, [
+                Process(1, "CNC FIRST SIDE", 5.0, None, None, FREE_MACHINE)]),
+        },
+        operators=[Operator(RESUMING, "CNC1/CNC4", ["CNC1", "CNC4"], "First shift"),
+                   Operator(FREE_ON_PINNED, PINNED, [PINNED], "First shift")],
+        calendar=WorkCalendar())
+
+
+def _SOLE_CREW_BOOK():
+    """The frozen batch, plus one due TODAY that can only run on ``FREE_MACHINE``
+    — which is what makes ``RESUMING`` wanted there and the WHO force costly."""
+    return [_B("B1", "A", 10, remaining={1: 4}),
+            _B("B2", "C", 4, due=_URGENT)]
 
 
 def _masters(strip=(), night=False):
@@ -83,11 +164,11 @@ def _masters(strip=(), night=False):
         calendar=WorkCalendar())
 
 
-def _solve(batches, frozen=None, masters=None, hold=False):
+def _solve(batches, frozen=None, masters=None, hold=False, setup=90.0):
     return cp_solve.solve_book(
         batches, masters if masters is not None else _masters(),
         Config(plan_start_date=date(2026, 8, 12), scheduler="cp",
-               setup_time_min=90.0),
+               setup_time_min=setup),
         PLAN_START, time_limit=30, horizon_days=20, num_workers=1,
         frozen=frozen, hold_across_unmanned_shift=hold)
 
@@ -114,18 +195,32 @@ def _pin(machine=PINNED, operator=RESUMING, remaining_qty=4,
 # WHERE
 # --------------------------------------------------------------------------- #
 
-def test_with_no_pin_the_solver_picks_the_other_machine_and_the_other_person():
-    """Non-vacuity for every pinning test below. Measured, so the pinned
-    assertions are known to discriminate rather than assumed to."""
-    free = _solve([_B("B1", "A", 10, remaining={1: 4})])
+# ``setup_time_min=0`` on the WHERE pair, ON PURPOSE — it is the whole reason
+# the E2 leg used to prove nothing. Rule 4 is INVERTED here (90 minutes is in
+# every machining mode and credited back on a resume), so a pin makes ITS OWN
+# machine 90 minutes cheaper than the same operation anywhere else, and under E2
+# that alone is enough for the solver to select it: with the machine force
+# deleted the op STILL landed on the pinned machine (measured 2026-08-14,
+# mutation M-B). Charge no setup and the two machines are interchangeable, so
+# the force is the only thing left that can decide. The 90 minutes has its own
+# tests, below.
+_NO_SETUP = 0.0
+
+
+@BOTH_ENCODINGS
+def test_with_no_pin_the_solver_picks_the_other_machine(hold):
+    """Non-vacuity for the WHERE pin, under BOTH encodings — it used to be
+    measured under E1 only, so the E2 leg asserted nothing."""
+    free = _solve([_B("B1", "A", 10, remaining={1: 4})], hold=hold,
+                  setup=_NO_SETUP)
     assert free.status_ok
     assert free.genome["cp_machine_of"][("B1", 1)] == FREE_MACHINE
-    assert free.genome["cp_roster"][(FREE_MACHINE, 0)] == FREE_OPERATOR
 
 
 @BOTH_ENCODINGS
 def test_a_frozen_op_is_pinned_to_the_machine_it_is_physically_on(hold):
-    res = _solve([_B("B1", "A", 10, remaining={1: 4})], frozen=_pin(), hold=hold)
+    res = _solve([_B("B1", "A", 10, remaining={1: 4})], frozen=_pin(), hold=hold,
+                 setup=_NO_SETUP)
     assert res.status_ok
     assert res.genome["cp_machine_of"][("B1", 1)] == PINNED
     assert res.stats["frozen_applied"] == 1
@@ -133,22 +228,86 @@ def test_a_frozen_op_is_pinned_to_the_machine_it_is_physically_on(hold):
 
 @BOTH_ENCODINGS
 def test_a_frozen_op_pins_its_operator_onto_that_machine_for_the_shift(hold):
-    res = _solve([_B("B1", "A", 10, remaining={1: 4})],
-                 frozen=_pin(operator=RESUMING), hold=hold)
+    """See ``_sole_crew_masters``: ``RESUMING`` is the only person who can man
+    CNC4, so the un-forced answer is the OTHER person on CNC1 under both
+    encodings, and forcing him here costs the plan two real late-days."""
+    res = _solve(_SOLE_CREW_BOOK(), frozen=_pin(operator=RESUMING),
+                 masters=_sole_crew_masters(), hold=hold)
     assert res.status_ok
     assert res.genome["cp_roster"][(PINNED, 0)] == RESUMING
+    # He was WANTED on CNC4, and the pin overrode that: nobody mans CNC4 in the
+    # resume shift and the batch that needs it slips two days.
+    assert res.genome["cp_roster"].get((FREE_MACHINE, 0)) is None
+    assert res.total_late_days > 0
 
 
-def test_a_pin_with_no_operator_leaves_the_roster_to_the_solver():
+@BOTH_ENCODINGS
+def test_a_pin_with_no_operator_leaves_the_roster_to_the_solver(hold):
     """A row that names no person still pins the machine — WHERE without WHO.
 
-    Also the non-vacuity partner of the test above: on the SAME book, with the
-    machine pinned and nobody named, the solver rosters the OTHER person.
+    Also the non-vacuity partner of the test above, and the exact baseline the
+    roster-force mutation reduces to: on the SAME book, with the machine pinned
+    and nobody named, the solver rosters the OTHER person on it — now measured
+    under both encodings, not just E1.
     """
-    res = _solve([_B("B1", "A", 10, remaining={1: 4})], frozen=_pin(operator=None))
+    res = _solve(_SOLE_CREW_BOOK(), frozen=_pin(operator=None),
+                 masters=_sole_crew_masters(), hold=hold)
     assert res.status_ok
     assert res.genome["cp_machine_of"][("B1", 1)] == PINNED
     assert res.genome["cp_roster"][(PINNED, 0)] == FREE_ON_PINNED
+    assert res.genome["cp_roster"][(FREE_MACHINE, 0)] == RESUMING
+    assert res.total_late_days == 0            # nothing was given up for it
+
+
+# --------------------------------------------------------------------------- #
+# WHERE on a BENCH — where there is no WHO to apply
+# --------------------------------------------------------------------------- #
+
+@BOTH_ENCODINGS
+def test_with_no_pin_the_solver_picks_the_other_bench(hold):
+    """Non-vacuity partner for the bench pin below. Measured, under both
+    encodings, so the pin is known to move the work."""
+    free = _solve([_B("B1", "A", 10, remaining={1: 4})],
+                  masters=_bench_masters(), hold=hold)
+    assert free.status_ok
+    assert free.genome["cp_machine_of"][("B1", 1)] == "MD2"
+
+
+@BOTH_ENCODINGS
+def test_a_bench_pin_is_WHERE_only_and_is_never_reported_as_a_settings_fault(hold):
+    """The 2026-08-14 review finding, and CLAUDE.md's 2026-08-09 rule: a report
+    may never attribute a cause it did not CHECK.
+
+    ``roster.x`` holds CNC/VMC entries only, because Rule 1 rosters machining
+    machines only. So the operator lookup in ``pin_frozen`` MISSES for every
+    bench pin — and it used to report the miss as *"N is not on MD1 for that
+    shift under today's Settings"*, about a helper who IS on MD1. Nothing is
+    wrong with those Settings; this engine simply does not roster bench work by
+    shift, and the WHO half of a bench pin is not applied at all.
+
+    It would not have been a rare line either: ``engine.freeze`` freezes every
+    in-progress non-OS step and the owner's routings are largely
+    MD/MW/MPK/MI/CMM/DTC, so this list would have been mostly false accusations
+    against a correctly configured operator table.
+    """
+    res = _solve([_B("B1", "A", 10, remaining={1: 4})],
+                 frozen=_pin(machine="MD1"), masters=_bench_masters(), hold=hold)
+    assert res.status_ok
+    assert res.genome["cp_machine_of"][("B1", 1)] == "MD1"   # WHERE is physics
+    assert res.stats["frozen_applied"] == 1
+    assert res.stats["frozen_unpinned"] == []               # and nothing invented
+
+
+def test_a_machining_pin_still_reports_an_operator_it_cannot_honour():
+    """The other half of the statement above: silence is scoped to BENCHES, not
+    granted to every missing roster entry. On a machining machine — where Rule 1
+    really does roster, and the lookup therefore means something — a pinned
+    operator the Settings table no longer qualifies is still reported."""
+    res = _solve([_B("B1", "A", 10, remaining={1: 4})], frozen=_pin(),
+                 masters=_masters(strip=[(RESUMING, PINNED)]))
+    assert res.status_ok
+    assert any("under today's Settings" in reason
+               for reason in res.stats["frozen_unpinned"])
 
 
 # --------------------------------------------------------------------------- #
@@ -188,13 +347,6 @@ def test_an_unpinned_op_still_pays_its_setup():
     res = _solve([_B("B1", "A", 10, remaining={1: 4})])
     assert res.status_ok
     assert res.machine_busy_minutes(FREE_MACHINE) == 90 + 4 * 5
-
-
-# The floor tests need an order the objective WANTS early — due today, so every
-# day it waits is a late-day. With a comfortable delivery date nothing is ever
-# late, the solver is indifferent about where in a 20-day horizon it puts 20
-# minutes of work, and "it started late" proves nothing about the floor.
-_URGENT = date(2026, 8, 12)
 
 
 @BOTH_ENCODINGS
