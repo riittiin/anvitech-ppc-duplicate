@@ -71,9 +71,10 @@
 >   21 ops replayed EARLIER). Fixed by carrying `cp_start_of` (the solved start, a
 >   HARD FLOOR) and `cp_bench_of` (the bench operator, which the genome was
 >   discarding because Rule 1 rosters CNC/VMC only). Now: **completion-DATE drift is
->   EXACTLY 0 across 40 books / 280 orders.** A one-sided **LATE** residual of up to
->   **+83 min** remains at MINUTE resolution — the decoder's `_JobState` tracks one
->   op at a time and cannot release a successor while its predecessor is in the
+>   EXACTLY 0 across 40 books / 280 orders.** A one-sided **LATE** residual remains
+>   at MINUTE resolution — **+83 min and +191 min are OBSERVED VALUES, not a proven
+>   bound; nothing establishes a ceiling** — because the decoder's `_JobState` tracks
+>   one op at a time and cannot release a successor while its predecessor is in the
 >   chuck, while the CP release is a linear bound that fires mid-operation. It is
 >   INHERITED (the greedy engine has the same job state), it moves no published
 >   date, and its remedy is named in `decode.py`'s docstring. **If a shift-wise
