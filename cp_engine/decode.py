@@ -36,8 +36,10 @@ the solve never saw carry no floor and place freely.
 MEASURED RESIDUAL, and its cause, so nobody has to rediscover it. Over 40 solved
 books (280 orders) every completion replays to the SAME DATE — the unit
 ``cp_completion`` stores and the objective is scored in. At MINUTE resolution the
-residual is one-sided LATE, worst +83 min, and it has ONE cause: **this loop
-cannot release a successor while its predecessor is still in the chuck.**
+residual is one-sided LATE. It is NOT bounded here: the largest value OBSERVED is
++83 min on that harness and +191 min on an OS-blocks + scarce-crew shape, and the
+drift check is what derives the number for a given book. It has ONE cause: **this
+loop cannot release a successor while its predecessor is still in the chuck.**
 ``_JobState`` tracks one op at a time, and ``_release_successor`` runs when the
 operation is finally placed — so an operation that SPANS A SHIFT BOUNDARY defers
 its successor's release from the true release moment to its own completion, and a
@@ -259,8 +261,8 @@ def lay_out(jobs, shop, config, plan_start, g: dict, *, frozen=None) -> Plan:
     # because a pin OVERRIDES the genome's machine.
     unpinned = _apply_frozen(frozen, state, machines, shop)
     crew = _Crew(shop, roster)
-    assigned, unassigned, fallbacks = _assign(order, state, machine_of,
-                                              crew.rostered_machines)
+    assigned, unassigned, fallback_ops = _assign(order, state, machine_of,
+                                                 crew.rostered_machines)
 
     placements: list = []
     completion: dict = {}
@@ -276,7 +278,7 @@ def lay_out(jobs, shop, config, plan_start, g: dict, *, frozen=None) -> Plan:
         placements.extend(_settle_milestones(state, window.end, completion,
                                              floors))
         _run_shift(window, cursor, order, state, machines, shop, crew, assigned,
-                   fallbacks, floors, bench_of, overlap_of, config, setup_min,
+                   fallback_ops, floors, bench_of, overlap_of, config, setup_min,
                    placements, completion)
         stalled = 0 if len(placements) > before else stalled + 1
         if stalled > _STALL_WINDOWS:
@@ -334,11 +336,25 @@ def _order(by_key, ranks) -> list:
 def _floors(raw, plan_start) -> dict:
     """``(job key, op seq) -> the solved START``, as a datetime.
 
-    Stored ABSOLUTE (ISO strings) rather than as minutes from the plan start,
-    because the plan clock advances between the solve and the replay
-    (``api._stamp_plan_clock``) and a relative offset would slide the whole plan
-    by however far it moved. Datetimes are accepted too, so an in-process
-    hand-off that never went through JSON works the same way.
+    Stored ABSOLUTE (ISO strings) rather than as minutes from the plan start.
+    The reason is that a floor is only meaningful against a fixed wall clock: an
+    absolute one is self-describing, so a replay given a DIFFERENT ``plan_start``
+    from the solve gets floors that are visibly in the past and inert, rather
+    than floors that silently re-anchor to the new clock and claim to pin a plan
+    they no longer describe.
+
+    It is NOT a defence against the plan clock moving, and an earlier version of
+    this comment wrongly said it was. Nothing here survives that: ``cp_roster``
+    is keyed on a shift INDEX counted from ``plan_start``, ``_windows`` rebuilds
+    the calendar from ``plan_start``, and the clamp below lifts every past floor
+    up to it — so a replay on a later clock slides and can re-order jobs
+    (measured: solve at 12-08 08:00, replay at 13-08 moved every completion a day
+    and swapped two jobs). That is why ``lay_out`` requires the plan_start the
+    solve was given; a genome under a moved clock is STALE, and the staleness
+    banner, not this key, is what must catch it.
+
+    Datetimes are accepted too, so an in-process hand-off that never went through
+    JSON works the same way.
     """
     out: dict = {}
     for key, value in (raw or {}).items():
@@ -371,7 +387,16 @@ def _ready_at(js, op, floors):
 
 def _assign(order, state, machine_of, rostered_machines) -> tuple:
     """``(job key, op seq) -> machine``, the job keys the genome did not fully
-    cover, and the machines those uncovered ops landed on.
+    cover, and the (job, op) pairs it did not cover.
+
+    The third value is per-OP on purpose. Keyed on the MACHINE instead, one new
+    order landing on CNC1 switched pool staffing on for EVERY dark CNC1 shift for
+    the whole horizon — including the shifts carrying the genome's own solved
+    work. Measured: a solved order whose replay completed 14-08 15:10 alone
+    completed 13-08 02:10 once an unrelated 30-piece order was added, running its
+    tail through a night shift the solver had deliberately left dark. That is
+    EARLY completion drift on solved work, the one direction that must not
+    happen, and no drift harness that replays only the SOLVED book can see it.
 
     THE CONFLICT ORDER, and it is load-bearing: **a frozen pin beats the genome;
     the genome beats a fallback.** A pin is where the part physically IS. A
@@ -388,7 +413,7 @@ def _assign(order, state, machine_of, rostered_machines) -> tuple:
     """
     assigned: dict = {}
     unassigned: list = []
-    fallbacks: set = set()
+    fallback_ops: set = set()
     for key in order:
         js = state[key]
         stale = False
@@ -406,11 +431,11 @@ def _assign(order, state, machine_of, rostered_machines) -> tuple:
             mid = next((m for m in op.machine_options
                         if m in rostered_machines), op.machine_options[0])
             assigned[(key, op.seq)] = mid
-            fallbacks.add(mid)
+            fallback_ops.add((key, op.seq))
             stale = True
         if stale:
             unassigned.append(key)
-    return assigned, tuple(unassigned), frozenset(fallbacks)
+    return assigned, tuple(unassigned), frozenset(fallback_ops)
 
 
 class _Crew:
@@ -442,10 +467,9 @@ class _Crew:
                        for s, e in self.shop.absent.get(name, ()))
 
     def staff(self, mid, window, may_pool: bool) -> tuple:
-        """``(the one rostered person or None, the pool)``.
+        """``(the one rostered person or None, the pool, is this an ESCAPE)``.
 
-        Exactly one of the three outcomes, and which one is a rule, not a
-        preference:
+        Exactly one of four outcomes, and which one is a rule, not a preference:
 
         * the genome names someone who can be there -> that person, no pool. The
           decoder decides nothing.
@@ -453,19 +477,23 @@ class _Crew:
           shift, or they are away since the solve) -> the pool. The plan wants
           this machine manned; leaving it dark because the named man moved would
           take the machine out of the replay entirely, for the whole horizon.
-        * the genome names nobody. A machine it rosters SOMEWHERE was left dark
-          here on purpose — under E2 the part waits in the chuck, which is the
-          whole point of that encoding — so it stays dark, UNLESS it is carrying
-          work the genome never assigned (``may_pool``). Measured: without that
-          escape a new order laid on a barely-rostered machine waited 19 days,
-          and with one roster entry removed it got no placement at all.
+        * the genome never rosters this machine at all — a bench, or a machine
+          added since the solve -> the pool, unrestricted.
+        * the genome rosters this machine SOMEWHERE and named nobody here. It was
+          left dark on purpose (under E2 the part waits in the chuck, which is
+          the point of that encoding), so it stays dark UNLESS it is carrying an
+          op the genome never assigned. Then the pool staffs it as an **ESCAPE**,
+          and the caller must confine that shift to those ops alone — the
+          capacity exists for the new order, not for the solved book.
         """
         named = self.roster.get((mid, window.index))
         if named is not None and self.available(named, window):
-            return named, ()
-        if named is None and mid in self.rostered_machines and not may_pool:
-            return None, ()
-        return None, self._pool(mid, window)
+            return named, (), False
+        if named is None and mid in self.rostered_machines:
+            if not may_pool:
+                return None, (), False
+            return None, self._pool(mid, window), True
+        return None, self._pool(mid, window), False
 
     def _pool(self, mid, window) -> tuple:
         """Qualified, on this shift, present — name-sorted so the answer can
@@ -690,8 +718,28 @@ def _release_moment(segments, need: float):
 # One shift
 # --------------------------------------------------------------------------- #
 
+def _pending_escape_machines(order, state, assigned, fallback_ops) -> set:
+    """Machines still owing an op the genome never assigned.
+
+    Per-OP and re-derived every shift, so the escape below closes again the
+    moment the new work is done — a machine does not stay pool-staffed for the
+    rest of the horizon because one order once needed it.
+    """
+    if not fallback_ops:
+        return set()
+    out = set()
+    for key in order:
+        js = state[key]
+        for op in js.job.ops[js.idx:]:
+            if (key, op.seq) in fallback_ops:
+                mid = assigned.get((key, op.seq))
+                if mid is not None:
+                    out.add(mid)
+    return out
+
+
 def _run_shift(window, cursor, order, state, machines, shop, crew, assigned,
-               fallbacks, floors, bench_of, overlap_of, config, setup_min,
+               fallback_ops, floors, bench_of, overlap_of, config, setup_min,
                placements, completion):
     """Advance every staffed machine through one shift.
 
@@ -702,29 +750,59 @@ def _run_shift(window, cursor, order, state, machines, shop, crew, assigned,
     processed later in a fixed machine order.
     """
     live = {mid for (_key, _seq), mid in assigned.items()}
+    escapable = _pending_escape_machines(order, state, assigned, fallback_ops)
     manned: dict = {}
     benches: dict = {}
     booked: dict = {}
+    pooled: list = []
+    restricted: set = set()
     for mid in sorted(shop.machines):
         if mid not in live and machines[mid].job_key is None:
             continue                      # nothing is ever assigned here
         if not _machine_runs(shop.machines[mid], window.shift):
             continue
-        who, pool = crew.staff(mid, window, mid in fallbacks)
+        who, pool, escaped = crew.staff(mid, window, mid in escapable)
+        if escaped:
+            # The capacity exists for the op the genome never assigned, and for
+            # nothing else. Letting the solved book use it moves solved orders
+            # EARLIER, which is the one direction that must not happen.
+            restricted.add(mid)
         if who is not None:
             manned[mid] = who
         elif pool:
+            pooled.append((mid, pool))
+
+    # Reserve the genome's own people FIRST. A rostered person is on that machine
+    # for the whole shift and cannot also be at a bench — the same reservation
+    # ``rules._reserve_rostered_operators`` makes in the model (the live
+    # 2026-08-07 case ran manual stations AND CNC4). Doing this before the pool
+    # picks below is what stops a pool pick stealing a rostered man.
+    for name in manned.values():
+        booked.setdefault(name, []).append((window.start, window.end))
+
+    for mid, pool in pooled:
+        if mid in shop.machining_ids:
+            # RULE 1, and it binds the pool exactly as the roster binds the
+            # genome's own: ONE person, for the WHOLE shift. Staffing a CNC the
+            # way a bench is staffed — per operation, with only a clash check —
+            # publishes a plan in which one man runs a CNC and then walks to a
+            # bench in the same shift, which is precisely what
+            # ``roster_engine.report.operator_split_violations`` flags and what
+            # spec §8 requires to be zero.
+            pick = next((name for name in pool
+                         if not any(s < window.end and window.start < e
+                                    for s, e in booked.get(name, ()))), None)
+            if pick is None:
+                continue                  # nobody free all shift; the machine is dark
+            manned[mid] = pick
+            booked.setdefault(pick, []).append((window.start, window.end))
+        else:
             benches[mid] = pool
             for name in pool:
                 booked.setdefault(name, [])
+
     if not manned and not benches:
         return                      # every machine dark; anything in a chuck HOLDS
-
-    # A rostered person is on that machine for the whole shift and cannot also be
-    # at a bench — the same reservation ``rules._reserve_rostered_operators``
-    # makes in the model (the live 2026-08-07 case ran manual stations AND CNC4).
-    for name in manned.values():
-        booked.setdefault(name, []).append((window.start, window.end))
 
     free_at = {}
     for mid in list(manned) + list(benches):
@@ -737,16 +815,20 @@ def _run_shift(window, cursor, order, state, machines, shop, crew, assigned,
             now = free_at[mid]
             if now >= window.end - _SECOND:
                 continue
-            if machines[mid].job_key is not None:
+            only = fallback_ops if mid in restricted else None
+            ms = machines[mid]
+            if ms.job_key is not None:
+                if only is not None and (ms.job_key, ms.op_seq) not in only:
+                    continue        # solved work in the chuck; this shift is not its
                 start = now                      # the part is already in the chuck
-            elif _next_on_machine(mid, machines[mid], order, state, assigned,
-                                  floors, now) is not None:
+            elif _next_on_machine(mid, ms, order, state, assigned,
+                                  floors, now, only) is not None:
                 start = now
             else:
                 # Nothing startable yet — but work released later in THIS shift
                 # is still this shift's work; wait for it rather than going home.
                 start = _earliest_ready(mid, order, state, assigned, floors, now,
-                                        window.end)
+                                        window.end, only)
                 if start is None:
                     continue
             if best is None or (start, mid) < best:
@@ -754,11 +836,12 @@ def _run_shift(window, cursor, order, state, machines, shop, crew, assigned,
         if best is None:
             return
         start, mid = best
+        only = fallback_ops if mid in restricted else None
         if mid in benches:
             who, retry_at = _bench_operator(mid, machines[mid], order, state,
                                             assigned, floors, bench_of, shop,
                                             window, start, setup_min,
-                                            benches[mid], booked)
+                                            benches[mid], booked, only)
             if who is None:
                 # Every qualified helper is on another bench across this run. The
                 # bench waits for one — it does not take half a person, and it
@@ -769,11 +852,11 @@ def _run_shift(window, cursor, order, state, machines, shop, crew, assigned,
             who = manned[mid]
         free_at[mid] = _work(mid, machines[mid], order, state, assigned, floors,
                              shop, window, start, who, overlap_of, config,
-                             setup_min, placements, completion)
+                             setup_min, placements, completion, only)
 
 
 def _bench_operator(mid, ms, order, state, assigned, floors, bench_of, shop,
-                    window, start, setup_min, pool, booked):
+                    window, start, setup_min, pool, booked, only=None):
     """Staff a manual / inspection station.
 
     Returns ``(operator_name, None)`` and books them, or ``(None, retry_at)``
@@ -795,7 +878,7 @@ def _bench_operator(mid, ms, order, state, assigned, floors, bench_of, shop,
     the operation finishes or the shift ends.
     """
     peek = _bench_run_minutes(mid, ms, order, state, assigned, floors, shop,
-                              window, start, setup_min)
+                              window, start, setup_min, only)
     if peek is None:
         return None, window.end                   # nothing here to staff
     minutes, task_key = peek
@@ -818,7 +901,7 @@ def _bench_operator(mid, ms, order, state, assigned, floors, bench_of, shop,
 
 
 def _bench_run_minutes(mid, ms, order, state, assigned, floors, shop, window,
-                       start, setup_min):
+                       start, setup_min, only=None):
     """``(minutes this bench would hold a person from ``start``, the (job, op)
     it would run)``, or None if it has nothing to run.
 
@@ -831,7 +914,8 @@ def _bench_run_minutes(mid, ms, order, state, assigned, floors, shop, window,
         remaining = ms.remaining                  # part already on the bench
         task_key = (ms.job_key, ms.op_seq)
     else:
-        picked = _next_on_machine(mid, ms, order, state, assigned, floors, start)
+        picked = _next_on_machine(mid, ms, order, state, assigned, floors,
+                                  start, only)
         if picked is None:
             return None
         js, op = picked
@@ -842,7 +926,7 @@ def _bench_run_minutes(mid, ms, order, state, assigned, floors, shop, window,
                 (window.end - start).total_seconds() / 60.0), task_key)
 
 
-def _next_on_machine(mid, ms, order, state, assigned, floors, now):
+def _next_on_machine(mid, ms, order, state, assigned, floors, now, only=None):
     """The next job this machine runs. NOT a choice — a lookup.
 
     A part the machine is already physically holding goes first, in previous-plan
@@ -859,6 +943,8 @@ def _next_on_machine(mid, ms, order, state, assigned, floors, now):
         op = _current_op(js)
         if op is None or js.pinned.get(op.seq) != mid:
             continue          # that part has moved on; this pin is spent
+        if only is not None and (key, op.seq) not in only:
+            continue
         if _ready_at(js, op, floors) > now or js.job.qty_for(op.seq) <= 0:
             continue
         return js, op
@@ -869,13 +955,16 @@ def _next_on_machine(mid, ms, order, state, assigned, floors, now):
         op = _current_op(js)
         if op is None or assigned.get((key, op.seq)) != mid:
             continue
+        if only is not None and (key, op.seq) not in only:
+            continue          # an ESCAPE-staffed shift runs only what it was opened for
         if _ready_at(js, op, floors) > now or js.job.qty_for(op.seq) <= 0:
             continue
         return js, op
     return None
 
 
-def _earliest_ready(mid, order, state, assigned, floors, after, before):
+def _earliest_ready(mid, order, state, assigned, floors, after, before,
+                    only=None):
     """The first moment strictly after ``after`` and before ``before`` at which
     some unclaimed job could start on this machine."""
     best = None
@@ -885,6 +974,8 @@ def _earliest_ready(mid, order, state, assigned, floors, after, before):
             continue
         op = _current_op(js)
         if op is None or assigned.get((key, op.seq)) != mid:
+            continue
+        if only is not None and (key, op.seq) not in only:
             continue
         if js.job.qty_for(op.seq) <= 0:
             continue
@@ -897,7 +988,8 @@ def _earliest_ready(mid, order, state, assigned, floors, after, before):
 
 
 def _work(mid, ms, order, state, assigned, floors, shop, window, start,
-          operator, overlap_of, config, setup_min, placements, completion):
+          operator, overlap_of, config, setup_min, placements, completion,
+          only=None):
     """Advance one machine from ``start``. Returns when it is next free.
 
     The machine claims a job and does not let go until the operation is finished,
@@ -905,7 +997,8 @@ def _work(mid, ms, order, state, assigned, floors, shop, window, start,
     a free time rather than a placement per shift.
     """
     if ms.job_key is None:
-        picked = _next_on_machine(mid, ms, order, state, assigned, floors, start)
+        picked = _next_on_machine(mid, ms, order, state, assigned, floors,
+                                  start, only)
         if picked is None:
             return window.end                     # nothing to do; park it
         js, op = picked

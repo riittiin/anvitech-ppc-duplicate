@@ -174,9 +174,14 @@ def from_solution(result, built, roster, released, plan_start) -> dict:
             if mid is not None:
                 cp_machine_of[(job_key, op_seq)] = mid
                 break
-        # ABSOLUTE, not minutes-from-plan-start. The stored plan clock advances
-        # between the solve and the replay (``api._stamp_plan_clock``), and a
-        # relative offset would slide the whole plan by however far it moved.
+        # ABSOLUTE, not minutes-from-plan-start: a floor is only meaningful
+        # against a fixed wall clock, so an absolute one is self-describing and a
+        # replay on a DIFFERENT plan clock gets floors that are visibly inert
+        # rather than floors that silently re-anchor. It is NOT a defence against
+        # the plan clock moving — the shift indices in ``cp_roster`` and the
+        # decoder's whole calendar are counted from plan_start, so a genome under
+        # a moved clock is stale whatever this key holds. See
+        # ``decode._floors``.
         cp_start_of[(job_key, op_seq)] = (
             plan_start + timedelta(minutes=scheduled.start)).isoformat()
         # WHO the solver put at a bench. Rule 1 rosters CNC/VMC only, so

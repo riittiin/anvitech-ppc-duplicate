@@ -489,6 +489,153 @@ def test_a_new_order_on_a_barely_rostered_machine_is_still_planned():
     assert "B9" in plan.completion
 
 
+def _first_shifts_only_genome():
+    """CNC1 rostered in the FIRST shift of every working day and nowhere else —
+    the solver deliberately leaving the night shifts dark. Shift indices run
+    0 = 12-08 first, 1 = 12-08 second, 2 = 14-08 first (13-08 is the weekly off),
+    so the even ones are the first shifts."""
+    return {"cp_machine_of": {("B1", 1): "CNC1"},
+            "cp_roster": {("CNC1", i): "N" for i in range(0, 20, 2)},
+            "cp_overlap_of": {"B1": 1000}, "ranks": {"SO-B1\x1fA": 1},
+            "cp_completion": {}, "cp_solved_book_sig": "",
+            "cp_start_of": {("B1", 1): "2026-08-12T08:00:00"}}
+
+
+def _two_item_cnc_masters(second_shift_machines="CNC1"):
+    return _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC1")]),
+         "Z": Routing("Z", "z", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC1")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("S", second_shift_machines,
+                  second_shift_machines.split("/"), "2nd shift")])
+
+
+def test_a_new_order_never_moves_a_solved_order_earlier():
+    """THE MOVED-BOOK INVARIANT, and the one a solved-book-only drift harness
+    structurally cannot see: on a replay of the solved book ``fallback_ops`` is
+    empty, so the escape never fires and the hole stays hidden.
+
+    Measured with the escape keyed on the MACHINE for the whole horizon: B1
+    completed 14-08 15:10 alone and 13-08 **02:10** once one unrelated 30-piece
+    order landed on the same CNC — the solved order pulled 1 day 13 h EARLIER
+    through night shifts the solver had left dark on purpose. Early drift on
+    solved work is the direction that must not happen, and it also contradicts
+    this module's own rule that a freed slot is nobody's to move up into."""
+    masters = _two_item_cnc_masters()
+    g = _first_shifts_only_genome()
+    alone = _lay(masters, [_B("B1", "A", 1000)], g)
+    moved = _lay(masters, [_B("B1", "A", 1000), _B("B9", "Z", 30)], g)
+
+    assert alone.completion["B1"] == datetime(2026, 8, 14, 15, 10)
+    assert moved.completion["B1"] == alone.completion["B1"]
+    # ...and the new order is still planned, never dropped for want of staffing.
+    assert moved.dropped == ()
+    assert "B9" in moved.completion
+
+
+def test_the_escape_staffs_the_new_order_and_nothing_else():
+    """The narrow half of the same rule. The escape opens a dark shift FOR the op
+    the genome never assigned; the solved book may not ride along, so the new
+    order runs after the solved work rather than in front of it."""
+    masters = _two_item_cnc_masters()
+    plan = _lay(masters, [_B("B1", "A", 1000), _B("B9", "Z", 30)],
+                _first_shifts_only_genome())
+    b1 = [p for p in plan.placements if p.job_key == "B1"][0]
+    b9 = [p for p in plan.placements if p.job_key == "B9"][0]
+    assert b9.start >= b1.end
+    # B1 never touches a night shift: every one of its segments is inside a
+    # first-shift window, which is all the genome rostered.
+    for start, end, _who in b1.segments:
+        assert start.hour >= 8 and end.hour <= 19
+
+
+def test_a_pool_staffed_cnc_obeys_rule_1():
+    """Once a CNC falls to the pool it must be bound to ONE person for the WHOLE
+    shift, exactly as the roster binds the genome's own. Staffing it the way a
+    bench is staffed — per operation, with only a clash check — planned a
+    flexible helper on CNC1 08:00-10:00 and MD1 10:00-10:01 in the same first
+    shift: the live 2026-08-07 Sandeep Kumar shape, and precisely what
+    ``roster_engine.report.operator_split_violations`` flags. Spec §8 requires
+    that check to read 0 against a CP plan, so it is asserted here rather than
+    left for the surface that will run it."""
+    from engine.config import Config as _Config
+    from roster_engine import report as roster_report
+
+    masters = _masters(
+        {"Z": Routing("Z", "z", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC1")]),
+         "M": Routing("M", "m", "cust", "rm", None,
+                      [Process(1, "DEBURING", 1.0, None, None, "MD1")])},
+        [Operator("H", "CNC1/MD1", ["CNC1", "MD1"], "First shift"),
+         Operator("S", "CNC1", ["CNC1"], "2nd shift")])
+    g = {"cp_machine_of": {}, "cp_roster": {("CNC1", 1): "S"},
+         "cp_overlap_of": {}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B9", "Z", 30), _B("B8", "M", 1)], g)
+
+    entries = [_RosterEntry(p) for p in plan.placements if p.machine]
+    config = _Config(plan_start_date=date(2026, 8, 12), scheduler="cp")
+    assert roster_report.operator_split_violations(entries, config, masters) == []
+    assert roster_report.segmentation_violations(entries) == []
+    assert roster_report.machine_conflict_violations(entries) == []
+    # Non-vacuous: the fixture really does put H on both machines' work.
+    assert {p.machine for p in plan.placements} == {"CNC1", "MD1"}
+    assert {who for p in plan.placements for _s, _e, who in p.segments} == {"H"}
+
+
+def test_a_pool_pick_can_never_steal_a_person_the_genome_already_rostered():
+    """The pool is picked AFTER the genome's own people are reserved, and only
+    from those free for the whole shift. Taking the name-sorted first regardless
+    puts A on the CNC the genome rostered him to AND on the escape-staffed one,
+    in the same shift — Rule 1, broken by the fix that was meant to keep the new
+    order planned."""
+    from engine.config import Config as _Config
+    from roster_engine import report as roster_report
+
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC1")]),
+         "Z": Routing("Z", "z", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC4")])},
+        # A sorts first and is qualified for BOTH; Zoe is qualified for CNC4 only.
+        [Operator("A", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift"),
+         Operator("Zoe", "CNC4", ["CNC4"], "First shift"),
+         Operator("Q", "CNC4", ["CNC4"], "2nd shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1"},
+         # CNC4 IS rostered — but in the night shift, so shift 0 is dark for it.
+         "cp_roster": {("CNC1", 0): "A", ("CNC4", 1): "Q"},
+         "cp_overlap_of": {"B1": 400}, "ranks": {"SO-B1\x1fA": 1},
+         "cp_completion": {}, "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 400), _B("B9", "Z", 30)], g)
+
+    on_cnc4 = [p for p in plan.placements if p.machine == "CNC4"][0]
+    assert [who for _s, _e, who in on_cnc4.segments] == ["Zoe"]
+    entries = [_RosterEntry(p) for p in plan.placements if p.machine]
+    config = _Config(plan_start_date=date(2026, 8, 12), scheduler="cp")
+    assert roster_report.operator_split_violations(entries, config, masters) == []
+    # Non-vacuous: A really is held on CNC1 for that whole first shift.
+    on_cnc1 = [p for p in plan.placements if p.machine == "CNC1"][0]
+    assert on_cnc1.segments[0][0] == PLAN_START
+    assert [who for _s, _e, who in on_cnc1.segments][0] == "A"
+
+
+class _RosterEntry:
+    """The four fields ``roster_engine.report``'s checks read off a schedule
+    entry. Built here rather than through the app seam because that seam is a
+    later task; the checks themselves are an INDEPENDENT implementation of the
+    four rules, which is exactly what makes running them worth anything."""
+
+    def __init__(self, placement):
+        self.machine = placement.machine
+        self.op_segments = list(placement.segments)
+        self.start = placement.start
+        self.end = placement.end
+        self.batch_id = placement.job_key
+        self.process_seq = placement.op_seq
+
+
 def test_a_rostered_machine_whose_named_operator_left_the_shift_is_still_manned():
     """An admin edits an operator's shift after the solve. The genome still names
     him, he cannot be there, and without a fallback that machine goes dark for
