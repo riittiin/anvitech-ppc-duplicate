@@ -318,12 +318,19 @@ def _overlap_minutes(cp_model, built, task_var, task_idx, shift):
 def add_release(cp_model, variables, built, config) -> dict:
     """Rule 3: the successor starts once ``ceil(p x qty)`` pieces have cleared.
 
-    ``k_j`` is an integer DECISION — the pieces that must clear — so the solver
-    picks the overlap PER JOB instead of the whole book inheriting one tuned
-    number (spec §3). Whole pieces by construction: k is an integer, so a release
-    on 5.6 pieces cannot be expressed. One k per job, not per step boundary: the
-    overlap is a property of how a batch is handed down its routing, and the
-    previous engine's one global percentage is what this replaces.
+    ``k_j`` is an integer VARIABLE — the pieces that must clear — one per job, not
+    per step boundary: the overlap is a property of how a batch is handed down its
+    routing, and the previous engine's one global percentage is what this replaces.
+    Whole pieces by construction: k is an integer, so a release on 5.6 pieces
+    cannot be expressed.
+
+    ⚠ **It is a variable, NOT a decision, and the difference matters to anyone
+    reading this to find out where overlap is tuned. It is not tuned anywhere:
+    k ≡ 1 — maximum overlap, always.** Proof and consequences are five paragraphs
+    down ("k is a variable with no decision in it"); this sentence exists so the
+    two halves of this docstring cannot be read as contradicting each other, which
+    an earlier version of it did. Spec §3's "``p_j`` decided per job" and §5.3's
+    "integer decision per job" are superseded by the same finding.
 
     **Which quantity k is counted in.** Its domain is ``1..min(pieces still owed
     by any step it governs)`` — ``Job.qty_for``, the per-step WIP remainder, NOT

@@ -514,10 +514,12 @@ def knob_for(config):
         return "flow_chunks", FLOW_CHUNK_CANDIDATES
     if getattr(config, "scheduler", "classic") == "roster":
         return "overlap_percent", ROSTER_OVERLAP_CANDIDATES
-    # The CP engine has NO knob. Overlap is a MODEL VARIABLE there, picked per job
-    # by the solver under the same objective as everything else, so sweeping it
-    # outside would re-solve the same book N times to answer a question the model
-    # already answered — at N times the worker's wall clock. Falling through to
+    # The CP engine has NO knob, and the reason is stronger than "the model picks
+    # it": under ``cp_engine.rules.add_release`` the release size k appears only in
+    # two monotone lower bounds and in NO objective, so k = 1 is provably optimal
+    # for every book — MAXIMUM OVERLAP, ALWAYS (spec §5.3). There is nothing to
+    # sweep, so sweeping would re-solve the same book N times for the same answer
+    # at N times the worker's wall clock. Falling through to
     # the classic lineup is the silent failure: a contest that looks perfectly
     # normal and burns four solves to pick a number the model overrides.
     # ``knob_value`` below is what every caller of this must use for the CURRENT

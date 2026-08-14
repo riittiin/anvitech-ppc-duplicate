@@ -9,14 +9,22 @@ another's, the applied genome means nothing, and every screen is green.
 
 So the load-bearing test here is not any per-site assertion: it is
 ``test_no_dispatch_site_ships_without_learning_cp``, which COUNTS the sites. It
-walks the AST of the four dispatch modules, finds every function that reads
-``config.scheduler`` (or ``DEFAULT_SCHEDULER``), and fails if that set differs
-from the registry below — so an eighth branch point added by a future edit
-cannot ship untaught. A per-site assertion can only guard the sites somebody
+walks the AST of **every module under ``engine/`` and ``api/``**, finds every
+function that reads ``config.scheduler`` (or ``DEFAULT_SCHEDULER``), and fails if
+that set differs from the registry below — so a branch point added by a future
+edit cannot ship untaught. A per-site assertion can only guard the sites somebody
 already thought of; this one guards the ones nobody has written yet.
 
-The registry found **fourteen** sites, not the seven the plan's W.1 table names.
-The extra seven are real and each is wired below; see the registry's own notes.
+The registry found **sixteen** sites, not the seven the plan's W.1 table names.
+The extra nine are real and each is wired below; see the registry's own notes.
+
+THE SCANNED SET WAS ITSELF A HAND-LISTED TUPLE OF FOUR FILES, and that cost a
+real defect: ``engine/operator_coverage._day_window`` — the reporting shift
+window four published surfaces read — sat outside the scanner's view while the
+scanner's docstring claimed to count the sites, and gave cp a shop 2 h/day
+narrower than cp plans (the 2026-08-07 incident, third occurrence). It is the
+seventeenth site, and the scan is now derived (``_scanned_modules``) rather than
+listed, so the next one is found without anyone remembering to widen a tuple.
 """
 
 import ast
@@ -80,6 +88,15 @@ DISPATCH_SITES = {
     # config — it needs no branch, but validate() must accept "cp" or an admin's
     # Save 400s. Listed so the scanner's set is exact.
     ("api/main.py", "run"):                "no branch needed; validate() accepts cp",
+    # --- found only once the scan became STRUCTURAL (2026-08-14) --------------
+    ("engine/config.py", "validate"):      "cp is an accepted scheduler name",
+    # THE SEVENTEENTH SITE, and it shipped wrong: the reporting shift window for
+    # single-shift stations. cp runs them 08:00-19:00 (cp_engine.windows/
+    # decode._machine_runs); this seam gave cp the legacy manual 09:00-18:00, so
+    # Analytics, the delay report, the shift-wise export AND its shift label, and
+    # the Rule-6 machine table each described a shop 2 h/day narrower than the
+    # plan they were describing. Third occurrence of the 2026-08-07 incident.
+    ("engine/operator_coverage.py", "_day_window"): "cp -> the full first shift",
 }
 
 # Everything that asks ``optimizer.knob_for`` for the tuned setting. It returns
@@ -128,10 +145,31 @@ def _scan(rel):
     return out
 
 
+def _scanned_modules():
+    """Every app module the site scan walks — DERIVED, not hand-listed.
+
+    The first version of this file named four files, and that is precisely how a
+    live seventeenth site (``engine/operator_coverage._day_window``) sat outside
+    the scanner's view while the scanner's own docstring claimed to count the
+    sites. It described a shop 2 h/day narrower than cp plans, which is the
+    2026-08-07 incident for the THIRD time — twice-escalated, and each new engine
+    missed it on its first pass.
+
+    So the set is now structural: every ``.py`` under ``engine/`` and ``api/``.
+    A file added tomorrow is scanned the day it lands, without anyone remembering
+    to widen a tuple. ``ppc_engine/``, ``roster_engine/`` and ``cp_engine/`` are
+    each ONE engine's internals and never dispatch between engines, so they are
+    out of scope by design, not by omission; ``scripts/`` is a measurement
+    harness, not a plan path.
+    """
+    return sorted(str(p.relative_to(REPO))
+                  for base in ("engine", "api")
+                  for p in (REPO / base).rglob("*.py"))
+
+
 def _all_sites():
     found = {}
-    for rel in ("engine/pipeline.py", "engine/optimizer.py",
-                "engine/optimize_service.py", "api/main.py"):
+    for rel in _scanned_modules():
         found.update(_scan(rel))
     return found
 
@@ -702,6 +740,30 @@ def test_apply_persists_the_genome(monkeypatch):
     assert book_store.load_cp_genome()["cp_machine_of"] == {"B1\x1f1": "CNC1"}
 
 
+def test_removing_the_applied_optimization_removes_the_GENOME_TOO(monkeypatch):
+    """"Remove the applied optimization" removed only the job ORDER.
+
+    ``_optimize_clear`` called ``clear_plan_priority()`` and nothing else, while
+    ``clear_cp_genome`` was called from nowhere in production. Under cp the
+    genome is the REST of the applied plan — the machine per operation, the crew
+    roster, the bench operator and (worst) ``cp_start_of``'s HARD start floors —
+    and ``_resolve_config`` re-attaches it to every later plan. So the published
+    plan became a hybrid nobody solved: Rule-3 job order against solved machines
+    and solved start floors, while ``optimize_meta.active`` read False and the
+    screen said the optimization was gone.
+
+    The end-to-end form is the second assertion: after a clear, the config the
+    seam receives must carry NO genome."""
+    m = _api()
+    monkeypatch.delenv("DEFAULT_SCHEDULER", raising=False)
+    book_store.save_plan_priority({"k": 1}, {"saved_at": "x"})
+    book_store.save_cp_genome({"cp_overlap_of": {"B1": 5},
+                               "cp_start_of": {("B1", 1): "2026-08-20T08:00:00"}})
+    m._optimize_clear()
+    assert book_store.load_cp_genome() in (None, {})
+    assert m._resolve_config(_cfg("cp")).cp_genome in (None, {})
+
+
 def test_applying_a_plan_with_no_genome_leaves_the_stored_one_alone(monkeypatch):
     """Every other engine returns no genome; applying one of those must not wipe
     the CP genome on file."""
@@ -709,6 +771,54 @@ def test_applying_a_plan_with_no_genome_leaves_the_stored_one_alone(monkeypatch)
     m = _stage_apply(monkeypatch, scheduler="roster", genome={})
     m._optimize_apply()
     assert book_store.load_cp_genome()["cp_overlap_of"] == {"B1": 5}
+
+
+def test_a_failed_genome_write_is_never_swallowed(monkeypatch):
+    """The genome write sat in `except Exception: pass` while `save_plan_priority`
+    two lines above it did not — so a store failure produced exactly the state the
+    surrounding comment warns against: ranks applied, no genome, the decoder
+    falling back for every operation, a well-formed plan nobody searched. And
+    every downstream check is silent BY DESIGN there — `_report_unassigned`
+    returns early with no genome, `completion_drift` and `genome_stale` return [].
+    The two writes are one applied plan; half of it is worse than none of it."""
+    m = _stage_apply(monkeypatch, genome={"cp_machine_of": {("B1", 1): "CNC1"}})
+
+    def boom(_g):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(book_store, "save_cp_genome", boom)
+    with pytest.raises(RuntimeError):
+        m._optimize_apply()
+
+
+def test_a_failed_auto_apply_leaves_a_VISIBLE_note(monkeypatch):
+    """...and because the apply now raises, the AUTO path's outer
+    `except Exception: pass` would turn it into total silence — an operator
+    presses "Done entering — update plan", the search runs for minutes and
+    nothing at all appears. That is the 2026-08-09 invisibility class exactly, so
+    the handler writes a durable note naming what happened."""
+    m = _api()
+    monkeypatch.delenv("DEFAULT_SCHEDULER", raising=False)
+    book_store.save_masters_bytes(build_sample_bytes())
+    book_store.save_plan_config(json.dumps(_cfg("cp").to_dict()))
+    book_store.save_auto_note({"text": "old", "at": "x"})
+
+    def boom():
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(m, "_auto_apply_result", boom)
+    import time as _time
+    with m._OPTIMIZE_LOCK:
+        m._OPTIMIZE.update(job_id="J9", started_mono=_time.monotonic(),
+                           state="running", auto=True)
+    m._finalize_optimize("J9", _cfg("cp"), None, "deep",
+                         winner_overlap=None, winner_flexible=False,
+                         ranks={"k": 1},
+                         best={"total_late_days": 1, "makespan_days": 1.0},
+                         evals=3, table=[], cancelled=False, genome={})
+    note = (book_store.load_auto_note() or {}).get("text", "")
+    assert note != "old", "a failed auto-apply left the previous note on screen"
+    assert "could NOT be saved" in note and "RuntimeError" in note
 
 
 def test_finalize_survives_a_mode_with_no_knob(monkeypatch):
@@ -995,6 +1105,60 @@ def test_the_absence_blocks_reach_the_cp_check(monkeypatch):
                                   "to_date": "2026-08-13"}])
     assert seen and seen[0].get("reserved"), \
         "the absence blocks never reached the CP self-check"
+
+
+# =========================================================================== #
+# THE SEVENTEENTH SITE — a report may not model a shop the engine does not plan
+# (mirror of tests/test_roster_wiring.py's pair; third occurrence of 2026-08-07)
+# =========================================================================== #
+
+def test_a_single_shift_station_is_reported_on_the_window_cp_plans():
+    """``cp_engine.windows.build_shifts`` builds the first shift from
+    ``config.first_shift_start_hour`` to ``first_shift_end_hour`` (08:00–19:00),
+    and ``cp_engine.decode._machine_runs`` lets a single-shift station run all of
+    it — citing the 2026-08-07 incident by name. ``operator_coverage._day_window``
+    gave cp the legacy manual 09:00–18:00, so Analytics, the delay justification
+    report, the shift-wise export AND its shift LABEL (a live floor document) and
+    the Rule-6 machine table each described a shop 2 h/day narrower than the plan
+    they were describing."""
+    from engine import operator_coverage
+    cp = operator_coverage._day_window(_cfg("cp"))
+    assert cp == (8 * 60, 19 * 60)
+    assert cp == operator_coverage._day_window(_cfg("new"))
+    assert cp == operator_coverage._day_window(_cfg("roster"))
+
+
+@pytest.mark.parametrize("sched", ["classic", "flow"])
+def test_the_retired_engines_keep_the_manual_window_under_cp_too(sched):
+    """A golden trace and ~500 tests ride on classic's 09:00–18:00."""
+    from engine import operator_coverage
+    assert operator_coverage._day_window(_cfg(sched)) == (9 * 60, 18 * 60)
+
+
+def test_every_planned_minute_on_a_single_shift_station_is_inside_the_window(book):
+    """The end-to-end form: plan the book on cp (the REPLAY path — no solver
+    needed, and none is installed on the server this rule is read on), then ask
+    the reporting rule where those stations were open. Under the manual window
+    every minute cp plans between 08:00–09:00 and 18:00–19:00 is invisible to
+    four published surfaces."""
+    from engine import operator_coverage
+    so_lines, masters = book
+    masters = _fully_staffed(masters)
+    cfg = _cfg("cp", apply_operator_logic=True)
+    pr = PlanRun(so_lines=list(so_lines))
+    pipeline.run_forward(pr, cfg, masters)
+    lo, hi = operator_coverage._day_window(cfg)
+    checked = 0
+    for e in pr.schedule:
+        m = masters.machines.get(e.machine)
+        if m is None or m.is_two_shift(cfg.two_shift_threshold_hours):
+            continue
+        for s, en, _who in (e.op_segments or []):
+            checked += 1
+            assert lo <= s.hour * 60 + s.minute, (e.machine, s)
+            assert en.hour * 60 + en.minute <= hi or (en.hour, en.minute) == (0, 0), \
+                (e.machine, en)
+    assert checked, "the fixture planned nothing on a single-shift station"
 
 
 # =========================================================================== #

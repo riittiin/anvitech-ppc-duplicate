@@ -69,7 +69,7 @@ rules**. Each is removed so the solver decides it.
 | --- | --- | --- |
 | Modes are `(machine × qualified operator)` pairs; one person owns a whole operation | `tardiness_bound.py:348` | Modes are `(machine)` for machining ops. The operator is **not** a per-task choice |
 | Machine options = Allotted, Suggested only as fallback | `roster_engine/domain.py::_candidates` | Allotted ∪ Suggested, deduped, Allotted first |
-| One global tuned overlap %, baked in as a fixed start-to-start lag | `tardiness_bound.py::_release_delay` | `p_j` decided per job, still `ceil(p × qty)` whole pieces |
+| One global tuned overlap %, baked in as a fixed start-to-start lag | `tardiness_bound.py::_release_delay` | ~~`p_j` decided per job, still `ceil(p × qty)` whole pieces~~ **Superseded (§5.3): `k_j` is provably always 1 — maximum overlap, always. The knob is gone because there is nothing to sweep, not because the solver tunes it.** |
 | Job order supplied by Rules 2–3 and searched by local descent | `roster_engine/search.py` | Solver sequences from scratch; no seeded order |
 | Rule 1 dropped, Rule 4 dropped | `tardiness_bound.py:22, 384` | Both enforced (§5.1, §5.4) |
 
@@ -202,13 +202,37 @@ w[t,m,s] ≤ len(s) · staffed[m,s]      no processing in an unstaffed shift
 start_s)`, clipped at 0). Exact Rule 2, but ≈ 4 constraints per `(t, m, s)`
 triple — tens of thousands even after window tightening.
 
-**Decision: E2 is the target; E1 is a flagged fallback.** Task 1 of the
+~~**Decision: E2 is the target; E1 is a flagged fallback.** Task 1 of the
 implementation plan is a measurement on the owner's real book — model size, solve
 time, and **how often the restriction actually binds under E1**. If E1 never
 binds, or binds at a cost under a late-day, E1 ships and E2 is recorded as
 measured-and-not-worth-it. The flag is `cp_hold_across_unmanned_shift`, default
 `True` (= E2). This is the one place the design deliberately leaves a measured
-decision open; it is not left open in the code.
+decision open; it is not left open in the code.~~
+
+**SUPERSEDED BY THE MEASUREMENT — E1 SHIPS, and the flag default is `False`
+(2026-08-14, owner-authorized).** The paragraph above is kept because it records
+what was believed before Task 1 ran; the measurement is what changed it, and §5.1
+above already says the outcome must be recorded here.
+
+What Task 1 found on the owner's real book:
+
+* **E2 does not scale.** From ~30 batches upward the model returns **no plan at
+  all** within the worker's time budget. An encoding that answers "infeasible" on
+  the owner's own book is not a target; it is unusable.
+* **E1's restriction binds, and its cost is bounded and small.** The solver held a
+  part across an unmanned shift in **3 of 116 operations** — the machine keeps the
+  part while nobody is there, which the shop tolerates (the part sits in the
+  chuck) and the decoder reproduces faithfully.
+
+So `cp_hold_across_unmanned_shift` ships **default `False` (= E1)**. E2 remains in
+the model behind the same flag — it is exact, and a future model that can afford
+it should be able to switch back without re-deriving the encoding. The decision is
+**not** left open in the code: `Config.cp_hold_across_unmanned_shift` defaults to
+`False` and `engine/cp_adapter.CP_HOLD_ACROSS_UNMANNED_SHIFT` carries the same
+value for the config-less path (`cp_engine.solve.solve_book`'s own default is
+`True`, so the adapter passes it explicitly rather than relying on it).
+`tests/test_cp_wiring.py` pins the shipping default.
 
 ### 5.2 Rule 2 — no segmentation
 
@@ -223,15 +247,48 @@ Free by construction, and cheaper than the rules that need work:
 
 ### 5.3 Rule 3 — overlap in whole pieces, per job
 
-`k_j ∈ {1 … qty_j}` is an integer decision per job: the pieces that must clear
-before the successor may start, i.e. `k_j = ceil(p_j × qty_j)` with `p_j` free. For
-consecutive in-house ops `a → b`:
+~~`k_j ∈ {1 … qty_j}` is an integer decision per job: the pieces that must clear
+before the successor may start, i.e. `k_j = ceil(p_j × qty_j)` with `p_j` free.~~
+For consecutive in-house ops `a → b`:
 
 ```
 start_b ≥ start_a + setup_a + k_j · cycle_a          release
 start_b ≥ end_a   − (qty_j − k_j) · cycle_a          release, from the tail
 end_b   ≥ end_a                                       pacing — b never finishes first
 ```
+
+**SUPERSEDED — `k_j` IS PROVABLY ALWAYS 1 (measured Task 6, 2026-08-14).** The
+struck text above is what was believed; this is what the model turned out to be,
+and §3's table row ("`p_j` decided per job") is superseded by the same finding.
+
+`k_j` appears **only** in the two lower bounds above, and the right-hand side of
+each is monotonically increasing in `k_j`. A successor is never *obliged* to start
+at its lower bound, so **every schedule legal at any `k_j` is also legal at
+`k_j = 1`**: the feasible set at 1 contains every other, and no objective —
+makespan, tardiness, or the fairness pair — can make `k_j > 1` strictly pay. The
+earlier belief that a tardiness objective might make it a real choice (a job
+holding a machine back for a more urgent one) is wrong: holding back is already
+free.
+
+So under this engine Rule 3 is, in effect, **"release after one piece" — maximum
+overlap, always.** That is a real statement about the owner's overlap rule, not a
+defect, and it is the reason there is genuinely nothing to sweep: this engine does
+not tune a global overlap percentage the way the incumbent's contest did. Two
+consequences the code depends on, both recorded here so a later reader does not
+conclude overlap tuning is being handled:
+
+* **there is no overlap knob under cp** (`optimizer.knob_for` → `(None, ())`,
+  `optimize_service.cloud_candidates` → one job, `cp_adapter.sweep_optimize` → one
+  solve). The *decision* is right; the reason is `k ≡ 1`, not "the solver tunes it".
+* `k_j` is **under-determined above its lower bound** — being in no objective, any
+  consistent value is equally optimal. CP-SAT's presolve fixes it to the lower
+  bound today (measured over five seeds), so `cp_overlap_of` carries 1, but nothing
+  in the model *requires* that. A decoder must read it as "at least this many
+  pieces had cleared", never as "the release this schedule needs"; the drift check
+  (§8) is what proves the replay matches the solve.
+
+The domain `1 … min(pieces still owed by any step it governs)` is still pinned by
+tests, because the domain is what fixes what `k` MEANS to a decoder.
 
 OS and dispatch keep `end_before_start` in both directions (fully sequential), and
 a step with no cycle time does not overlap — both unchanged from

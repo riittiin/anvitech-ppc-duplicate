@@ -298,16 +298,12 @@ def save_cp_genome(g: dict | None) -> None:
     genome — every later lookup simply MISSES, the decoder falls back for every
     single operation, and the plan looks perfectly well-formed. A genome arrives
     already flat whenever it came home over the wire (a cloud worker's row), so
-    the shape is checked here rather than assumed.
+    the shape is checked rather than assumed — by ``genome.as_json``, which is
+    the ONE place that question is answered (``optimize_service.run_candidate``,
+    the other boundary that must hand JSON onward, asks the same function).
     """
-    from cp_engine.genome import _TUPLE_KEYED, to_json
-    if not g:
-        get_store().kv_set(CP_GENOME_KEY, json.dumps({}))
-        return
-    flat = any(isinstance(key, str)
-               for name in _TUPLE_KEYED
-               for key in (g.get(name) or {}))
-    get_store().kv_set(CP_GENOME_KEY, json.dumps(g if flat else to_json(g)))
+    from cp_engine.genome import as_json
+    get_store().kv_set(CP_GENOME_KEY, json.dumps(as_json(g)))
 
 
 def load_cp_genome() -> dict:

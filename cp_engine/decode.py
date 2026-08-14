@@ -758,10 +758,19 @@ def _first_work_moment(mid, ms, order, state, assigned, floors, cursor, window,
 
     It reads CURRENT ops only, so work released into this shift by another
     machine's overlap mid-window is not seen and the machine waits for the next
-    window. That is a one-shift delay for pool-staffed machines only (a
-    genome-rostered machine is manned regardless of demand), it is the
-    conservative direction, and it can never drop anything: the op is still
-    current at the next window's start, when it IS seen.
+    window. That is a one-shift delay, it is the conservative direction, and it
+    can never drop anything: the op is still current at the next window's start,
+    when it IS seen.
+
+    **WHICH MACHINES THAT DELAY CAN TOUCH, stated exactly** — an earlier version
+    of this said "pool-staffed machines only (a genome-rostered machine is manned
+    regardless of demand)", and that is false for one of ``_Crew.staff``'s four
+    branches. A machine IS manned regardless of demand only while the genome's
+    named operator is available; if that person's shift was edited or they are
+    away since the solve, ``staff`` returns ``(None, pool, False)`` and the
+    machine is staffed from the pool like any other — so it is subject to this
+    question, and to this delay, exactly like an unrostered bench. Rostered is
+    therefore not a safe-list: the demand test is what decides, every time.
     """
     if ms.job_key is not None:
         # A part physically in the chuck: the machine has work by construction

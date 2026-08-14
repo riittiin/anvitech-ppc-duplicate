@@ -551,6 +551,75 @@ def test_the_escape_staffs_the_new_order_and_nothing_else():
         assert start.hour >= 8 and end.hour <= 19
 
 
+def test_the_escape_restriction_holds_AFTER_the_new_order_is_done():
+    """The DISPATCH-level half of the escape restriction, which had no test.
+
+    ``_run_shift`` narrows an escape-staffed machine to ``fallback_ops`` in three
+    places. Two of them are in the dispatch loop, and BOTH could be deleted with
+    all 93 CP tests still green — because the third (the round-3 staffing gate,
+    ``_first_work_moment(..., only=...)``) hides them: it refuses to man the
+    machine at all when the part in the chuck is solved work, so the dispatch
+    branch is never reached on any fixture that had one.
+
+    THE CASE THAT REACHES IT, and it is a real one — a MOVED book:
+
+      * B9 is a new order the genome never assigned, big enough that it does not
+        finish in the one shift the genome rostered CNC1 for. It is in the chuck
+        at 19:00, so the escape opens the night shift FOR IT and the round-3 gate
+        passes (the chuck holds a fallback op, which is in ``only``).
+      * B9 then FINISHES mid-night, and the loop asks the machine what else it
+        can run. B1's CNC step is ready (its bench predecessor released it at
+        19:00) and its solved floor is in the past — the ONLY reason it is
+        eligible at all. A solved op that never slipped is protected by
+        ``cp_start_of`` alone, which is exactly why this restriction looked
+        untested-but-safe.
+
+    With the restriction, B1 waits for the next shift the solve actually rostered.
+    Without it, B1's CNC step runs at 21:10 on 12-08 instead of 08:00 on 14-08 —
+    **1 day 11 h EARLIER, riding on capacity opened for somebody else.** Early
+    drift on solved work is the one direction that must not happen (see
+    ``_assign``'s own note, and the 2026-08-09 gap-backfill finding: pulling work
+    earlier cost the owner ~40 late-days).
+    """
+    machines = {"CNC1": Machine("CNC1", "CNC 1", "CNC lathe",
+                                available_hrs_per_day=19.5),
+                "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5)}
+    masters = _masters(
+        # B1's bench step is sized to release its CNC successor at exactly 19:00,
+        # the instant the rostered first shift ends — so the CNC step is ready in
+        # the escaped night shift and not before it.
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "DEBURING", 22.0, None, None, "MD1"),
+                       Process(2, "CNC FIRST SIDE", 1.0, None, None, "CNC1")]),
+         "Z": Routing("Z", "z", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC1")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("S", "CNC1", ["CNC1"], "2nd shift"),
+         Operator("M", "MD1", ["MD1"], "First shift")],
+        machines=machines)
+    g = {"cp_machine_of": {("B1", 1): "MD1", ("B1", 2): "CNC1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(0, 20, 2)},   # first shifts
+         "cp_overlap_of": {"B1": 30},          # no release until the bench is done
+         "ranks": {"SO-B1\x1fA": 1}, "cp_completion": {},
+         "cp_solved_book_sig": "",
+         "cp_start_of": {("B1", 1): "2026-08-12T08:00:00",
+                         ("B1", 2): "2026-08-12T08:00:00"}}
+
+    alone = _lay(masters, [_B("B1", "A", 30)], g)
+    moved = _lay(masters, [_B("B1", "A", 30), _B("B9", "Z", 700)], g)
+
+    assert alone.completion["B1"] == datetime(2026, 8, 14, 10, 0)
+    assert moved.completion["B1"] == alone.completion["B1"]
+    b1_cnc = [p for p in moved.placements
+              if p.job_key == "B1" and p.op_seq == 2][0]
+    assert b1_cnc.start == datetime(2026, 8, 14, 8, 0)
+    # NON-VACUOUS, and this is what the earlier fixtures could not produce: the
+    # escape really did fire and really did run the new order into the night.
+    b9 = [p for p in moved.placements if p.job_key == "B9"][0]
+    assert b9.end > datetime(2026, 8, 12, 19, 0)
+    assert moved.dropped == ()
+
+
 def test_a_pool_staffed_cnc_obeys_rule_1():
     """Once a CNC falls to the pool it must be bound to ONE person for the WHOLE
     shift, exactly as the roster binds the genome's own. Staffing it the way a

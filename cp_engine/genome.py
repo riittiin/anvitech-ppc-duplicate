@@ -94,6 +94,38 @@ def to_json(g: dict) -> dict:
     return out
 
 
+def is_flat(g: dict | None) -> bool:
+    """Has this genome already been through ``to_json``?
+
+    ONE definition of the shape question, because ``to_json`` is **not
+    idempotent** and the wrong answer is silent. Handed an already-flat genome,
+    ``to_json`` rebuilds each key from the first two CHARACTERS of the string
+    (``"CNC1\\x1f1"`` -> ``("C", "N")``): no exception, no malformed genome — every
+    later lookup simply MISSES, the decoder falls back for every single
+    operation, and the plan looks perfectly well-formed.
+
+    A genome arrives flat whenever it came home over the wire (a cloud worker's
+    row, the store's JSON), and tuple-keyed straight out of ``from_solution``.
+    Both shapes reach the same call sites, so every one of them asks here.
+    """
+    return any(isinstance(key, str)
+               for name in _TUPLE_KEYED
+               for key in ((g or {}).get(name) or {}))
+
+
+def as_json(g: dict | None) -> dict:
+    """``to_json``, made safe to call on a genome of EITHER shape.
+
+    Use this at any boundary that must hand JSON onward but cannot prove which
+    shape it was given — the cloud contest row (``optimize_service.run_candidate``)
+    and the store write (``book_store.save_cp_genome``). An already-flat genome
+    passes through untouched; a tuple-keyed one is flattened exactly once.
+    """
+    if not g:
+        return {}
+    return dict(g) if is_flat(g) else to_json(g)
+
+
 def from_json(raw: dict) -> dict:
     """The inverse of ``to_json``.
 

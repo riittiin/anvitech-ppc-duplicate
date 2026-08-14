@@ -67,7 +67,10 @@ def cloud_candidates(config) -> tuple:
         return CLOUD_ROSTER_OVERLAP_CANDIDATES
     if sched == "cp":
         # ONE job, not a candidate grid: the CP engine has no knob (see
-        # optimizer.knob_for) — overlap is a variable inside the model. The single
+        # optimizer.knob_for) — the release size k is in no objective, so k = 1 is
+        # provably optimal and there is nothing to sweep (spec §5.3). NOT "the
+        # solver tunes it per job"; that reading would suggest overlap tuning is
+        # being handled somewhere, and it is not — it is maximum, always. The single
         # ``None`` is the candidate VALUE that ``contest_jobs`` and
         # ``run_candidate`` then carry through as "no knob to set"; an empty tuple
         # would produce an empty contest and silently search nothing.
@@ -390,6 +393,20 @@ def pick_winner(current_overlap, current_flexible, rows, base_seed=None):
     return best
 
 
+def _cp_genome_json(g) -> dict:
+    """A CP genome in a shape ``json.dumps`` accepts, or ``{}``.
+
+    ``cp_engine.genome`` is the REPLAY path — it imports neither pyjobshop nor
+    ortools, directly or transitively (see that package's ``__init__``) — so this
+    module may import it, and the cloud worker (which has the solver) certainly
+    may. The import is local anyway so that a non-cp contest never pays for it.
+    """
+    if not g:
+        return {}
+    from cp_engine.genome import as_json
+    return as_json(g)
+
+
 def run_candidate(payload: dict, overlap: int, flexible: bool = False, *, on_progress=None,
                   should_cancel=None, seed=None) -> dict:
     """One contender, fully self-contained (safe to run in a subprocess): it
@@ -434,7 +451,19 @@ def run_candidate(payload: dict, overlap: int, flexible: bool = False, *, on_pro
             # a cloud candidate, and applying ranks WITHOUT the genome makes the
             # decoder fall back for every single operation — a well-formed plan
             # that nobody searched. {} for every other engine.
-            "genome": dict(getattr(res, "genome", None) or {}),
+            #
+            # FLATTENED HERE, and that is not decoration. ``cp_adapter.solve``
+            # returns the genome as the solver built it, and four of its eight
+            # maps are keyed by a 2-TUPLE. A row is the worker's RETURN hop:
+            # ``scripts/cloud_optimize_worker.py`` ``json.dumps``es a body
+            # containing these rows for both ``/optimize/shard-result`` and
+            # ``/optimize/result``, and ``json.dumps`` REFUSES a tuple key
+            # ("keys must be str, int, float, bool or None"). The worker's blanket
+            # ``except Exception`` turns that into an error post, so the app
+            # reports "solve worker not reachable" — false; it was reachable, and
+            # it did solve. Without this, no path can produce a stored genome.
+            # ``as_json`` is idempotent where ``to_json`` is not.
+            "genome": _cp_genome_json(getattr(res, "genome", None)),
             # The roster engine's second genome. A row is ALL the app ever sees of a
             # cloud candidate, so without it here the winning ranks would be applied
             # and then replayed against a different roster — a plan nobody searched.
@@ -496,7 +525,9 @@ def contest_jobs(payload: dict) -> list:
     # that; `getattr(config, None)` raises.
     cur_value = optimizer.knob_value(config)
     if getattr(config, "scheduler", "classic") == "cp":
-        # ONE candidate, spelled out. sweep_contenders(None, [None]) drops the
+        # ONE candidate, spelled out — cp has no knob because its release size k
+        # is in no objective (k = 1 always, spec §5.3), not because the solver
+        # tunes overlap per job. sweep_contenders(None, [None]) drops the
         # sole `None` on both of its filters and returns [], which would make the
         # whole contest an EMPTY list of jobs — a deep search that reports done in
         # milliseconds, having searched nothing, with no error anywhere.

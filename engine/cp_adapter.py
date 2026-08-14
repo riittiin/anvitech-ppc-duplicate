@@ -202,8 +202,16 @@ def solve(so_lines, config, masters, *, reserved=None, budget_evals=150,
             batches, masters, config, plan_start,
             time_limit=float(getattr(config, "cp_time_limit_sec", None)
                              or CP_TIME_LIMIT_SEC),
-            horizon_days=int(getattr(config, "cp_horizon_days", None)
-                             or CP_HORIZON_DAYS),
+            # THE CONSTANT, read directly. This used to be
+            # ``getattr(config, "cp_horizon_days", None) or CP_HORIZON_DAYS`` —
+            # and ``Config`` has no such field, so the getattr could only ever
+            # return the default. Benign in its effect, and exactly the shape of
+            # the ``cp_num_workers`` defect that made every solve single-threaded:
+            # a knob that reads as configurable, is not, and says nothing when it
+            # silently falls back. There is no horizon field on purpose (see
+            # CP_HORIZON_DAYS above — it is a measured deployment constant, not a
+            # setting), so it is read as one.
+            horizon_days=CP_HORIZON_DAYS,
             num_workers=int(getattr(config, "cp_num_workers", None) or 1),
             absent=absent, frozen=pins,
             hold_across_unmanned_shift=bool(getattr(
@@ -280,10 +288,18 @@ def sweep_optimize(so_lines, config, masters, *, budget_evals=150, seed=42,
 
     Every other engine tunes a knob OUTSIDE the search — the overlap % under
     classic/roster, the chunk count under flow — because their schedulers cannot
-    choose it. **Here the overlap is a model variable**, picked per job by the
-    solver under the same objective as everything else (``rules.add_release``),
-    so sweeping it outside would re-solve the same book N times to answer a
-    question the model already answered, at N times the worker's wall clock.
+    choose it. **Here there is no overlap to tune at all**: ``rules.add_release``
+    puts ``k_j`` (the pieces that must clear before a successor starts) in nothing
+    but two monotone lower bounds and in no objective, so ``k_j ≡ 1`` — MAXIMUM
+    OVERLAP, ALWAYS — is provably optimal for every book. Sweeping a percentage
+    outside the model would re-solve the same book N times and get the same answer
+    N times, at N times the worker's wall clock.
+
+    ⚠ Do not read this as "the solver tunes the overlap per job". It does not, and
+    an earlier version of this docstring said it did. The overlap is a MODEL
+    VARIABLE with no decision left in it (``cp_engine.rules.add_release``, and spec
+    §5.3, which records the same correction). The CONCLUSION — one solve, no knob,
+    nothing to persist — is unchanged; only the reason is.
 
     So this is ONE solve, wrapped in the ``SweepResult`` the panel and the apply
     path already speak. ``overlap_percent`` comes back UNCHANGED — Apply

@@ -2096,7 +2096,9 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
     # Fingerprint against the WINNING settings: Apply persists the winning
     # overlap into the saved plan config, so the staleness check must
     # compare future plans against exactly that config.
-    # ``_knob`` is None under the CP engine (overlap is a model variable), and both
+    # ``_knob`` is None under the CP engine — there is no overlap setting to tune
+    # (its release size is in no objective, so it is always 1: maximum overlap,
+    # spec §5.3), and both
     # ``replace(cfg, **{None: v})`` and ``getattr(cfg, None)`` raise — so the knob
     # is only applied when there IS one. Nothing else about the fingerprint changes.
     _knob, _ = optimizer.knob_for(base_config)
@@ -2144,8 +2146,20 @@ def _finalize_optimize(job_id, base_config, real_baseline, label, *,
     if _OPTIMIZE.get("auto"):
         try:
             _auto_apply_result()
-        except Exception:   # noqa: BLE001 — an auto note must never crash a result
-            pass
+        except Exception as e:   # noqa: BLE001 — an auto note must never crash a result
+            # ...but it must never be SILENT either (2026-08-09's whole lesson).
+            # `_optimize_apply` writes the ranks and the CP genome UNGUARDED on
+            # purpose — half an applied plan is worse than none — so a store
+            # failure lands here, and without a note the floor would press Done
+            # and see nothing at all.
+            try:
+                _auto_note_write(
+                    f"⚠ Checked {_ist_now().strftime('%H:%M')}: the search "
+                    f"finished but the new plan could NOT be saved "
+                    f"({type(e).__name__}). It may be only partly applied — "
+                    f"press \"Done entering — update plan\" again.")
+            except Exception:  # noqa: BLE001 — the store is what just failed
+                pass
     return True
 
 
@@ -2526,11 +2540,19 @@ def _optimize_apply():
         # An EMPTY genome is never written: every other engine returns one, and
         # applying a roster/classic plan must not wipe what is on file (the same
         # rule `crew_rank` follows below).
+        #
+        # NOT GUARDED, and deliberately unlike the snapshot below. It used to sit
+        # in `except Exception: pass`, which produced exactly the state this
+        # comment warns against: ranks applied, no genome, the decoder falling
+        # back for every operation, a well-formed plan nobody searched — and
+        # every downstream check silent BY DESIGN (`_report_unassigned` returns
+        # early with no genome; `completion_drift` and `genome_stale` return []).
+        # `save_plan_priority` two lines up is unguarded for the same reason: these
+        # two writes are one applied plan, and half of it is worse than none of it.
+        # A store failure now surfaces to the caller, which is a visible failed
+        # Apply over a silently half-applied one.
         if res.get("genome"):
-            try:
-                book_store.save_cp_genome(res["genome"])
-            except Exception:  # noqa: BLE001 — never let a store hiccup break an apply
-                pass
+            book_store.save_cp_genome(res["genome"])
         # Persist the applied plan's per-op assignment (machine/operator/time) so the
         # next "Done" can freeze whatever is in progress on its real machine. Recompute
         # from the winning ranks the same way the incumbent is scored.
@@ -2553,9 +2575,11 @@ def _optimize_apply():
         cfg = _load_plan_config()
         knob = res.get("knob") or optimizer.knob_for(cfg)[0]
         target = cfg
-        # `knob` is None under the CP engine — there is no setting to persist,
-        # because the overlap it searched is a per-job model variable that lives
-        # in the genome written above, not a single number.
+        # `knob` is None under the CP engine — there is no setting to persist.
+        # Not because the overlap it searched is "a per-job variable in the genome"
+        # (an earlier comment here said that): `cp_overlap_of` is always 1 by
+        # construction — the release size is in no objective, so maximum overlap is
+        # provably optimal for every book (spec §5.3). There is no number to save.
         if best_ov is not None and knob:
             target = replace(target, **{knob: best_ov})
         if best_flex is not None:
@@ -2578,6 +2602,18 @@ def _optimize_apply():
 
 def _optimize_clear():
     book_store.clear_plan_priority()
+    # AND THE CP GENOME, or "Remove the applied optimization" removes only the job
+    # ORDER. Under cp the genome is the rest of the applied plan — the machine per
+    # operation, the crew roster, the bench operator, and (worst) ``cp_start_of``'s
+    # HARD start floors — and ``_resolve_config`` re-attaches it to every later
+    # plan. Clearing the ranks alone therefore published a hybrid nobody solved:
+    # Rule-3 order against solved machines and solved start floors, while
+    # ``optimize_meta.active`` read False and the screen said the optimization was
+    # gone. Unconditional and engine-blind on purpose: an admin who clears under
+    # cp and then rolls DEFAULT_SCHEDULER back must not leave a genome behind that
+    # a later cutover would silently re-apply. Every other engine stores none, so
+    # this is a no-op for them.
+    book_store.clear_cp_genome()
     return {"cleared": True}
 
 

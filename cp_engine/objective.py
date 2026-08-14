@@ -48,8 +48,18 @@ Both are in DAYS, not minutes: it is the number the owner is judged on, it
 matches the app's ``(completion.date() - due_date).days``, and it keeps the
 squares small (0..60 -> 0..3600) so the chord encoding below stays tiny.
 
-WORKER-ONLY. This module imports ortools, which is deliberately absent on Render
-(see ``cp_engine/__init__.py``).
+WORKER-ONLY **BY USE, NOT BY IMPORT.** It imports ``math`` and ``typing`` and
+nothing else: every function here is handed the ``cp_model`` (an ortools
+``CpModel``) as an ARGUMENT and calls methods on it. So importing this module on
+Render — where ortools is deliberately absent (see ``cp_engine/__init__.py``) —
+would succeed; it is worker-only because its only caller is ``cp_engine.solve``,
+which does import the solver.
+
+That distinction is recorded precisely because the solver-import boundary is this
+package's load-bearing invariant: a false statement about which modules cross it
+is how a replay-path module comes to be treated as untouchable, or a worker-only
+one as safe to import. An earlier version of this line claimed "this module
+imports ortools", which it never has.
 """
 
 from __future__ import annotations

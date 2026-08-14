@@ -480,6 +480,26 @@ def test_the_cloud_worker_round_trip_carries_a_REAL_genome_home(contended,
     row = optimize_service.run_candidate(payload, overlap, flexible, seed=seed)
     assert row["genome"], "the genome never left run_candidate"
 
+    # THE RETURN HOP. The payload round-trip above is app -> worker; this is the
+    # half that was never driven, and the half that was broken: the worker
+    # ``json.dumps``es a body containing these rows for BOTH
+    # ``/optimize/shard-result`` and ``/optimize/result``
+    # (scripts/cloud_optimize_worker.py), and four of the genome's eight maps are
+    # keyed by a 2-tuple straight out of the solver — which ``json.dumps``
+    # refuses outright ("keys must be str, int, float, bool or None, not tuple").
+    # The worker's blanket ``except Exception`` swallowed it into an error post,
+    # so the app told the owner "solve worker not reachable" when it was
+    # reachable and had solved. cp has no local fallback, so NO path could
+    # produce a stored genome.
+    #
+    # This must ride on a genome from a REAL SOLVE. ``test_cp_wiring.py``'s fakes
+    # are string-keyed, which is exactly how the defect survived a whole plan.
+    assert any(isinstance(k, tuple)
+               for k in (row["genome"].get("cp_machine_of") or {})) is False, \
+        "run_candidate handed a TUPLE-keyed genome to a JSON boundary"
+    json.dumps({"job_id": "x", "shard_index": 0, "shard_total": 1,
+                "rows": [row], "evals": row["evals"], "cancelled": False})
+
     merged = optimize_service.merge_shard_rows(payload, [row], row["evals"],
                                                False)
     recovered = optimize_service.genome_of_winner(
