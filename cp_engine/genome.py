@@ -13,9 +13,10 @@ module runs on the production server, which deliberately has neither installed
 model's decisions into plain Python, and round-trip those decisions through
 JSON. Nothing here calls a solver.
 
-Why the JSON round-trip needs its own care: two of the six keys are naturally
-keyed by TUPLES — ``(machine, shift_index)`` for the roster, ``(job_key,
-op_seq)`` for the machine assignment — and JSON has no tuple-keyed object. The
+Why the JSON round-trip needs its own care: four of the eight keys are
+naturally keyed by TUPLES — ``(machine, shift_index)`` for the roster and
+``(job_key, op_seq)`` for the machine assignment, the solved start and the
+bench operator — and JSON has no tuple-keyed object. The
 tempting shortcut is ``str(key)``, and it is a silent defect: ``from_json``
 would produce a dict keyed by the STRING ``"('CNC1', 0)"``, every replay lookup
 against the real tuple ``('CNC1', 0)`` would miss, and the decoder would fall
@@ -46,7 +47,7 @@ from datetime import timedelta
 
 from engine.pipeline import KEY_SEP
 
-# The six things the solver decided (see the design spec, "The genome, and the
+# The eight things the solver decided (see the design spec, "The genome, and the
 # fast replay"). Order is the one every ``to_json``/``from_json`` round trip and
 # every "does this genome have everything" check iterates in — fixed here so it
 # is never re-typed, and re-typed differently, at a second call site.
@@ -57,13 +58,17 @@ KEYS = (
     "cp_overlap_of",
     "cp_completion",
     "cp_solved_book_sig",
+    "cp_start_of",
+    "cp_bench_of",
 )
 
 # Genome keys whose value is a dict keyed by a 2-tuple, and so need the
 # KEY_SEP encoding. The other four (``ranks``, ``cp_overlap_of``,
 # ``cp_completion``, ``cp_solved_book_sig``) are already JSON-native (string or
-# scalar keys/values) and pass through untouched.
-_TUPLE_KEYED = ("cp_machine_of", "cp_roster")
+# scalar keys/values) and pass through untouched. Every VALUE is JSON-native in
+# all eight — ``cp_start_of`` carries an ISO datetime STRING, not a datetime,
+# for exactly that reason.
+_TUPLE_KEYED = ("cp_machine_of", "cp_roster", "cp_start_of", "cp_bench_of")
 
 
 def to_json(g: dict) -> dict:
@@ -72,7 +77,7 @@ def to_json(g: dict) -> dict:
     Only the documented ``KEYS`` are considered — ``from_solution`` never
     produces anything else, so there is nothing to preserve beyond them; an
     input dict with no ``KEYS`` present (``{}``) produces ``{}``, not a padded
-    six-key skeleton, so an empty genome round-trips to an empty genome.
+    eight-key skeleton, so an empty genome round-trips to an empty genome.
     """
     out: dict = {}
     for key in KEYS:
@@ -158,13 +163,33 @@ def from_solution(result, built, roster, released, plan_start) -> dict:
         for so in job.so_refs:
             ranks[f"{so}{KEY_SEP}{job.item_code}"] = i + 1
 
-    cp_machine_of = {}
+    operator_by_res = {idx: name
+                       for name, idx in built.operator_res_order.items()}
+
+    cp_machine_of, cp_start_of, cp_bench_of = {}, {}, {}
     for (job_key, op_seq), task_idx in built.task_of.items():
         scheduled = result.best.tasks[task_idx]
         for res_idx in scheduled.resources:
             mid = machine_by_res.get(res_idx)
             if mid is not None:
                 cp_machine_of[(job_key, op_seq)] = mid
+                break
+        # ABSOLUTE, not minutes-from-plan-start. The stored plan clock advances
+        # between the solve and the replay (``api._stamp_plan_clock``), and a
+        # relative offset would slide the whole plan by however far it moved.
+        cp_start_of[(job_key, op_seq)] = (
+            plan_start + timedelta(minutes=scheduled.start)).isoformat()
+        # WHO the solver put at a bench. Rule 1 rosters CNC/VMC only, so
+        # ``roster.x`` — and therefore ``cp_roster`` — names nobody here; but
+        # ``model._add_modes`` really does book a capacity-1 operator renewable
+        # on every manual/inspection mode, and throwing that away meant the
+        # decoder re-invented it and the two disagreed about who was free when.
+        # A machining mode carries no operator at all, so this map is naturally
+        # bench-only and never fights the roster.
+        for res_idx in scheduled.resources:
+            name = operator_by_res.get(res_idx)
+            if name is not None:
+                cp_bench_of[(job_key, op_seq)] = name
                 break
 
     cp_roster = {}
@@ -193,6 +218,8 @@ def from_solution(result, built, roster, released, plan_start) -> dict:
         "cp_overlap_of": cp_overlap_of,
         "cp_completion": cp_completion,
         "cp_solved_book_sig": _book_signature(built.jobs),
+        "cp_start_of": cp_start_of,
+        "cp_bench_of": cp_bench_of,
     }
 
 

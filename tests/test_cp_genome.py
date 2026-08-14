@@ -11,6 +11,14 @@ def _g():
         "cp_overlap_of": {"B1": 80},
         "cp_completion": {"B1": "2026-09-04"},
         "cp_solved_book_sig": "abc123",
+        # ABSOLUTE ISO datetime strings, never minutes from the plan start: the
+        # stored plan clock advances between the solve and the replay, and a
+        # relative offset would slide the whole plan by however far it moved.
+        "cp_start_of": {("B1", 1): "2026-08-12T08:00:00",
+                        ("B1", 2): "2026-08-12T17:50:00"},
+        # WHO the solver put at a bench. Rule 1 rosters CNC/VMC only, so
+        # ``cp_roster`` names nobody there and this is the only record of it.
+        "cp_bench_of": {("B1", 2): "Sandeep"},
     }
 
 

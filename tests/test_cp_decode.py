@@ -13,6 +13,8 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from cp_engine import decode, domain
 from engine.config import Config
 from engine.models import (Machine, Masters, Operator, Process, Routing,
@@ -339,6 +341,12 @@ def test_a_genome_machine_the_routing_no_longer_lists_falls_back_and_is_flagged(
 # --------------------------------------------------------------------------- #
 
 def test_a_frozen_op_keeps_its_machine_and_pays_no_setup_on_resume():
+    """The three numbers are DELIBERATELY different. 88 is the SO line's own
+    remainder, 369 is what the clubbed BATCH still owes, 535 is the order. A
+    frozen row pins WHERE and WHEN, never HOW MUCH — reading 88 off the row is
+    the 2026-08-11 director escalation, in which 281 pieces of a clubbed order
+    were in no plan at all. Setting the row and the batch to the SAME number
+    (the first version of this test) makes the assertion pass either way."""
     masters = _masters(_routing(),
                        [Operator("N", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift"),
                         Operator("M", "MD1", ["MD1"], "First shift")])
@@ -347,12 +355,157 @@ def test_a_frozen_op_keeps_its_machine_and_pays_no_setup_on_resume():
          "cp_overlap_of": {"B1": 10}, "ranks": {}, "cp_completion": {},
          "cp_solved_book_sig": ""}
     pins = [{"job_key": "B1", "op_seq": 1, "machine": "CNC1", "operator": "N",
-             "remaining_qty": 4, "prev_start": PLAN_START}]
-    plan = _lay(masters, [_B("B1", "A", 10, remaining={1: 4})], g, frozen=pins)
+             "remaining_qty": 88, "prev_start": PLAN_START}]
+    plan = _lay(masters, [_B("B1", "A", 535, remaining={1: 369})], g, frozen=pins)
     first = _op(plan, 1)
     assert first.machine == "CNC1"            # the pin beats the genome
-    assert first.qty == 4                     # batch remainder, never the line's
-    assert first.work_min == 4 * 5.0          # no setup on resume
+    assert first.qty == 369                   # batch remainder, never the line's 88
+    assert first.work_min == 369 * 5.0        # no setup on resume
+
+
+def test_a_frozen_pin_beats_the_solved_start():
+    """A pin beats the genome, and that includes ``cp_start_of``. The part is
+    physically in the chuck; holding a running machine back to a start the
+    solver computed for a book that has since moved would idle it for nothing."""
+    masters = _masters(_routing(),
+                       [Operator("N", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift"),
+                        Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {"B1": 10}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": "",
+         "cp_start_of": {("B1", 1): "2026-08-17T08:00:00"}}
+    pins = [{"job_key": "B1", "op_seq": 1, "machine": "CNC1", "operator": "N",
+             "remaining_qty": 10, "prev_start": PLAN_START}]
+    plan = _lay(masters, [_B("B1", "A", 10, remaining={1: 10})], g, frozen=pins)
+    assert _op(plan, 1).start == PLAN_START
+
+
+# --------------------------------------------------------------------------- #
+# The solved start is a HARD FLOOR — what makes the replay the same plan
+# --------------------------------------------------------------------------- #
+
+def test_the_solved_start_is_a_hard_floor():
+    """A single global job rank cannot reproduce a solve: the solver's real
+    decision is a per-machine sequence with starts it was free NOT to left-shift.
+    Measured before this key existed — 12 books solved OPTIMAL, replayed 1-7
+    completion-days adrift. The decoder must not pull an op earlier than the
+    solve put it, even when the machine is standing idle."""
+    masters = _masters(_routing(), [Operator("N", "CNC1", ["CNC1"], "First shift"),
+                                    Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {"B1": 10}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": "",
+         "cp_start_of": {("B1", 1): "2026-08-12T13:00:00"}}
+    plan = _lay(masters, [_B("B1", "A", 10)], g)
+    assert _op(plan, 1).start == datetime(2026, 8, 12, 13, 0)
+
+
+def test_the_floor_is_a_lower_bound_never_a_pull_forward():
+    """``max(floor, earliest feasible)``, not ``min`` and not an equality. A
+    floor in the past cannot make an op run before its predecessor delivered, and
+    cannot put anything before the plan start."""
+    masters = _masters(_routing(), [Operator("N", "CNC1", ["CNC1"], "First shift"),
+                                    Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {"B1": 100}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": "",
+         # Both floors are at or before the plan start. Neither may bind.
+         "cp_start_of": {("B1", 1): "2026-08-01T00:00:00",
+                         ("B1", 2): "2026-08-01T00:00:00"}}
+    plan = _lay(masters, [_B("B1", "A", 100)], g)
+    first, second = _op(plan, 1), _op(plan, 2)
+    assert first.start == PLAN_START
+    assert second.start == PLAN_START + timedelta(minutes=90 + 100 * 5)
+
+
+def test_the_bench_operator_comes_from_the_genome():
+    """``cp_roster`` names nobody at a bench (Rule 1 rosters CNC/VMC only), yet
+    ``model._add_modes`` really does book a capacity-1 operator renewable there.
+    Throwing that away meant the decoder re-invented it — the measured source of
+    the only LATER-than-solved drift. The name-sorted fallback would pick C."""
+    masters = _masters(_routing(), [Operator("N", "CNC1", ["CNC1"], "First shift"),
+                                    Operator("C", "MD1", ["MD1"], "First shift"),
+                                    Operator("D", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1", ("B1", 2): "MD1"},
+         "cp_roster": {("CNC1", i): "N" for i in range(20)},
+         "cp_overlap_of": {"B1": 10}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": "", "cp_bench_of": {("B1", 2): "D"}}
+    plan = _lay(masters, [_B("B1", "A", 10)], g)
+    assert [who for _s, _e, who in _op(plan, 2).segments] == ["D"]
+
+
+# --------------------------------------------------------------------------- #
+# The fallback must reach a machine somebody is actually on
+# --------------------------------------------------------------------------- #
+
+def test_an_unsolved_op_prefers_a_machine_the_genome_actually_mans():
+    """Measured on a real solve of a CNC1/CNC4 routing: the genome rostered CNC1
+    in 2 shifts of 33 and CNC4 in 31. A new order taking ``options[0]`` sat idle
+    19 DAYS waiting for CNC1's next rostered shift while CNC4 stood staffed."""
+    masters = _masters(_routing(),
+                       [Operator("N", "CNC1/CNC4", ["CNC1", "CNC4"], "First shift"),
+                        Operator("M", "MD1", ["MD1"], "First shift")])
+    g = {"cp_machine_of": {}, "cp_roster": {("CNC4", i): "N" for i in range(20)},
+         "cp_overlap_of": {}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 10)], g)
+    assert "B1" in plan.unassigned
+    assert _op(plan, 1).machine == "CNC4"     # NOT options[0], which is CNC1
+
+
+def test_a_new_order_on_a_barely_rostered_machine_is_still_planned():
+    """The other half of the same defect. Delete the genome's later roster entry
+    for CNC1 and the new order got ZERO placements and no completion — reported
+    in ``dropped``, but absent from the Gantt, which is the 2026-08-11 shape.
+
+    The rule is narrow on purpose: a rostered machine the solve left dark stays
+    dark (under E2 the part waits in the chuck, which is the point of that
+    encoding) UNLESS it is carrying work the genome never assigned.
+
+    B1 fills the ONE rostered shift to the minute (90 setup + 570 pieces = 660),
+    and B9 is a DIFFERENT item so Rule 4 grants it no warm fixture. Both matter:
+    the first version of this test let B9 tuck into the tail of shift 0 as a
+    same-part repeat and passed with the escape removed.
+    """
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC1")]),
+         "Z": Routing("Z", "z", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC1")])},
+        [Operator("N", "CNC1", ["CNC1"], "First shift"),
+         Operator("S", "CNC1", ["CNC1"], "2nd shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1"},
+         "cp_roster": {("CNC1", 0): "N"},          # ONE shift, and nothing after
+         "cp_overlap_of": {"B1": 570}, "ranks": {"SO-B1\x1fA": 1},
+         "cp_completion": {}, "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 570), _B("B9", "Z", 30)], g)
+    assert _op(plan, 1).work_min == 90 + 570        # shift 0 is full to the minute
+    assert plan.dropped == ()
+    assert "B9" in plan.unassigned
+    assert [p for p in plan.placements if p.job_key == "B9"]
+    assert "B9" in plan.completion
+
+
+def test_a_rostered_machine_whose_named_operator_left_the_shift_is_still_manned():
+    """An admin edits an operator's shift after the solve. The genome still names
+    him, he cannot be there, and without a fallback that machine goes dark for
+    the WHOLE replay — the plan wants it manned, and somebody else is qualified."""
+    masters = _masters(
+        {"A": Routing("A", "a", "cust", "rm", None,
+                      [Process(1, "CNC FIRST SIDE", 1.0, None, None, "CNC1")])},
+        [Operator("N", "CNC1", ["CNC1"], "2nd shift"),      # was First at solve time
+         Operator("S", "CNC1", ["CNC1"], "First shift")])
+    g = {"cp_machine_of": {("B1", 1): "CNC1"},
+         "cp_roster": {("CNC1", 0): "N"},
+         "cp_overlap_of": {"B1": 60}, "ranks": {}, "cp_completion": {},
+         "cp_solved_book_sig": ""}
+    plan = _lay(masters, [_B("B1", "A", 60)], g)
+    first = _op(plan, 1)
+    assert first.start == PLAN_START
+    assert [who for _s, _e, who in first.segments][0] == "S"
 
 
 # --------------------------------------------------------------------------- #
@@ -387,6 +540,125 @@ def test_one_helper_is_never_on_two_benches_at_the_same_instant():
                     f"{who} is at two machines between {start} and {end}")
             busy[who].append((start, end))
     assert {p.machine for p in plan.placements} == {"MD1", "MD2"}
+
+
+# --------------------------------------------------------------------------- #
+# Solve, then replay — spec §8's integrity check, on a REAL solve
+# --------------------------------------------------------------------------- #
+
+def _contended_book():
+    """Four jobs over a shop with two CNCs and three benches served by two
+    helpers. Helper contention is deliberate: it is what makes the per-machine
+    sequence a real decision, and it was the shape that exposed the drift."""
+    machines = {
+        "CNC1": Machine("CNC1", "CNC 1", "CNC lathe", available_hrs_per_day=19.5),
+        "CNC2": Machine("CNC2", "CNC 2", "CNC lathe", available_hrs_per_day=19.5),
+        "MD1": Machine("MD1", "MD 1", "manual", available_hrs_per_day=9.5),
+        "MD2": Machine("MD2", "MD 2", "manual", available_hrs_per_day=9.5),
+        "MI1": Machine("MI1", "MI 1", "inspection", available_hrs_per_day=9.5),
+    }
+    routings, batches = {}, []
+    for i, (cycle, qty, due) in enumerate([(2.0, 60, 14), (1.0, 120, 15),
+                                           (3.0, 40, 16), (1.0, 80, 14)]):
+        item = f"IT{i}"
+        routings[item] = Routing(item, item, "cust", "rm", None, [
+            Process(1, "CNC FIRST SIDE", cycle, None, None, "CNC1/CNC2"),
+            Process(2, "DEBURING", 0.5, None, None, "MD1/MD2"),
+            Process(3, "INSP", 0.3, None, None, "MI1")])
+        batches.append(_B(f"B{i}", item, qty, date(2026, 8, due)))
+    operators = [
+        Operator("A", "CNC1/CNC2", ["CNC1", "CNC2"], "First shift"),
+        Operator("B", "CNC1/CNC2", ["CNC1", "CNC2"], "2nd shift"),
+        Operator("C", "MD1/MD2/MI1", ["MD1", "MD2", "MI1"], "First shift"),
+        Operator("D", "MD1/MD2/MI1", ["MD1", "MD2", "MI1"], "First shift"),
+    ]
+    return _masters(routings, operators, machines), batches
+
+
+def test_a_solved_book_replays_to_the_same_completion_dates():
+    """Spec §8: on the book that was solved, drift must be 0. Not asserted with
+    a hand-built genome — this SOLVES, reads ``Solved.genome``, replays it, and
+    compares against the solver's own completions.
+
+    Measured over 40 generated books of this shape: 280 of 280 orders replay to
+    the SAME completion date, in both directions. Before ``cp_start_of`` existed
+    the same experiment drifted 1-7 days per book.
+    """
+    pytest.importorskip("pyjobshop")
+    from cp_engine import solve
+
+    masters, batches = _contended_book()
+    solved = solve.solve_book(batches, masters, _cfg(), PLAN_START,
+                              time_limit=20, horizon_days=20, num_workers=1)
+    assert solved.status_ok, solved.status
+
+    jobs, _by_key, _skipped = domain.build_jobs(batches, masters)
+    shop = domain.build_shop(masters, {})
+    plan = decode.lay_out(jobs, shop, _cfg(), PLAN_START, solved.genome)
+
+    assert plan.unassigned == ()          # the genome covers the book it solved
+    assert plan.dropped == ()
+    for key, solved_end in solved.completion.items():
+        assert plan.completion[key].date() == solved_end.date(), (
+            f"{key}: solved {solved_end}, replayed {plan.completion[key]}")
+
+
+def test_the_genome_carries_the_solved_start_and_the_bench_crew():
+    """The producing half of the pair. ``cp_start_of`` must be an ABSOLUTE ISO
+    datetime equal to the solver's own start (a relative offset would slide the
+    whole plan when the stored plan clock advances between solve and replay), and
+    ``cp_bench_of`` must actually name the helper the solver booked — Rule 1
+    rosters CNC/VMC only, so ``cp_roster`` structurally cannot."""
+    pytest.importorskip("pyjobshop")
+    from cp_engine import solve
+
+    masters, batches = _contended_book()
+    solved = solve.solve_book(batches, masters, _cfg(), PLAN_START,
+                              time_limit=20, horizon_days=20, num_workers=1)
+    assert solved.status_ok, solved.status
+
+    starts = solved.genome["cp_start_of"]
+    assert set(starts) == set(solved.windows)
+    for key, (solved_start, _end) in solved.windows.items():
+        assert (datetime.fromisoformat(starts[key])
+                == PLAN_START + timedelta(minutes=solved_start)), key
+
+    bench = solved.genome["cp_bench_of"]
+    # Every DEBURING and INSP step ran at a bench and must name its helper; no
+    # CNC step may, because a machining mode books no operator at all.
+    by_name = {o.name: o for o in masters.operators}
+    for (job_key, op_seq), who in bench.items():
+        assert op_seq in (2, 3), (job_key, op_seq)
+        assert solved.machine_of[(job_key, op_seq)] in by_name[who].machines
+    assert set(bench) == {key for key in solved.windows if key[1] in (2, 3)}
+    assert not any(key[1] == 1 for key in bench)
+
+
+def test_no_op_in_a_replayed_solve_starts_before_the_solver_put_it():
+    """The floor's own guarantee, and the reason the per-machine sequence comes
+    back without a sequence key: solved starts on one machine do not overlap, so
+    pinning every op at or after its solved start reproduces their order."""
+    pytest.importorskip("pyjobshop")
+    from cp_engine import solve
+
+    masters, batches = _contended_book()
+    solved = solve.solve_book(batches, masters, _cfg(), PLAN_START,
+                              time_limit=20, horizon_days=20, num_workers=1)
+    assert solved.status_ok, solved.status
+
+    jobs, _by_key, _skipped = domain.build_jobs(batches, masters)
+    plan = decode.lay_out(jobs, domain.build_shop(masters, {}), _cfg(),
+                          PLAN_START, solved.genome)
+    started = {}
+    for p in plan.placements:
+        started.setdefault((p.job_key, p.op_seq), p.start)
+    checked = 0
+    for key, (solved_start, _end) in solved.windows.items():
+        if key not in started:
+            continue
+        checked += 1
+        assert started[key] >= PLAN_START + timedelta(minutes=solved_start), key
+    assert checked >= len(solved.windows) - 1      # the fixture is not vacuous
 
 
 # --------------------------------------------------------------------------- #
