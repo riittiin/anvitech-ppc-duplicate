@@ -62,23 +62,29 @@ services:
       # box, so waiting would just add 3 idle minutes to every run.
       - key: ORACLE_CLAIM_TIMEOUT_MIN
         value: "0"
-      # Run the CP (constraint-programming) engine in production. The code default is
-      # 'classic' (kept for the test suite that validates that engine); this makes the
-      # deployed app use CP unless an admin explicitly picks another in Settings.
+      # Run the new operator-stable engine — the SAME engine the live Anvitech site
+      # runs (verified 2026-08-15 in the live repo riittiin/anvitech-ppc-engine:
+      # render.yaml says DEFAULT_SCHEDULER=new, and it has no cp_engine or
+      # roster_engine at all). Keeping the duplicate on `new` is what makes it a fair
+      # mirror: same engine, same plans, its own database.
       #
-      # ROLLBACK IS THIS ONE VALUE: set it back to `new` (the roster/operator-stable
-      # engine) and redeploy. The CP genome lives under its own store key that no other
-      # engine reads, so there is nothing to migrate or undo.
+      # ROLLED BACK FROM `cp` on 2026-08-15 after a live trial. The CP engine works end
+      # to end — dispatch, solve, return, score, and the apply gate all verified on the
+      # owner's real book — but its 30-minute solve did NOT beat this engine: 726
+      # late-days against the applied plan's 671, so the gate correctly refused it. The
+      # proven floor is 228, so a far better plan exists and neither engine is near it.
       #
-      # ⚠️ CP HAS NO LOCAL SOLVE FALLBACK. Render deliberately has neither pyjobshop nor
-      # ortools — it runs only the millisecond REPLAY path. The solve happens on a
-      # worker (GitHub Actions here; ORACLE_CLAIM_TIMEOUT_MIN is 0 because this
-      # duplicate has no always-on box). So GITHUB_DISPATCH_TOKEN and
-      # OPTIMIZE_WORKER_SECRET must be set on this service or "Start deep search"
-      # cannot succeed — every other engine would quietly compute locally instead.
+      # WHY IT LOST, and what would change it: CP searches from a blank sheet every
+      # run. It has no idea a current plan exists, so it can return something worse —
+      # and two earlier runs spent their entire budget just finding a FIRST feasible
+      # schedule. CP-SAT accepts a starting solution (CPModel.solve(initial_solution=)),
+      # so warm-starting from the applied plan would make a deep search incapable of
+      # returning worse than what the shop already has. That is the next thing to build
+      # if CP is revisited. Also unbuilt: a makespan term (the objective has none, so it
+      # will stretch the plan for a single late-day).
       #
-      # ⚠️ UNTIL THE FIRST DEEP SEARCH SUCCEEDS THERE IS NO GENOME, and the decoder
-      # falls back for every operation — a well-formed plan that nobody solved. The
-      # first deep search after this switch is part of the cutover, not a later step.
+      # Nothing needs migrating to come back: the CP genome lives under its own store
+      # key (anvitech:cp_genome) that no other engine reads. cp_engine/ and its 1757
+      # green tests stay in the tree.
       - key: DEFAULT_SCHEDULER
-        value: cp
+        value: new
