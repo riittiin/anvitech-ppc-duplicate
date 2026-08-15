@@ -62,29 +62,32 @@ services:
       # box, so waiting would just add 3 idle minutes to every run.
       - key: ORACLE_CLAIM_TIMEOUT_MIN
         value: "0"
-      # Run the new operator-stable engine — the SAME engine the live Anvitech site
-      # runs (verified 2026-08-15 in the live repo riittiin/anvitech-ppc-engine:
-      # render.yaml says DEFAULT_SCHEDULER=new, and it has no cp_engine or
-      # roster_engine at all). Keeping the duplicate on `new` is what makes it a fair
-      # mirror: same engine, same plans, its own database.
+      # Run the new operator-stable engine in production. The code default is 'classic'
+      # (kept for the test suite that validates that engine); this makes the deployed app
+      # use the new engine unless an admin explicitly picks another in Settings.
       #
-      # ROLLED BACK FROM `cp` on 2026-08-15 after a live trial. The CP engine works end
-      # to end — dispatch, solve, return, score, and the apply gate all verified on the
-      # owner's real book — but its 30-minute solve did NOT beat this engine: 726
-      # late-days against the applied plan's 671, so the gate correctly refused it. The
-      # proven floor is 228, so a far better plan exists and neither engine is near it.
+      # This is the SAME engine the live site runs, on purpose: same engine, same
+      # plans, its own database is what makes this deployment a fair mirror. Two
+      # alternative engines were built here and BOTH have been removed from the tree
+      # (2026-08-15); the record is kept here because the code that produced it is gone.
       #
-      # WHY IT LOST, and what would change it: CP searches from a blank sheet every
-      # run. It has no idea a current plan exists, so it can return something worse —
-      # and two earlier runs spent their entire budget just finding a FIRST feasible
-      # schedule. CP-SAT accepts a starting solution (CPModel.solve(initial_solution=)),
-      # so warm-starting from the applied plan would make a deep search incapable of
-      # returning worse than what the shop already has. That is the next thing to build
-      # if CP is revisited. Also unbuilt: a makespan term (the objective has none, so it
-      # will stretch the plan for a single late-day).
+      #   cp_engine (CP-SAT, 2026-08-14) — worked end to end: dispatch, solve, return,
+      #   score and the apply gate were all verified on the owner's real book. It lost
+      #   on merit: 726 late-days against the applied plan's 671, so the gate correctly
+      #   refused it, and two earlier runs spent their whole budget just reaching a
+      #   first feasible schedule. It searches from a blank sheet with no knowledge
+      #   that a current plan exists, so it can return something worse. Warm-starting
+      #   from the applied plan (CPModel.solve(initial_solution=)) is what would fix
+      #   that, and it was never built. Nor was a makespan term.
       #
-      # Nothing needs migrating to come back: the CP genome lives under its own store
-      # key (anvitech:cp_genome) that no other engine reads. cp_engine/ and its 1757
-      # green tests stay in the tree.
+      #   roster_engine (roster-first, 2026-08-12) — never deployed.
+      #
+      # Also removed: four 2026-08-12 scheduler changes to ppc_engine (parallel batch
+      # splitting, the per-machine booking calendar, and partial-window staffing). The
+      # calendar made every trial placement rewind to the plan start and walk forward
+      # hunting for a hole, which cost 4x the wall clock per plan — measured 1.62 s vs
+      # the live site's 0.41 s on the same book — for a plan the search could no longer
+      # afford to look for. Both engines and all of that work remain in git history and
+      # on their own branches.
       - key: DEFAULT_SCHEDULER
         value: new

@@ -32,16 +32,71 @@ confuse.
 
 ## Environment variables
 
+This is the **complete** list of every variable the code reads — audited against
+the source, not from memory. Nothing outside this list has any effect.
+
+### Must be set on Render
+
 | Variable | Meaning |
 |---|---|
 | `MONGODB_URI` | **This** deployment's own database (read/write). A separate cluster. |
 | `UPSTREAM_MONGODB_URI` | The live site's database, **read-only user**. Setting this turns on the mirror. Unset ⇒ plain standalone copy. |
-| `UPSTREAM_CACHE_TTL` | Seconds to cache live-site reads. Default 30. |
-| `ADMIN_PASSWORD` / `USER_PASSWORD` | Logins for this deployment. Use **different** passwords from the live site. |
-| `DEFAULT_SCHEDULER` | `new` (set in `render.yaml`). |
+| `ADMIN_PASSWORD` | Admin login. **There is no baked default** — unset means a fresh random secret at every boot, i.e. no working admin login at all. Use a **different** password from the live site. |
+| `USER_PASSWORD` | Floor login. Same rule: no default, must be set. |
 
-Usernames default to `anvitech` (admin) and `anvitech_user` (user); override with
-`ADMIN_USERNAME` / `USER_USERNAME`.
+### Set in `render.yaml`, no action needed
+
+| Variable | Value | Why |
+|---|---|---|
+| `DEFAULT_SCHEDULER` | `new` | The engine the live site runs. |
+| `GITHUB_REPO` | `riittiin/anvitech-ppc-duplicate` | Dispatch target. `api/main.py` refuses the mirrored repo regardless. |
+| `ORACLE_CLAIM_TIMEOUT_MIN` | `0` | No Oracle box here; skip the 3-minute claim window. |
+| `UPSTREAM_CACHE_TTL` | `30` | Seconds to cache live-site reads. |
+
+### Cloud Optimize — see the section below
+
+`GITHUB_DISPATCH_TOKEN`, `OPTIMIZE_WORKER_SECRET` on Render; `APP_URL` and
+`OPTIMIZE_WORKER_SECRET` as GitHub repo secrets.
+
+### Optional, with sane defaults — set only deliberately
+
+| Variable | Default | Notes |
+|---|---|---|
+| `OPTIMIZE_CLOUD_BUDGET_PER_CANDIDATE` | `400` | Plans per contest candidate — **the deep-search depth knob**. Total plans shown in the UI = this × candidates × 2 (the machine-set dimension). At 12 overlap candidates that is 24 jobs: `400` ⇒ 9,600 plans, `700` ⇒ 16,800. Raising it raises wall clock proportionally; see the warning below. |
+| `OPTIMIZE_CLOUD_TIMEOUT_MIN` | `40` | How long the app waits for the cloud contest before falling back to the local search on Render's 0.1 CPU. |
+| `OPTIMIZE_WORKFLOW` | `optimize.yml` | Which workflow file to dispatch. |
+| `ADMIN_USERNAME` | `anvitech` | Usernames are not secret. |
+| `USER_USERNAME` | `anvitech_user` | |
+| `APP_USERNAME` / `APP_PASSWORD` | — | **Legacy admin override that WINS over `ADMIN_USERNAME`/`ADMIN_PASSWORD`.** The live site has these set. If you copy the live site's env wholesale, these silently give this deployment the live site's admin credentials — set them to this deployment's own values or do not set them at all. |
+| `SESSION_SECRET` | — | Leave unset. It falls back to a value persisted in this deployment's own store, and `anvitech:session_secret` is in `overlay_store.NEVER_MIRRORED`, so logins here can never be signed with the live site's secret. |
+| `UPSTASH_REDIS_REST_URL` / `_TOKEN` | — | Alternative store, ranked below Mongo. Unused here. |
+| `STORE_DIR` | `data/store` | Local-file store path; only used when no Mongo/Upstash is configured. |
+| `AUTO_OPTIMIZE` | — | **Test isolation only. Never set this in a deployment** — `AUTO_OPTIMIZE=0` disables the auto re-optimize the Done button triggers. |
+| `REGEN_GOLDEN` | — | Golden-trace regeneration, local dev only. |
+
+### Sizing the deep search
+
+`OPTIMIZE_CLOUD_BUDGET_PER_CANDIDATE` is the one knob that can make Optimize
+appear broken. The contest fans out over 20 GitHub Actions shards; with 24 jobs
+six shards get two jobs each, so the slowest shard runs
+`2 × budget × seconds-per-plan`. One plan on the owner's book is ~0.4 s on a
+runner, so `400` ⇒ ~5 min and `700` ⇒ ~10 min of solving. Push it far enough and
+the shard passes `OPTIMIZE_CLOUD_TIMEOUT_MIN`, at which point the app abandons
+the cloud result and recomputes locally on 0.1 CPU — which looks like "the
+optimizer got very slow" and is really "the cloud contest is being thrown away".
+
+If the goal is for this deployment to produce the **same plans** as the live
+site, this variable must hold the **same value** on both.
+
+### A note on the plan count in the UI
+
+If the "tried N of M plans" total is not a clean multiple of
+`budget × 12 × 2`, the saved `overlap_percent` is off the contest grid.
+`optimizer.sweep_contenders` prepends the current overlap as an extra contender
+when it is not already one of `CLOUD_NEW_OVERLAP_CANDIDATES`
+(60, 65, 70, 74, 78, 80, 82, 84, 86, 88, 90, 93) — 13 contenders instead of 12,
+so the total grows by `budget × 2`. That is a stored setting, not a bug. It
+happens after applying a result searched under a different engine's grid.
 
 ## Setting it up
 

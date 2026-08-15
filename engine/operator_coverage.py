@@ -77,38 +77,16 @@ def _day_window(config):
 
     The production NEW engine (`ppc_engine.worktime.iter_windows`) skips only the
     SECOND shift for such a station, so it runs the whole FIRST shift, 08:00–19:00.
-    The ROSTER engine does the same, by its own explicit rule
-    (`roster_engine.worktime.machine_runs_shift`: "First shift is the full 08:00-19:00
-    window, NOT the legacy 09:00-18:00 manual window"). So does the CP engine:
-    `cp_engine.windows.build_shifts` builds the first shift from
-    `config.first_shift_start_hour` to `first_shift_end_hour`, and
-    `cp_engine.decode._machine_runs` lets a single-shift station run all of it —
-    citing this very incident. The retired classic and flow engines used the
-    narrower manual window, 09:00–18:00, and keep it.
+    The retired classic engine used the narrower manual window, 09:00–18:00.
 
     Reporting features must model the shop the way the engine that BUILT the plan does,
     or they describe a different shop: before this was shared (2026-08-07), Analytics
     understated those stations' capacity by 2 h/day and the delay justification report
     labelled 08:00–09:00 and 18:00–19:00 waits "outside working hours" while the shop
     was open — 158 hours of genuinely planned work on Test9 fell outside the window
-    those two features believed in. Roster was falling into exactly that hole: on the
-    repo's own sample book 83 of 83 planned minutes on single-shift stations sat
-    outside the window four features believed in (analytics.py, delay_report.py,
-    rule6_allocate's shift-wise window AND shift label, and api's Rule-6 machine
-    table).
-
-    THIRD TIME (2026-08-14, cp). This seam is not reachable from the engine that
-    plans — it is a hand-maintained mirror of a rule three engines now state
-    independently — so every new engine has to be added here by hand, and the two
-    that came after 2026-08-07 were each missed on their first pass. That is why
-    `tests/test_cp_wiring.py`'s dispatch-site scan now walks every module under
-    `engine/` and `api/` structurally instead of four hand-listed files: this
-    function is the seventeenth site, and a hand-listed set could never have seen
-    it."""
+    those two features believed in."""
     first, _second, manual = _shift_windows(config)
-    return (first
-            if getattr(config, "scheduler", "classic") in ("new", "roster", "cp")
-            else manual)
+    return first if getattr(config, "scheduler", "classic") == "new" else manual
 
 
 def eligible_window(machine, config):

@@ -41,29 +41,17 @@ from .rules import rule1_consolidate, rule2_sort_by_date, rule3_tiebreak_process
 # matches ppc_engine/config.py makespan_weight, so the two scorers finally agree.
 MAKESPAN_WEIGHT = 0.1           # == ppc_engine makespan_weight
 
-# The on-time objective (2026-08-06 spec, reshaped 2026-08-13). ONE symmetric term
-# replacing total_late_days + slip_severity: for each order take how far it misses
+# The on-time objective (2026-08-06 spec). ONE symmetric term replacing
+# total_late_days + slip_severity: for each order take how far it misses
 # its delivery date in EITHER direction, ignore the first ONTIME_BAND_DAYS, cap the
-# rest, and SUM it.
+# rest, and square it.
 #
-# It is LINEAR since 2026-08-13, at the owner's explicit request. It was SQUARED
-# from 2026-08-06 — the mechanism he asked for by name, so that ten orders 6 days
-# out (10 x 2^2 = 40) beat one order 30 days out ((30-4)^2 = 676). The measured
-# consequence was that the search REFUSED plans which cut TOTAL late-days by
-# concentrating them: a CP solver found one 86 late-days better than the live plan
-# and the optimizer correctly rejected it. Correlation between this term and total
-# late-days, on a loaded book: squared -0.61, linear +0.49. See
-# `scripts/measure_linear_ontime.py` and roster_engine/objective.py for the A/B.
+# Squaring is the mechanism the owner asked for by name: ten orders 6 days out
+# (10 x 2^2 = 40) must beat one order 30 days out ((30-4)^2 = 676). The cap stops a
+# single hopeless order swamping the plan. The band is FLAT by owner decision — no
+# pull toward the exact date; anywhere inside +/-4 days is equally on time.
 #
-# The cap stops a single hopeless order swamping the plan. The band is FLAT by
-# owner decision — no pull toward the exact date; anywhere inside +/-4 days is
-# equally on time. The ceiling and committed-promise guards below keep THEIR
-# squaring: they are no-regression barriers, not the objective.
-#
-# The three CONSTANTS must stay numerically EQUAL to ppc_engine/config.py ontime_*;
-# the SHAPE deliberately differs from it now (ppc_engine is vendored, drives only
-# the retired `new` engine, and still squares). tests/test_scorer_mirror.py pins
-# both halves of that statement.
+# Must stay numerically EQUAL to ppc_engine/config.py ontime_* .
 ONTIME_BAND_DAYS = 4.0          # == ppc_engine ontime_band_days
 ONTIME_CAP_DAYS = 60.0          # == ppc_engine ontime_cap_days
 ONTIME_WEIGHT = 1.0             # == ppc_engine ontime_weight
@@ -110,48 +98,6 @@ class OptimizeResult:
     evals: int = 0
     improved: bool = False
     cancelled: bool = False   # True when stopped early via should_cancel (best-so-far kept)
-    # The roster engine searches a SECOND genome beside the sequence: {machine id ->
-    # priority rank}, the order the roster fills machines in. It is as much a part of
-    # the answer as ``ranks`` — replay the ranks with a different crew and you get a
-    # different plan — so it is persisted by Apply alongside them. Empty for every
-    # other engine, which has no such dimension.
-    crew_rank: dict = field(default_factory=dict)
-    # The CP engine's answer is not a sequence at all: it is a decision GENOME
-    # (job order, machine per operation, crew roster, released pieces, the solved
-    # completion dates and the book it was solved against), replayed on every
-    # page load by engine/cp_adapter.run. ``ranks`` above is the genome's own job
-    # order, carried separately so Apply and pipeline.apply_priority_rank need no
-    # new vocabulary — but replay the ranks WITHOUT the genome and you get a
-    # different plan, so this is as much the artifact as they are. Empty for
-    # every other engine, which has no such thing.
-    genome: dict = field(default_factory=dict)
-
-
-# The keys ``score`` REQUIRES. Kept beside it (and read by ``scoreable`` below) so
-# the "can this be scored?" test and the scoring itself can never drift apart.
-SCORE_REQUIRED_KEYS: tuple = ("ontime_breach", "makespan_days")
-
-
-def scoreable(metrics) -> bool:
-    """True when ``metrics`` is a plan ``score`` can actually rank.
-
-    THE ONE DEFINITION OF "THIS CANDIDATE PRODUCED A PLAN", and it exists because
-    ``is None`` was never that test. ``OptimizeResult.best`` defaults to an EMPTY
-    DICT, so every search that legitimately finds nothing — most reachably
-    ``cp_adapter.solve`` when the solver returns no solution inside its time limit
-    — hands the contest ``{}``, which is not None and sails through an ``is None``
-    guard straight into ``score``, where the missing ``ontime_breach`` raises. That
-    is the 2026-08-15 live failure: "could not finalize the cloud result:
-    'ontime_breach'" on the owner's screen, twice.
-
-    The remedy is NOT to soften ``score`` (see its docstring — a defaulted
-    ``ontime_breach`` would score a missing plan as a PERFECT one). It is to ask
-    this question first, everywhere a metrics dict of unknown provenance is about
-    to be ranked: ``pick_winner`` (rows from remote workers), the classic sweep's
-    own contest, and ``api.main._finalize_optimize``.
-    """
-    return (isinstance(metrics, dict)
-            and all(k in metrics for k in SCORE_REQUIRED_KEYS))
 
 
 def score(metrics: dict) -> float:
@@ -173,9 +119,6 @@ def score(metrics: dict) -> float:
     would otherwise score as a PERFECT plan, and dicts arrive here from remote
     contest workers (engine/optimize_service.py). Fail loud, per CLAUDE.md. The
     two dormant guards below keep ``.get`` — absent means genuinely zero for them.
-
-    Callers holding a dict that may be a NON-plan (an empty ``OptimizeResult.best``,
-    a worker row) must ask ``scoreable`` first. That is the guard; this stays loud.
     """
     return (ONTIME_WEIGHT * metrics["ontime_breach"]
             + MAKESPAN_WEIGHT * metrics["makespan_days"]
@@ -272,11 +215,7 @@ def plan_metrics(schedule, so_lines, plan_start, ceiling_days=None,
         if over > 0:
             if over > ONTIME_CAP_DAYS:
                 over = ONTIME_CAP_DAYS
-            # LINEAR since 2026-08-13 (was `over * over`) — see
-            # roster_engine/objective.py for the measurement. The two scorers must
-            # keep the same SHAPE or the contest picks winners on one yardstick and
-            # reports on another.
-            ontime_breach += float(over)
+            ontime_breach += float(over * over)
     result = {
         "makespan_days": makespan_days(schedule, plan_start),
         "late_orders": len(late),
@@ -350,29 +289,6 @@ def optimize(so_lines, config, masters, *, reserved=None, budget_evals=150,
         return new_engine.optimize_sequence(
             so_lines, config, masters, reserved=reserved, budget_evals=budget_evals,
             seed=seed, on_progress=on_progress, should_cancel=should_cancel, frozen=frozen)
-    # The roster engine likewise owns its own search — over TWO genomes, the job
-    # sequence and the crew. ``frozen`` MUST be forwarded: the fall-through body
-    # below evaluates without it, which was safe only because classic and flow
-    # ignore frozen by design. The roster adapter honours it, so an unforwarded
-    # frozen set means the contest scores plans with in-progress work floating free
-    # while the applied plan pins it — the ranks would answer the wrong question.
-    if getattr(config, "scheduler", "classic") == "roster":
-        from engine import roster_adapter
-        return roster_adapter.optimize_sequence(
-            so_lines, config, masters, reserved=reserved, budget_evals=budget_evals,
-            seed=seed, on_progress=on_progress, should_cancel=should_cancel,
-            frozen=frozen)
-    # The CP engine does not SEARCH a sequence at all — it solves the whole book
-    # once, under its own objective, and the job order is one field of the genome
-    # that falls out. ``frozen`` matters for the same reason it does for roster:
-    # ``cp_adapter.run`` pins in-progress work to the machine it is physically on,
-    # so a solve that ignored it would optimise a plan the app will never build.
-    if getattr(config, "scheduler", "classic") == "cp":
-        from engine import cp_adapter
-        return cp_adapter.solve(
-            so_lines, config, masters, reserved=reserved,
-            budget_evals=budget_evals, seed=seed, on_progress=on_progress,
-            should_cancel=should_cancel, frozen=frozen)
     config.validate()
 
     batches = rule1_consolidate.run(list(so_lines), config=config, masters=masters)
@@ -519,77 +435,14 @@ FLOW_CHUNK_CANDIDATES = (4, 6)
 # over classic, without hanging the free instance.
 FLOW_LOCAL_BUDGET = 100
 
-# The owner's overlap band for the roster engine (2026-08-12). Under this
-# engine's definition (roster_engine.release) the percentage is the fraction of
-# a step's pieces that must have CLEARED before its successor may start, so 50 =
-# "start once half are done" and 100 = fully sequential. Below 50 a successor
-# starts on a handful of pieces and the shop floor stops believing the plan, so
-# the owner's band is the whole physically sane range. Six coarse points here;
-# optimize_service.CLOUD_ROSTER_OVERLAP_CANDIDATES is the finer grid the parallel
-# cloud contest fans across Actions shards.
-ROSTER_OVERLAP_CANDIDATES = (50, 60, 70, 80, 90, 100)
-
 
 def knob_for(config):
     """The ONE setting the sweep contest tunes for this scheduler mode:
     ('flow_chunks', FLOW_CHUNK_CANDIDATES) under the flow scheduler,
-    ('overlap_percent', ROSTER_OVERLAP_CANDIDATES) under the roster engine,
-    ('overlap_percent', OVERLAP_CANDIDATES) under classic Rule 6 / the new engine.
-
-    The roster branch is easy to miss because the KNOB NAME is the same as the
-    default's: forget it and the contest still runs, still tunes overlap, and
-    still looks right — it just searches classic's narrow (70, 80, 85, 88)
-    instead of the owner's 50-100 band."""
+    ('overlap_percent', OVERLAP_CANDIDATES) under classic Rule 6."""
     if getattr(config, "scheduler", "classic") == "flow":
         return "flow_chunks", FLOW_CHUNK_CANDIDATES
-    if getattr(config, "scheduler", "classic") == "roster":
-        return "overlap_percent", ROSTER_OVERLAP_CANDIDATES
-    # The CP engine has NO knob, and the reason is stronger than "the model picks
-    # it": under ``cp_engine.rules.add_release`` the release size k appears only in
-    # two monotone lower bounds and in NO objective, so k = 1 is provably optimal
-    # for every book — MAXIMUM OVERLAP, ALWAYS (spec §5.3). There is nothing to
-    # sweep, so sweeping would re-solve the same book N times for the same answer
-    # at N times the worker's wall clock. Falling through to
-    # the classic lineup is the silent failure: a contest that looks perfectly
-    # normal and burns four solves to pick a number the model overrides.
-    # ``knob_value`` below is what every caller of this must use for the CURRENT
-    # value: ``getattr(config, None)`` raises.
-    if getattr(config, "scheduler", "classic") == "cp":
-        return None, ()
     return "overlap_percent", OVERLAP_CANDIDATES
-
-
-def knob_value(config):
-    """The tuned knob's current value — ``None`` when this mode has no knob.
-
-    ``knob_for`` may return ``(None, ())``, and six call sites do
-    ``getattr(config, knob)`` or ``replace(config, **{knob: v})``; both raise
-    ``TypeError`` on ``None``. Rather than repeat the guard at each of them (and
-    miss one), "no knob" gets its own expression."""
-    knob, _cands = knob_for(config)
-    return getattr(config, knob) if knob else None
-
-
-def apply_key(metrics: dict, config=None) -> tuple:
-    """What the Apply gate ORDERS BY. Lower is better; ``<`` is "strictly better".
-
-    Under the CP engine: **total late-days, then the spread**. ``score`` below is
-    SYMMETRIC — it penalises finishing early exactly as it penalises finishing
-    late — which is right for an engine that SEARCHES on it, and wrong as the
-    acceptance test for an engine whose own objective is total lateness: measured,
-    it once made the app reject a plan 86 late-days better. ``slip_severity`` is
-    ``plan_metrics``' own capped-square spread, and it is used here because it is
-    the only spread BOTH sides of the comparison carry: the incumbent is measured
-    by ``plan_metrics``, which knows nothing of ``cp_spread``, and a gate that
-    compared two differently-derived numbers would be worse than a blunt one.
-
-    Every other engine keeps ``score`` byte-identically. They search on it, so the
-    gate that accepts their answer must read the same number, and nothing in this
-    repo may move until ``DEFAULT_SCHEDULER=cp``."""
-    if getattr(config, "scheduler", "classic") == "cp":
-        return (float(metrics.get("total_late_days", 0) or 0),
-                float(metrics.get("slip_severity", 0.0) or 0.0))
-    return (score(metrics),)
 
 
 def sweep_contenders(current_overlap=None, candidates=OVERLAP_CANDIDATES):
@@ -623,7 +476,6 @@ class SweepResult:
     table: list = field(default_factory=list)   # per-candidate probe outcomes
     evals: int = 0
     cancelled: bool = False
-    crew_rank: dict = field(default_factory=dict)   # the winning crew genome (roster)
 
 
 def sweep_optimize(so_lines, config, masters, *, budget_evals=150, seed=42,
@@ -638,27 +490,6 @@ def sweep_optimize(so_lines, config, masters, *, budget_evals=150, seed=42,
         return new_engine.sweep_optimize(
             so_lines, config, masters, budget_evals=budget_evals, seed=seed,
             on_progress=on_progress, should_cancel=should_cancel, base_reserved=base_reserved, frozen=frozen)
-    # Same for roster — and note ``frozen=`` below is NOT forwarded to
-    # _sweep_optimize_classic, which has no such parameter. That is deliberate and
-    # safe for classic/flow (they ignore frozen) and would be a silent, unnoticeable
-    # defect for roster, which does not.
-    if getattr(config, "scheduler", "classic") == "roster":
-        from engine import roster_adapter
-        return roster_adapter.sweep_optimize(
-            so_lines, config, masters, budget_evals=budget_evals, seed=seed,
-            on_progress=on_progress, should_cancel=should_cancel,
-            base_reserved=base_reserved, frozen=frozen)
-    # CP: ONE solve wrapped in a SweepResult, because there is no knob to sweep
-    # (see knob_for). Falling through to _sweep_optimize_classic would ask
-    # `getattr(config, None)` and raise — but only on the FIRST deep search after
-    # the cutover, i.e. in production, which is why it is spelled out here rather
-    # than left to the fall-through.
-    if getattr(config, "scheduler", "classic") == "cp":
-        from engine import cp_adapter
-        return cp_adapter.sweep_optimize(
-            so_lines, config, masters, budget_evals=budget_evals, seed=seed,
-            on_progress=on_progress, should_cancel=should_cancel,
-            base_reserved=base_reserved, frozen=frozen)
     return _sweep_optimize_classic(
         so_lines, config, masters, budget_evals=budget_evals, seed=seed,
         on_progress=on_progress, should_cancel=should_cancel,
@@ -722,12 +553,8 @@ def _sweep_optimize_classic(so_lines, config, masters, *, budget_evals=150, seed
 
     def _sc(res):
         """A comparable score, or None when the candidate never ran (cancelled:
-        _run returned None) or produced no plan at all.
-
-        ``scoreable``, not ``is not None``: an ``OptimizeResult`` that found nothing
-        carries an EMPTY dict, which is not None and would reach ``score`` — see
-        ``scoreable``'s docstring for the live failure that taught us."""
-        return score(res.best) if (res is not None and scoreable(res.best)) else None
+        _run returned None)."""
+        return score(res.best) if (res is not None and res.best is not None) else None
 
     # The current setting runs FIRST (an early Stop still leaves the user's
     # own setting fully searched), then every other contender gets the SAME

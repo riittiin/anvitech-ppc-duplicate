@@ -145,22 +145,6 @@ def scheduler_for(config):
         # the whole UI keeps consuming the same ScheduleEntry list.
         from . import new_engine
         return new_engine.run
-    if sched == "roster":
-        # The roster-first engine (roster_engine/, 2026-08-12 spec): the crew is
-        # rostered at the shift boundary and an operation runs to completion, so
-        # "one operator per machine per shift" is structural rather than checked.
-        # engine/roster_adapter.py is the only file that knows both worlds.
-        from . import roster_adapter
-        return roster_adapter.run
-    if sched == "cp":
-        # The CP-SAT engine (cp_engine/, 2026-08-14 spec). THE REPLAY, never a
-        # solve: cp_adapter.run decodes the stored genome in milliseconds, which
-        # is what /run needs on every page load. Wiring this to cp_adapter.solve
-        # would start a CP solve on Render's 0.5-CPU instance on every refresh —
-        # and pyjobshop is not installed there, so it would 500 rather than merely
-        # be slow.
-        from . import cp_adapter
-        return cp_adapter.run
     if sched == "flow":
         from . import flow_scheduler
         return flow_scheduler.run

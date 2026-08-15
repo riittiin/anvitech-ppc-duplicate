@@ -504,14 +504,7 @@ function optimizeProgressLine(st) {
   if (st.mode === "cloud" && (!st.evals || st.evals === 0)) {
     return "starting on GitHub Actions (spinning up the runner, ~1-2 min)…";
   }
-  // A TIME-BOXED search has no plan budget to count against. The CP engine runs
-  // ONE solve and its `evals` counts IMPROVED SOLUTIONS, not plans tried, so the
-  // server sends budget_evals = 0 and a fraction would be a fiction — "tried 3 of
-  // 0 plans", a bar that can never fill. Every other engine sends a real budget
-  // and reads exactly as before.
-  const tried = st.budget_evals
-    ? `tried ${st.evals} of ${st.budget_evals} plans${where}`
-    : `searching${where}… ${st.evals} better plan${st.evals === 1 ? "" : "s"} found so far`;
+  const tried = `tried ${st.evals} of ${st.budget_evals} plans${where}`;
   let best = "";
   if (st.best && st.best.makespan_days !== undefined) best = `, best so far: ${fmtMetrics(st.best)}`;
   else if (st.best && typeof st.best.score === "number") best = `, best score so far: ${st.best.score}`;

@@ -154,76 +154,6 @@ class Config:
     # + existing rule tests stable); the web UI defaults it ON.
     apply_operator_logic: bool = False
 
-    # The roster engine's CREW GENOME: {machine id -> priority rank}, the order the
-    # roster fills machines in when it mans a shift (roster_engine.roster). It is a
-    # second search dimension alongside the job sequence, so — exactly like
-    # ``overlap_percent`` — it is OPTIMIZER-OWNED: never typed into Settings, written
-    # only when an optimize result is applied, and replayed by every later plan so the
-    # floor keeps ONE roster instead of a fresh one on every refresh.
-    # None (and {}) mean "not set"; every other engine ignores it entirely.
-    crew_rank: Optional[dict] = None
-
-    # --- the CP engine (cp_engine/, 2026-08-14 spec) ------------------------- #
-    # Rule 2's "the part stays in the chuck" clause, as an encoding choice.
-    # False = E1: an operation may NOT span an unmanned shift. **E1 is the
-    # shipping default and that is a deliberate, owner-authorized reversal** of
-    # the provisional E2 default: measured, E2 is not a trade-off but unusable —
-    # 11x the variables, 8.5x the constraints, and it returns UNKNOWN (no plan at
-    # all) from 30 batches upward even at a 1800 s budget, while the owner's book
-    # is 61. The cost of E1 was measured too and he authorized it: the solver
-    # held a part across an unmanned shift ONCE IN 116 OPERATIONS; E1 forbids
-    # ~3 in 116. See docs/superpowers/plans/2026-08-14-cp-tractability-findings.md.
-    cp_hold_across_unmanned_shift: bool = False
-    # Phase 2's eps, in days: how much TOTAL lateness the fairness phase may
-    # spend to even the distribution out. 0 makes it a strict tie-break that can
-    # never cost a single late-day, which is the owner's rule; it is a knob only
-    # so that buying evenness would be a config change, not a redesign.
-    cp_fairness_slack_days: int = 0
-    # Seconds for ONE solve, both phases together. 900 (15 min) because Render's
-    # own OPTIMIZE_CLOUD_TIMEOUT_MIN is 20 and a budget that outlives the caller
-    # waiting for it is a budget nobody collects. This engine ships time-boxed and
-    # FEASIBLE-WITH-A-BOUND, not proved-optimal (a 2.4x gap that 6x the budget
-    # does not close) — cores buy the bound, not wall clock.
-    # 1800, NOT 900 — raised after the FIRST LIVE RUN failed on the owner's book
-    # (2026-08-14, runs 31815811927 / 31816888792). 900 s split by
-    # ``cp_engine.solve._PHASE_ONE_SHARE`` (0.6) gives PHASE 1 only 540 s, and on
-    # this book phase 1 found NO FEASIBLE SOLUTION AT ALL in that time: the worker
-    # stopped at 9 m 10 s — 540 s exactly — and reported "1 candidates, 0 plans",
-    # which the app surfaced as an opaque "could not finalize the cloud result".
-    # The tractability measurement that set every other default here ran at
-    # **1800 s** (phase 1 = 1080 s) and DID reach FEASIBLE on the same book, so
-    # the shipped default was half the budget its own evidence required. Phase 1's
-    # first feasible solution costs somewhere between 9 and 18 minutes here.
-    # Headroom checked: api's OPTIMIZE_CLOUD_TIMEOUT_MIN default is 40 min and the
-    # workflow's timeout-minutes is 60, so 1800 s of solving fits both.
-    # If a future book fails the same way, RAISE THIS rather than relaxing
-    # ``status_ok`` — a solve with no feasible schedule has nothing to publish.
-    cp_time_limit_sec: int = 1800
-    # Solver threads for ONE solve. **CORES BUY THE BOUND; WALL CLOCK BUYS THE
-    # PLAN.** Measured at the owner's scale (findings §1): 2 → 4 workers at the
-    # same 30 minutes moved the PROVEN FLOOR 170 → 215 late-days and cut the
-    # optimality gap 2.41× → 1.99×, while six times the clock at 2 workers moved
-    # the floor by two days. 4 is therefore the shipping default and the reason
-    # **the solve worker must be pinned at 4+ cores** — a GitHub Actions runner
-    # and the Oracle free-tier VM (4 OCPU) both clear it. On a smaller box
-    # CP-SAT simply oversubscribes: no error, a worse bound, silently. That is a
-    # deployment requirement, not a knob, which is why it is not in Settings.
-    # NOTE: >1 worker makes the search PARALLEL, so an identical book can return
-    # a different (equally legal) plan run to run even at a fixed seed — see
-    # ``cp_time_limit_sec`` above; the limit is wall clock either way.
-    cp_num_workers: int = 4
-    # The solved DECISION GENOME (job order, machine per operation, crew roster,
-    # released pieces, solved completions, the book it was solved against). It
-    # rides on the config into the seam because ``/run`` has no genome argument,
-    # exactly as ``crew_rank`` does — but unlike crew_rank it is NOT persisted in
-    # the saved plan config: it lives under its own store key
-    # (``book_store.CP_GENOME_KEY``), which no other engine reads, so W.5's
-    # one-env-var rollback needs no migration. ``api._resolve_config`` attaches
-    # it at every planning entry. It is an optimization OUTPUT and is POPPED from
-    # ``_inputs_signature`` — leave it in and every apply flags its own result
-    # stale the instant it lands.
-    cp_genome: Optional[dict] = None
-
     def validate(self) -> None:
         """Fail loud on a bad config (Design spec §8 — config validation)."""
         errs = []
@@ -255,22 +185,8 @@ class Config:
             errs.append("two_shift_threshold_hours must be >= 0")
         if not isinstance(self.apply_operator_logic, bool):
             errs.append("apply_operator_logic must be true or false")
-        # "roster" = the roster-first engine (roster_engine/, 2026-08-12 spec),
-        # dispatched by pipeline.scheduler_for -> engine/roster_adapter.py. It must
-        # be listed here or NOTHING can plan on it: run_forward, optimizer.optimize
-        # and optimize_service all call validate(), and api._load_plan_config drops
-        # a config that fails validation back to a bare Config() — i.e. an admin's
-        # saved choice would be silently downgraded to classic.
-        # "cp" = the CP-SAT engine (cp_engine/, 2026-08-14 spec), dispatched by
-        # pipeline.scheduler_for -> engine/cp_adapter.py. Same argument as roster
-        # above, and it is the exact silent-fallback class the whole CP wiring
-        # commit exists to prevent: a name missing here makes
-        # api._load_plan_config drop the stored config back to a bare Config(),
-        # i.e. an admin's saved engine choice is DOWNGRADED TO CLASSIC and the
-        # site plans on the wrong engine behind a completely green screen.
-        if self.scheduler not in ("classic", "flow", "new", "roster", "cp"):
-            errs.append("scheduler must be 'classic', 'flow', 'new', 'roster', "
-                        "or 'cp'")
+        if self.scheduler not in ("classic", "flow", "new"):
+            errs.append("scheduler must be 'classic', 'flow', or 'new'")
         if not (1 <= int(self.flow_chunks) <= 50):
             errs.append("flow_chunks must be within 1..50")
         if not isinstance(self.split_parallel, bool):
@@ -287,18 +203,6 @@ class Config:
             errs.append("worst_ceiling_days must be >= 0 or None")
         if self.committed_promise_slack_days < 0:
             errs.append("committed_promise_slack_days must be >= 0")
-        if self.crew_rank is not None and not isinstance(self.crew_rank, dict):
-            errs.append("crew_rank must be a {machine id: rank} mapping or null")
-        if not isinstance(self.cp_hold_across_unmanned_shift, bool):
-            errs.append("cp_hold_across_unmanned_shift must be true or false")
-        if int(self.cp_fairness_slack_days) < 0:
-            errs.append("cp_fairness_slack_days must be >= 0")
-        if int(self.cp_time_limit_sec) <= 0:
-            errs.append("cp_time_limit_sec must be > 0")
-        if int(self.cp_num_workers) < 1:
-            errs.append("cp_num_workers must be >= 1")
-        if self.cp_genome is not None and not isinstance(self.cp_genome, dict):
-            errs.append("cp_genome must be a decision-genome mapping or null")
         if errs:
             raise ValueError("Invalid config: " + "; ".join(errs))
 
@@ -326,11 +230,6 @@ class Config:
                     value = None
                 elif isinstance(value, str):
                     value = date.fromisoformat(value)
-            if key in ("crew_rank", "cp_genome"):
-                # "" / null / {} from the wire all mean "no genome on file", and
-                # they must land as the SAME value or _inputs_signature would see
-                # a settings change where there is none.
-                value = dict(value) if value else None
             if key == "priority_window_days":
                 # "" / "none" / null from the UI means "no limit".
                 if value in (None, "", "none", "null"):

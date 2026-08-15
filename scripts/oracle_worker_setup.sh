@@ -18,20 +18,6 @@ if [ ! -d "$REPO_DIR/.git" ]; then
 fi
 python3 -m pip install --user -r "$REPO_DIR/requirements.txt"
 
-# The CP solver. PINNED, and deliberately NOT in requirements.txt: Render runs
-# only the replay path and must never have it (cp_engine's replay modules are
-# tested to import without pyjobshop or ortools). But THIS box is where a cp
-# deep search actually solves, so without it every cp contest fails here and
-# there is NO local fallback to catch it — Render cannot solve either.
-#
-# The version is pinned because cp_engine reaches pyjobshop's INTERNAL API
-# (CPModel(data).model / .variables / assign_vars) for Rule 1's per-shift roster
-# and the fairness objective; tests/test_cp_escape_hatch.py is the canary.
-#
-# ALREADY BUILT A BOX BEFORE 2026-08-14? Run this one line on it:
-#   python3 -m pip install --user pyjobshop==0.0.9
-python3 -m pip install --user pyjobshop==0.0.9
-
 sudo tee /etc/anvitech-worker.env >/dev/null <<EOF
 APP_URL=${APP_URL}
 OPTIMIZE_WORKER_SECRET=${SECRET}

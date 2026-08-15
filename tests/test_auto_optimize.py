@@ -88,12 +88,7 @@ def test_done_skips_and_notes_when_nothing_changed(monkeypatch):
     cfg = m._load_plan_config()
     book_store.save_plan_priority({}, {"saved_at": "t",
                                        "book_sig": m._current_book_sig(),
-                                       "inputs_sig": m._inputs_signature(cfg),
-                                       # A contest is run against a plan START as well
-                                       # as a book and settings; a record without it
-                                       # cannot be known to match (see
-                                       # tests/test_replan_on_date_advance.py).
-                                       "plan_start": m._current_plan_start_sig()})
+                                       "inputs_sig": m._inputs_signature(cfg)})
     starts = []
     monkeypatch.setattr(m, "_start_optimize", lambda *a, **k: starts.append(1))
     c = TestClient(m.app)
@@ -116,8 +111,7 @@ def test_done_skips_when_last_searched_matches_even_without_applied_plan(monkeyp
     m = _api(); _seed_book()
     cfg = m._load_plan_config()
     book_store.save_last_searched({"book_sig": m._current_book_sig(),
-                                   "inputs_sig": m._inputs_signature(cfg),
-                                   "plan_start": m._current_plan_start_sig()})
+                                   "inputs_sig": m._inputs_signature(cfg)})
     assert book_store.load_plan_priority() is None
     starts = []
     monkeypatch.setattr(m, "_start_optimize", lambda *a, **k: starts.append(1))
